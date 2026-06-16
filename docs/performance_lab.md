@@ -17,6 +17,7 @@ python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners e
 python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
 python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batches 1,4,8,16,32,64
 python scripts\profile_cached_action_attention_internals.py --device cuda --prefix-batches 1,4,8,16,32,64
+python scripts\perf_lab_paired_heads.py --device cuda --batches 1,8,32,64,128
 python scripts\perf_lab_batched_beam_planner.py --device cuda --beam-widths 1,4,8,16 --max-depth 24
 python scripts\perf_lab_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
 python scripts\perf_lab_persistent_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
@@ -836,6 +837,27 @@ This confirms the split strategy:
 - the best optimization target is still batched search/tree expansion, not more scalar planner micro-optimization.
 
 `summarize_perf_profiles.py` converts the online, root-table, and cached-internals JSON files into a compact Markdown report for slide/debug use.
+
+## Paired Policy/Q Head Experiment
+
+`perf_lab_paired_heads.py` benchmarks whether the policy and Q MLP heads should be evaluated as paired functional calls instead of separate `nn.Sequential` modules. The experiment checks three paths:
+
+```text
+separate modules:       current runtime path
+paired direct:          same weights, functional LayerNorm/Linear/GELU/Linear
+paired stacked/einsum:  stack policy/Q as a leading dimension and batch matmuls
+```
+
+The paired-direct path is algebraically exact and often wins for tiny type/residual head microbenchmarks. The stacked/einsum variant is generally slower. When wired into the full cached scorer, however, the paired-direct runtime path made end-to-end cached scoring slower:
+
+```text
+current cached score, prefixes=1:       ~2.22 ms
+paired-head cached score, prefixes=1:   ~2.57 ms
+current cached score, prefixes=32:      ~2.18 ms
+paired-head cached score, prefixes=32:  ~2.37 ms
+```
+
+Conclusion: do not fuse these heads in the current PyTorch runtime. The microbenchmark benefit does not survive the full action-attention scorer. The larger optimization remains batching the search/tree work so each neural call handles more prefixes.
 
 ## MCTX Takeaway
 
