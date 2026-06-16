@@ -1751,6 +1751,31 @@ This makes reusable CUDA Graph replay useful for longer batched eval/training
 runs. For very short smoke tests, `--skip-graph` remains useful because one graph
 capture can dominate only a few windows.
 
+The reusable graph path now also profiles its own stages and reuses fixed-shape
+device buffers for the dense physical action table (`actions`, flattened score
+indices, and validity mask). This removes repeated GPU allocation for candidate
+tables in the full-batch replay case. The 16-env profiled smoke showed:
+
+```text
+graph_score_replay:          ~0.64 ms
+graph_decision_select_device:~0.28 ms
+graph_action_tensor_prep_h2d:~0.10 ms
+graph_slot_h2d:              ~0.06 ms
+```
+
+On the 64-env, 20-window run, the long-run graph throughput improved further:
+
+```text
+reusable score graph before action buffers: ~870.8 env-windows/s
+reusable score graph with action buffers:   ~909.4 env-windows/s
+reward delta:                               0.0
+```
+
+A CPU-slot shortcut was tested and rejected: copying CPU slot tensors directly
+inside graph replay moved the transfer into the replay stage and reduced the
+64-env long-run throughput, so the graph path keeps the explicit `graph_slot_h2d`
+stage.
+
 Mixed precision was also tested on the current direct-pack/fast-step path and
 rejected on this Windows/CUDA/PyTorch stack:
 

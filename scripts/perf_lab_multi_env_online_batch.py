@@ -1055,6 +1055,8 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     batch_sizes: list[int] = []
     depth_counts: list[int] = []
     score_graph_cache: dict = {}
+    stage_buckets: dict[str, list[float]] = {}
+    profile_enabled = bool(getattr(args, "profile_stages", False))
     graph_replay_rounds = 0
     raw_rounds = 0
     if envs and hasattr(planner, "warmup"):
@@ -1067,17 +1069,47 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         if not root_env_ids:
             break
         if bool(getattr(args, "direct_root_pack", False)):
-            packed = pack_root_envs_direct(envs, root_env_ids, search_debt, planner.env_cfg, MAXT)
+            packed = time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "graph_root_pack_direct",
+                lambda: pack_root_envs_direct(envs, root_env_ids, search_debt, planner.env_cfg, MAXT),
+            )
         else:
-            obs2 = [attach_env_obs(get_obs(envs[i], search_debt[i]), planner.env_cfg, True, True) for i in root_env_ids]
-            packed = pack_root_observations(obs2, MAXT)
+            obs2 = time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "graph_root_obs_attach",
+                lambda: [attach_env_obs(get_obs(envs[i], search_debt[i]), planner.env_cfg, True, True) for i in root_env_ids],
+            )
+            packed = time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "graph_root_pack_observations",
+                lambda: pack_root_observations(obs2, MAXT),
+            )
         selected = [set() for _ in root_env_ids]
         elapsed = [0.0 for _ in root_env_ids]
         search_count = [0 for _ in root_env_ids]
         track_count = [0 for _ in root_env_ids]
         last = [-1 for _ in root_env_ids]
-        slot_template = slot_template_from_packed(packed, float(args.window_ms))
-        root_tokens = tokenize_packed_root_fast(adapt, packed, MAXT, TOKEN_DIM)
+        slot_template = time_stage(
+            device,
+            profile_enabled,
+            stage_buckets,
+            "graph_root_slot_template",
+            lambda: slot_template_from_packed(packed, float(args.window_ms)),
+        )
+        root_tokens = time_stage(
+            device,
+            profile_enabled,
+            stage_buckets,
+            "graph_root_tokenize_batch",
+            lambda: tokenize_packed_root_fast(adapt, packed, MAXT, TOKEN_DIM),
+        )
         sync(device)
         t0 = time.perf_counter()
         with torch.inference_mode():
@@ -1096,75 +1128,131 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         graph_build_times.append((time.perf_counter() - t0) * 1000.0)
 
         live_pos = list(range(len(root_env_ids)))
+        table_width = 2 + 2 * int(MAXT)
+        prealloc_action_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.long)
+        prealloc_flat_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.long)
+        prealloc_valid_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.bool)
         depth = 0
         while live_pos and depth < int(args.max_depth):
-            slots = make_live_slots(slot_template, live_pos, elapsed, search_count, track_count, last, float(args.window_ms))
-            physical = physical_action_table_from_packed(packed, live_pos, selected, MAXT)
+            slots = time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "graph_slot_context_update",
+                lambda: make_live_slots(slot_template, live_pos, elapsed, search_count, track_count, last, float(args.window_ms)),
+            )
+            physical = time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "graph_physical_action_table",
+                lambda: physical_action_table_from_packed(packed, live_pos, selected, MAXT),
+            )
             sync(device)
             t0 = time.perf_counter()
             with torch.inference_mode():
                 if graph_replay is not None and len(live_pos) == len(root_env_ids):
-                    slot_t = torch.from_numpy(slots).to(device, dtype=torch.float32)
-                    score_t = graph_replay(selected_t_all, slot_t)
+                    slot_t = time_stage(
+                        device,
+                        profile_enabled,
+                        stage_buckets,
+                        "graph_slot_h2d",
+                        lambda: torch.from_numpy(slots).to(device, dtype=torch.float32),
+                    )
+                    score_t = time_stage(
+                        device,
+                        profile_enabled,
+                        stage_buckets,
+                        "graph_score_replay",
+                        lambda: graph_replay(selected_t_all, slot_t),
+                    )
                     graph_replay_rounds += 1
                 else:
-                    pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
-                    slot_t = torch.from_numpy(slots).to(device, dtype=torch.float32)
-                    selected_t = selected_t_all.index_select(0, pos_t)
-                    cls_live = cls_out.index_select(0, pos_t)
-                    tok_live = tok_out.index_select(0, pos_t)
-                    active_live = token_active.index_select(0, pos_t)
-                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
-                        score_t = planner.score_slots_from_encoded(cls_live, tok_live, selected_t, active_live, slot_t).float()
+                    def raw_score_path():
+                        pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
+                        slot_t = torch.from_numpy(slots).to(device, dtype=torch.float32)
+                        selected_t = selected_t_all.index_select(0, pos_t)
+                        cls_live = cls_out.index_select(0, pos_t)
+                        tok_live = tok_out.index_select(0, pos_t)
+                        active_live = token_active.index_select(0, pos_t)
+                        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
+                            return planner.score_slots_from_encoded(cls_live, tok_live, selected_t, active_live, slot_t).float()
+
+                    score_t = time_stage(device, profile_enabled, stage_buckets, "graph_raw_score_forward", raw_score_path)
                     raw_rounds += 1
                 score_t[:, 0, :] += planner.search_score_bias
-                actions_t = torch.as_tensor(physical.actions, device=device, dtype=torch.long)
-                flat_t = torch.as_tensor(physical.bases * 2 + physical.sensors, device=device, dtype=torch.long)
-                valid_t = torch.as_tensor(physical.valid, device=device, dtype=torch.bool)
-                candidate_scores = torch.gather(score_t.reshape(len(live_pos), -1), 1, flat_t)
-                candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
-                idx = torch.argmax(candidate_scores, dim=1)
-                best = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
-                has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
-                best = torch.where(has_valid, best, torch.full_like(best, -1))
-                actions = best.cpu().numpy().astype(np.int64, copy=False)
+                def action_tensor_prep():
+                    if len(live_pos) == len(root_env_ids):
+                        prealloc_action_t.copy_(torch.from_numpy(physical.actions), non_blocking=False)
+                        prealloc_flat_t.copy_(torch.from_numpy(physical.bases * 2 + physical.sensors), non_blocking=False)
+                        prealloc_valid_t.copy_(torch.from_numpy(physical.valid), non_blocking=False)
+                        return prealloc_action_t, prealloc_flat_t, prealloc_valid_t
+                    return (
+                        torch.as_tensor(physical.actions, device=device, dtype=torch.long),
+                        torch.as_tensor(physical.bases * 2 + physical.sensors, device=device, dtype=torch.long),
+                        torch.as_tensor(physical.valid, device=device, dtype=torch.bool),
+                    )
+
+                actions_t, flat_t, valid_t = time_stage(device, profile_enabled, stage_buckets, "graph_action_tensor_prep_h2d", action_tensor_prep)
+
+                def select_actions():
+                    candidate_scores = torch.gather(score_t.reshape(len(live_pos), -1), 1, flat_t)
+                    candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
+                    idx = torch.argmax(candidate_scores, dim=1)
+                    best = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
+                    has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
+                    return torch.where(has_valid, best, torch.full_like(best, -1))
+
+                best = time_stage(device, profile_enabled, stage_buckets, "graph_decision_select_device", select_actions)
+                actions = time_stage(
+                    device,
+                    profile_enabled,
+                    stage_buckets,
+                    "graph_decision_action_d2h",
+                    lambda: best.cpu().numpy().astype(np.int64, copy=False),
+                )
             sync(device)
             plan_round_times.append((time.perf_counter() - t0) * 1000.0)
             batch_sizes.append(len(live_pos))
             next_live: list[int] = []
-            for local_idx, pos in enumerate(live_pos):
-                env_idx = root_env_ids[pos]
-                eng = envs[env_idx]
-                if eng.term_buf[0] or elapsed[pos] >= float(args.window_ms):
-                    continue
-                remaining = max(0.0, float(args.window_ms) - float(elapsed[pos]))
-                action = int(actions[local_idx])
-                base, _ = xs_decode_action(action, MAXT)
-                if bool(getattr(args, "fast_env_step", False)):
-                    dwell = float(packed.dwell[pos, int(base) - 1]) if int(base) > 0 else 0.0
-                    reward, dt, executed_action = execute_known_valid_action_fast(eng, action, int(base), dwell, remaining)
-                else:
-                    reward, dt, executed_action = execute_first_valid_action(eng, [action], remaining)
-                if executed_action is None or dt <= 0.0:
-                    continue
-                logical_action, _sensor = decode_sensor_action(int(executed_action), eng.max_trackers)
-                base, _ = xs_decode_action(int(executed_action), MAXT)
-                if int(logical_action) == 0:
-                    search_debt[env_idx] = 0.0
-                    search_count[pos] += 1
-                else:
-                    search_debt[env_idx] += max(float(dt), 0.0)
-                    if int(base) > 0:
-                        selected[pos].add(int(base))
-                        if 0 <= int(base) < selected_t_all.shape[1]:
-                            selected_t_all[pos, int(base)] = True
-                    track_count[pos] += 1
-                rewards[env_idx] += float(reward)
-                elapsed[pos] += float(dt)
-                executed[env_idx] += 1
-                last[pos] = int(base)
-                if not eng.term_buf[0] and elapsed[pos] < float(args.window_ms):
-                    next_live.append(pos)
+            def step_envs():
+                next_ids: list[int] = []
+                for local_idx, pos in enumerate(live_pos):
+                    env_idx = root_env_ids[pos]
+                    eng = envs[env_idx]
+                    if eng.term_buf[0] or elapsed[pos] >= float(args.window_ms):
+                        continue
+                    remaining = max(0.0, float(args.window_ms) - float(elapsed[pos]))
+                    action = int(actions[local_idx])
+                    base, _ = xs_decode_action(action, MAXT)
+                    if bool(getattr(args, "fast_env_step", False)):
+                        dwell = float(packed.dwell[pos, int(base) - 1]) if int(base) > 0 else 0.0
+                        reward, dt, executed_action = execute_known_valid_action_fast(eng, action, int(base), dwell, remaining)
+                    else:
+                        reward, dt, executed_action = execute_first_valid_action(eng, [action], remaining)
+                    if executed_action is None or dt <= 0.0:
+                        continue
+                    logical_action, _sensor = decode_sensor_action(int(executed_action), eng.max_trackers)
+                    base, _ = xs_decode_action(int(executed_action), MAXT)
+                    if int(logical_action) == 0:
+                        search_debt[env_idx] = 0.0
+                        search_count[pos] += 1
+                    else:
+                        search_debt[env_idx] += max(float(dt), 0.0)
+                        if int(base) > 0:
+                            selected[pos].add(int(base))
+                            if 0 <= int(base) < selected_t_all.shape[1]:
+                                selected_t_all[pos, int(base)] = True
+                        track_count[pos] += 1
+                    rewards[env_idx] += float(reward)
+                    elapsed[pos] += float(dt)
+                    executed[env_idx] += 1
+                    last[pos] = int(base)
+                    if not eng.term_buf[0] and elapsed[pos] < float(args.window_ms):
+                        next_ids.append(pos)
+                return next_ids
+
+            next_live = time_stage(device, profile_enabled, stage_buckets, "graph_env_step_batch", step_envs)
             live_pos = next_live
             depth += 1
         depth_counts.append(depth)
@@ -1190,6 +1278,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         "planning_ms_per_env_action": float(sum(plan_round_times) / max(1, sum(batch_sizes))),
         "total_reward": float(sum(rewards)),
         "executed_actions": int(sum(executed)),
+        "stage_profile": profile_summary(stage_buckets) if profile_enabled else {},
     }
 
 
