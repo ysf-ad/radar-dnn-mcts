@@ -118,7 +118,7 @@ def main() -> None:
 
     from exact_env_mutual import attach_env_obs
     from final_radar_campaign import get_obs
-    from mutual_features import slot_features, tokenize
+    from mutual_features import slot_features, slot_features_batch, tokenize, tokenize_batch
     from perf_fast_planner import physical_action_arrays, physical_action_table_batch
     from realistic_reward_retrain import adapter
     from repaired_campaign_tools import EDFPlanner, build_env, env_preset_cfg
@@ -154,18 +154,30 @@ def main() -> None:
             return fn()
 
         obs2 = maybe_time("attach_env_obs", lambda: [attach_env_obs(obs, env_cfg, True, True) for obs in observations])
-        tokens = maybe_time(
-            "tokenize_stack",
+        legacy_tokens = maybe_time(
+            "legacy_tokenize_stack",
             lambda: np.stack(
                 [tokenize(adapt, obs, selected=selected[i], search_count=0).astype(np.float32) for i, obs in enumerate(obs2)],
                 axis=0,
             ),
         )
-        slots = maybe_time(
-            "slot_features_stack",
+        tokens = maybe_time("batched_tokenize", lambda: tokenize_batch(adapt, obs2, selected=selected, search_count=[0] * len(obs2)))
+        legacy_slots = maybe_time(
+            "legacy_slot_features_stack",
             lambda: np.stack(
                 [slot_features(obs, 0.0, 0, 0, -1, 200.0).astype(np.float32) for obs in obs2],
                 axis=0,
+            ),
+        )
+        slots = maybe_time(
+            "batched_slot_features",
+            lambda: slot_features_batch(
+                obs2,
+                elapsed=[0.0] * len(obs2),
+                search_count=[0] * len(obs2),
+                track_count=[0] * len(obs2),
+                last_action=[-1] * len(obs2),
+                budget_ms=200.0,
             ),
         )
         x, s = maybe_time(
@@ -187,6 +199,7 @@ def main() -> None:
         legacy_counts, legacy_rows, legacy_width = maybe_time("legacy_gather_sort", lambda: sort_legacy_scores(score, action_arrays))
         vector_counts, vector_rows, vector_width = maybe_time("vectorized_gather_sort", lambda: sort_vectorized_scores(score, physical))
 
+    equal_features = bool(np.allclose(legacy_tokens, tokens, atol=1e-6) and np.allclose(legacy_slots, slots, atol=1e-6))
     equal_counts = np.array_equal(legacy_counts, vector_counts)
     equal_width = int(legacy_width) == int(vector_width)
     equal_rows = True
@@ -210,6 +223,7 @@ def main() -> None:
         "vectorized_matches_legacy_counts": bool(equal_counts),
         "vectorized_matches_legacy_width": bool(equal_width),
         "vectorized_matches_legacy_rows": bool(equal_rows),
+        "batched_features_match_legacy": bool(equal_features),
         "stage_profile": summary,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -143,6 +143,55 @@ attach_env_obs:                     ~0.02 ms,  ~0.2%
 So the next larger opportunity is to reduce repeated token/slot feature
 construction or cache more state, not to custom-kernel the physical action mask.
 
+That next feature-construction pass is now implemented for the batched scorer.
+`tokenize_batch` and `slot_features_batch` reproduce the legacy per-observation
+feature definitions exactly, but construct the dense `[batch, rows, features]`
+arrays with batched NumPy operations:
+
+```text
+observations[]
+    -> batched t_desired/deadline/dwell/active/tracked/range arrays
+    -> batched token tensor [batch, max_targets + 1, token_dim]
+    -> batched slot tensor [batch, slot_dim]
+    -> one action-attention policy/Q pass
+```
+
+Equivalence checks on real simulator observations matched the legacy functions:
+
+```text
+token max abs diff: 0.0
+slot max abs diff:  0.0
+```
+
+Updated CUDA batch-32 stage profile:
+
+```text
+legacy_tokenize_stack:            ~5.22 ms
+batched_tokenize:                 ~1.76 ms  (~3.0x faster)
+legacy_slot_features_stack:       ~1.78 ms
+batched_slot_features:            ~1.05 ms  (~1.7x faster)
+model_forward_and_cpu_transfer:   ~4.03 ms
+```
+
+Updated end-to-end root table timings after batched features:
+
+```text
+batch=8:    vectorized root tables ~4.92 ms,  ~6.2x vs loop
+batch=32:   vectorized root tables ~7.14 ms, ~17.1x vs loop
+batch=128:  vectorized root tables ~23.83 ms, ~20.8x vs loop
+```
+
+Compared with the prior vectorized-candidate-only run:
+
+```text
+batch=32:   ~12.24 ms -> ~7.14 ms
+batch=128:  ~44.10 ms -> ~23.83 ms
+```
+
+This confirms feature construction was a real bottleneck. The next larger
+target is the remaining model forward/action-attention stack and avoiding CPU
+round-trips when the caller can consume tensors directly.
+
 ## Current Optimization
 
 `FastActionAttentionPlanner` reuses the root target encoding inside a scheduling window:

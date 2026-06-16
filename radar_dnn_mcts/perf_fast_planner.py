@@ -8,7 +8,7 @@ import torch
 
 from exact_env_mutual import attach_env_obs, xs_decode_action, xs_s_search_action, xs_x_search_action
 from exact_env_mutual import xs_s_track_action, xs_x_track_action
-from mutual_features import slot_features, tokenize
+from mutual_features import slot_features, slot_features_batch, tokenize, tokenize_batch
 from realistic_reward_retrain import adapter
 from two_sensor_physical_head_eval import MAXT, ActionAttentionFactorizedNet
 
@@ -420,26 +420,14 @@ class BatchedActionAttentionScorer:
         last = [-1] * n if last is None else list(last)
 
         obs2 = [attach_env_obs(obs, self.env_cfg, True, True) for obs in observations]
-        tokens = np.stack(
-            [
-                tokenize(self.adapt, obs, selected=selected[i], search_count=int(search_count[i])).astype(np.float32)
-                for i, obs in enumerate(obs2)
-            ],
-            axis=0,
-        )
-        slots = np.stack(
-            [
-                slot_features(
-                    obs,
-                    float(elapsed[i]),
-                    int(search_count[i]),
-                    int(track_count[i]),
-                    int(last[i]),
-                    float(budget_ms),
-                ).astype(np.float32)
-                for i, obs in enumerate(obs2)
-            ],
-            axis=0,
+        tokens = tokenize_batch(self.adapt, obs2, selected=selected, search_count=search_count)
+        slots = slot_features_batch(
+            obs2,
+            elapsed=elapsed,
+            search_count=search_count,
+            track_count=track_count,
+            last_action=last,
+            budget_ms=float(budget_ms),
         )
         with torch.inference_mode():
             x = torch.from_numpy(tokens).to(self.device, dtype=torch.float32)
