@@ -95,25 +95,28 @@ def main() -> None:
 
     for beam_width in [int(x) for x in str(args.beam_widths).split(",") if x.strip()]:
         branch_top_k = 1 if int(beam_width) == 1 else int(args.branch_top_k)
-        beam = BatchedBeamWindowPlanner(
-            fast,
-            beam_width=int(beam_width),
-            branch_top_k=branch_top_k,
-            max_depth=int(args.max_depth),
-        )
-        beam_plan, beam_stat = bench_plan(beam, obs, device, args.iters, args.warmup)
-        report["beam_planners"].append(
-            {
-                "beam_width": int(beam_width),
-                "branch_top_k": int(branch_top_k),
-                "plan": [int(x) for x in beam_plan],
-                "plan_len": int(len(beam_plan)),
-                "matches_fast_plan": [int(x) for x in beam_plan] == [int(x) for x in fast_plan],
-                "matches_fast_prefix": [int(x) for x in beam_plan] == [int(x) for x in fast_plan[: len(beam_plan)]],
-                "timing": beam_stat,
-                "relative_to_fast_mean": float(beam_stat["mean_ms"] / max(fast_stat["mean_ms"], 1e-12)),
-            }
-        )
+        for use_top1_device in ([False, True] if int(branch_top_k) == 1 else [False]):
+            beam = BatchedBeamWindowPlanner(
+                fast,
+                beam_width=int(beam_width),
+                branch_top_k=branch_top_k,
+                max_depth=int(args.max_depth),
+                use_top1_device=bool(use_top1_device),
+            )
+            beam_plan, beam_stat = bench_plan(beam, obs, device, args.iters, args.warmup)
+            report["beam_planners"].append(
+                {
+                    "beam_width": int(beam_width),
+                    "branch_top_k": int(branch_top_k),
+                    "use_top1_device": bool(use_top1_device),
+                    "plan": [int(x) for x in beam_plan],
+                    "plan_len": int(len(beam_plan)),
+                    "matches_fast_plan": [int(x) for x in beam_plan] == [int(x) for x in fast_plan],
+                    "matches_fast_prefix": [int(x) for x in beam_plan] == [int(x) for x in fast_plan[: len(beam_plan)]],
+                    "timing": beam_stat,
+                    "relative_to_fast_mean": float(beam_stat["mean_ms"] / max(fast_stat["mean_ms"], 1e-12)),
+                }
+            )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")

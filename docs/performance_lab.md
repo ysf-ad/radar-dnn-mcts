@@ -1254,6 +1254,28 @@ most prefix counts because it still paid Python/Numpy preparation and tensor
 construction costs. The prepared device graph path is the useful one for dense
 MCTS/frontier batches that can be prepared once and replayed many times.
 
+Live beam-planner A/B confirms that distinction. With a dynamic frontier, each
+depth creates a new prefix batch, so graph capture cannot be reused and the
+device-selection setup cost is paid every depth:
+
+```text
+script: scripts/perf_lab_batched_beam_planner.py
+device=cuda, initial_targets=60, arrival_rate=4, seed=916,
+branch_top_k=1, max_depth=24
+
+fast cached planner:                 ~49.66 ms/window
+beam width 1, full-table top-1:       ~58.01 ms/window
+beam width 1, device top-1:           ~74.13 ms/window
+beam width 8, full-table top-1:       ~61.50 ms/window
+beam width 8, device top-1:           ~72.36 ms/window
+
+plans match fast planner: true
+```
+
+So the online beam planner should keep using the full-table path unless the
+frontier can be prepared and replayed. The device top-1 path is available as an
+explicit switch for experiments, but it is not the default dynamic-beam path.
+
 The staged profiler makes the bottleneck explicit. For batch 128, the full path
 spent about `5.8 ms` in tokenization and `3.6-4.0 ms` in slot-feature
 construction before the GPU model forward. The prepared path removes that

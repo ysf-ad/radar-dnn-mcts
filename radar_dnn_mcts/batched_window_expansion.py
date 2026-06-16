@@ -378,6 +378,25 @@ class BatchedWindowExpansionScorer:
                 out.append(prefix_after_action(self.obs, prefix, int(row_actions[idx]), float(row_vals[idx])))
         return out
 
+    def expand_prefixes_top1_device(self, prefixes: Iterable[BranchPrefix]) -> list[BranchPrefix]:
+        """Expand each live prefix by its single best valid next action.
+
+        This is the online-friendly top-1 path: the prefix batch is prepared on
+        device and valid-action selection stays on GPU, but no CUDA Graph is
+        captured because live beam frontiers usually change every depth.
+        """
+        prefix_list = list(prefixes)
+        if not prefix_list:
+            return []
+        prepared = self.prepare_prefixes_device(prefix_list)
+        scored = self.score_prepared_prefixes_device(prepared)
+        out: list[BranchPrefix] = []
+        for row, prefix in enumerate(prefix_list):
+            if not bool(scored.valid[row]):
+                continue
+            out.append(prefix_after_action(self.obs, prefix, int(scored.actions[row]), float(scored.scores[row])))
+        return out
+
 
 class BatchedBeamWindowPlanner:
     """Window planner that expands many partial prefixes per model call."""
@@ -388,11 +407,13 @@ class BatchedBeamWindowPlanner:
         beam_width: int = 8,
         branch_top_k: int = 2,
         max_depth: int = 64,
+        use_top1_device: bool = False,
     ):
         self.planner = planner
         self.beam_width = int(beam_width)
         self.branch_top_k = int(branch_top_k)
         self.max_depth = int(max_depth)
+        self.use_top1_device = bool(use_top1_device)
 
     def plan(self, obs, budget_ms=200):
         scorer = BatchedWindowExpansionScorer(self.planner, obs, budget_ms=float(budget_ms))
@@ -402,7 +423,10 @@ class BatchedBeamWindowPlanner:
             live = [p for p in frontier if float(p.elapsed_ms) < float(budget_ms)]
             if not live:
                 break
-            children = scorer.expand_prefixes(live, top_k=max(1, self.branch_top_k))
+            if self.use_top1_device and int(self.branch_top_k) == 1:
+                children = scorer.expand_prefixes_top1_device(live)
+            else:
+                children = scorer.expand_prefixes(live, top_k=max(1, self.branch_top_k))
             children = [p for p in children if p.actions]
             if not children:
                 break
