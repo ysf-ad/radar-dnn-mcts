@@ -12,6 +12,7 @@ python scripts\perf_lab_batched_roots.py --device cuda --batch-sizes 1,8,32,128
 python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
 python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast
 python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
+python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batches 1,4,8,16,32,64
 ```
 
 ## First Findings
@@ -203,6 +204,39 @@ B=64: ~16.5x
 ```
 
 This is the strongest evidence so far that the GPU path needs larger search batches, not tiny one-decision calls. The best next implementation step is to make MCTS/root expansion produce batches of slot/mask contexts and call this batched scorer once per expansion wave.
+
+## Batched Expansion Waves
+
+`BatchedWindowExpansionScorer` turns partial within-window plans into a batched next-action expansion problem:
+
+```text
+BranchPrefix = (actions, selected targets, elapsed ms, search count, track count, last action)
+
+many BranchPrefix objects
+    -> one slot/mask batch
+    -> one action-attention/head pass
+    -> best next action for every prefix
+```
+
+This is the practical bridge from microbenchmark to search implementation. It keeps the root target/context encoding fixed and evaluates an expansion wave of partial branches in one call.
+
+Measured CUDA speedups against scoring each prefix independently:
+
+```text
+prefixes=4:  ~3.2x
+prefixes=8:  ~5.3x
+prefixes=16: ~7.6x
+prefixes=32: ~8.1x
+prefixes=64: ~7.6x
+```
+
+The benchmark checks that the selected next actions match the sequential prefix loop. Score differences stayed within normal floating-point noise:
+
+```text
+max absolute score difference: <= 2.1e-7
+```
+
+Compared with pure slot scoring, expansion waves include prefix metadata, selected-target masks, candidate construction, and best-action selection, so this is the more realistic speedup to expect when wiring batched scoring into MCTS/root expansion.
 
 ## MCTX Takeaway
 

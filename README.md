@@ -112,4 +112,5 @@ python scripts\perf_lab_batched_roots.py --device cuda --batch-sizes 1,8,32,128
 python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
 python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast
 python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
+python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batches 1,4,8,16,32,64
 ```
