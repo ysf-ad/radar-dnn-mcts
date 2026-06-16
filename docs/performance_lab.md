@@ -9,6 +9,7 @@ python scripts\perf_lab_action_attention.py --device cpu
 python scripts\perf_lab_action_attention.py --device cuda --forward-batches 1,8,32,128
 python scripts\profile_action_attention_steps.py --device cuda
 python scripts\perf_lab_batched_roots.py --device cuda --batch-sizes 1,8,32,128
+python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
 ```
 
 ## First Findings
@@ -88,6 +89,40 @@ The first profiler separates:
 
 The dominant cost remains neural scoring and sequential planning control flow. Python candidate selection is small by comparison.
 
+Example CPU step profile for an 8-decision window:
+
+```text
+baseline model forward_scores: ~7.7 ms/decision
+fast cached action scoring:    ~4.8 ms/decision
+root encode once:              ~1.8 ms/window
+candidate selection:           ~0.2 ms/decision
+```
+
+So the useful targets are still model scoring, batching, and tree/control-flow structure. Hand-optimizing candidate selection is not the first lever.
+
+## Batched Branch Simulation
+
+`BatchedRootBranchSimulator` uses the C binding's vector environment API to evaluate many one-step root branches from the same snapshot:
+
+```text
+root snapshot -> vec_restore_all(batch envs)
+              -> one candidate action per env
+              -> vec_step_validated(batch envs)
+```
+
+This is the simulator-side counterpart to dense root proposals. It preserves the exact C environment transition while removing the Python loop over snapshot restore/step calls.
+
+Measured speedups against a scalar restore/step loop:
+
+```text
+branches=1:  ~0.94x
+branches=8:  ~1.42x
+branches=32: ~1.40x
+branches=58: ~1.46x
+```
+
+The executed actions, elapsed times, and rewards matched the scalar path in the benchmark. The speedup is real but modest because the C binding still loops internally over vector envs. The larger win should come from combining this with batched neural scoring and dense tree tensors so MCTS expansion/evaluation happens in grouped batches instead of Python node-by-node control flow.
+
 ## MCTX Takeaway
 
 MCTX is useful as a design reference because its search tree is dense and batched:
@@ -117,4 +152,5 @@ That layout mirrors the important MCTX idea: a batch dimension over independent 
 - Batch multiple environment windows during evaluation.
 - Expand `DenseRootSearchState` beyond the root into full batched tree tensors.
 - Replace Python node objects with dense tree tensors.
-- Keep simulator state transitions as the remaining hard part; either vectorize C simulation calls or build a PyTorch/JAX-compatible approximate rollout model.
+- Use `BatchedRootBranchSimulator` for exact one-step branch expansion.
+- Keep deeper simulator state transitions as the remaining hard part; either extend the C vector stepping path for deeper batched rollouts or build a PyTorch/JAX-compatible approximate rollout model.
