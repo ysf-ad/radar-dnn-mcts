@@ -1134,11 +1134,11 @@ script: scripts/perf_lab_cuda_graph_planner.py
 device=cuda, initial_targets=40, arrival_rate=3, seed=916,
 warmup=5, iterations=30
 
-regular fast planner:             50.803 ms / plan
-GPU-select fast planner:          48.402 ms / plan
-CUDA graph fast planner:          11.012 ms / plan
-CUDA graph + GPU-select planner:   9.426 ms / plan
-best speedup:                      5.39x
+regular fast planner:             46.393 ms / plan
+GPU-select fast planner:          44.978 ms / plan
+CUDA graph fast planner:          10.632 ms / plan
+CUDA graph + GPU-select planner:   9.024 ms / plan
+best speedup:                      5.14x
 plans match:                       true
 ```
 
@@ -1155,6 +1155,17 @@ selection, the planner gathers valid physical actions and runs `argmax` on the
 GPU, transferring only the selected action id. On its own it is neutral because
 the uncaptured model forward dominates latency, but after CUDA Graph replay it
 removes enough CPU/D2H work to improve the graph path.
+
+The selector uses a precomputed flat index table:
+
+```text
+flat_index = target_row * 2 + sensor_id
+candidate_score = score.reshape(-1)[flat_index]
+```
+
+This avoids two-dimensional advanced indexing in the hot loop. The internal
+profile improved GPU-selection time from about `0.209 ms/decision` to
+`0.185 ms/decision`.
 
 The fast planner also now builds a per-window slot-feature template. The
 observation-dependent slot terms are constant throughout a planning call, so the

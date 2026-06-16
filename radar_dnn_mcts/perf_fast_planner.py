@@ -515,24 +515,26 @@ class FastActionAttentionPlanner:
 
     def _physical_action_tensors(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         actions, bases, sensors = physical_action_arrays(obs, selected=None, max_trackers=MAXT)
+        flat_indices = bases.astype(np.int64, copy=False) * 2 + sensors.astype(np.int64, copy=False)
+        is_search = (bases == 0).astype(np.bool_, copy=False)
         return (
             torch.from_numpy(actions.astype(np.int64, copy=False)).to(self.device),
-            torch.from_numpy(bases.astype(np.int64, copy=False)).to(self.device),
-            torch.from_numpy(sensors.astype(np.int64, copy=False)).to(self.device),
+            torch.from_numpy(flat_indices).to(self.device),
+            torch.from_numpy(is_search).to(self.device),
         )
 
     def _select_best_action_torch(
         self,
         score_t: torch.Tensor,
         actions_t: torch.Tensor,
-        bases_t: torch.Tensor,
-        sensors_t: torch.Tensor,
+        flat_indices_t: torch.Tensor,
+        is_search_t: torch.Tensor,
     ) -> int | None:
         if actions_t.numel() <= 0:
             return None
-        vals = score_t[bases_t, sensors_t]
+        vals = score_t.reshape(-1).index_select(0, flat_indices_t)
         if self.search_score_bias != 0.0:
-            vals = vals + (bases_t == 0).to(vals.dtype) * float(self.search_score_bias)
+            vals = vals + is_search_t.to(vals.dtype) * float(self.search_score_bias)
         action = int(actions_t[torch.argmax(vals)].item())
         return action if action >= 0 else None
 
