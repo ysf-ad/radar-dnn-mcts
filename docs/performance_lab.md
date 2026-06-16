@@ -1918,29 +1918,36 @@ call does not obviously improve end-to-end throughput.
 
 An inference-only paired policy/Q head path was also tested behind
 `--paired-heads`. It packs same-architecture policy and Q MLP pairs into cached
-block-diagonal projections for type, target, and action-residual heads. The
-direct CUDA AMP equivalence check on a cached score state was exact:
+block-diagonal projections for type, target, and action-residual heads.
+
+Important correction: the first paired-head and direct-coupler benchmark only
+affected the older `_scores_from_encoded` helper. The online graph path calls
+`_combined_scores_from_encoded`, so the flags did not affect the real hot path
+until the scorer was fixed. After applying the flags to the combined scorer,
+the direct cached-score equivalence check showed:
 
 ```text
-score shape:       (1, 101, 2)
-max_abs_diff:      0.0
-allclose:          true
+direct couplers: max_abs_diff 0.0, allclose true
+paired heads:    max_abs_diff 0.00048828125, allclose false under fp16 AMP
 ```
 
-The full 64-env, 20-window graph benchmark preserved reward parity but did not
-beat the current path:
+Because paired heads are not bit-close under the strict AMP check, they remain
+an experimental path rather than a recommended speed path.
+
+The corrected direct-coupler path is exact but did not improve the full
+64-env, 20-window graph benchmark:
 
 ```text
-current graph path:       ~829.6 env-windows/s
-paired-head graph path:   ~813.7 env-windows/s
-reward delta:             0.0
+gpu action template, no direct couplers: ~944.8 env-windows/s
+gpu action template, direct couplers:    ~907.7 env-windows/s
+reward delta:                            0.0
 ```
 
-This suggests the separate policy/Q MLP launches are not the dominant source of
-score replay latency once CUDA graphs are active. The action self-attention and
-surrounding tensor staging remain the higher-value targets.
+This suggests the outer `TransformerEncoder` wrapper is not the bottleneck once
+CUDA graphs are active. The action self-attention kernels and surrounding
+tensor staging remain the higher-value targets.
 
-Two additional exact inference switches were tested:
+Two additional graph-path switches were tested:
 
 ```text
 --direct-couplers
@@ -1956,15 +1963,6 @@ exact:
 score shape:       (1, 101, 2)
 max_abs_diff:      0.0
 allclose:          true
-```
-
-The direct-coupler headline was a small improvement on the 64-env, 20-window
-graph path:
-
-```text
-previous graph path after rebuild:  ~829.6 env-windows/s
-direct couplers:                    ~833.0 env-windows/s
-reward delta:                       0.0
 ```
 
 `--cached-action-table` moves per-window physical action sorting/layout out of
@@ -1985,15 +1983,6 @@ cached graph_physical_action_table:    ~0.06 ms per decision
 one-time graph_physical_action_template: ~0.25 ms per window
 ```
 
-The best measured combination in this pass was direct couplers plus cached
-action table:
-
-```text
-graph throughput:          ~859.4 env-windows/s
-planning ms/env-action:    ~0.0342 ms
-reward delta:              0.0
-```
-
 The cached action table path now also has `--gpu-action-template`, which keeps
 the fixed per-window action IDs and score indices resident on GPU. Each
 decision still refreshes the changing validity mask, but avoids repeatedly
@@ -2008,14 +1997,14 @@ reward parity:
 The best measured command in this pass was:
 
 ```bash
-python scripts/perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --direct-couplers --cached-action-table --gpu-action-template
+python scripts/perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --cached-action-table --gpu-action-template
 ```
 
 Result:
 
 ```text
-graph throughput:          ~930.5 env-windows/s
-planning ms/env-action:    ~0.0311 ms
+graph throughput:          ~944.8 env-windows/s
+planning ms/env-action:    ~0.0308 ms
 reward delta:              0.0
 ```
 

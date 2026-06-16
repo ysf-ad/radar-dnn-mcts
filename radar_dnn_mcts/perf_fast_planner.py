@@ -490,27 +490,50 @@ class FastActionAttentionPlanner:
         cls_s = cls_out[:, None, :].expand(-1, 2, -1)
         slot_s = slot_emb[:, None, :].expand(-1, 2, -1)
         sensor_state = model.sensor_state_proj(torch.cat([cls_s, slot_s, sensor], dim=-1))
-        coupled_sensor = model.sensor_coupler(sensor_state)
+        coupled_sensor = _maybe_direct_encoder(model.sensor_coupler, sensor_state) if self.use_direct_couplers else model.sensor_coupler(sensor_state)
         type_ctx = torch.cat([cls_s, slot_s, coupled_sensor], dim=-1)
-        type_logits = model.type_head(type_ctx)
-        type_q = model.type_q_head(type_ctx)
+        if self.use_paired_heads:
+            type_logits, type_q = _paired_mlp_outputs(model.type_head, model.type_q_head, type_ctx, self._paired_head_cache)
+        else:
+            type_logits = model.type_head(type_ctx)
+            type_q = model.type_q_head(type_ctx)
 
         tok_st = tok_out[:, :, None, :].expand(-1, -1, 2, -1)
         cls_st = cls_out[:, None, None, :].expand(-1, rows, 2, -1)
         slot_st = slot_emb[:, None, None, :].expand(-1, rows, 2, -1)
         sensor_st = coupled_sensor[:, None, :, :].expand(bsz, rows, -1, -1)
         target_ctx = torch.cat([tok_st, cls_st, slot_st, sensor_st], dim=-1)
-        target_logits = model.target_head(target_ctx).squeeze(-1)
-        target_q = model.target_q_head(target_ctx).squeeze(-1)
+        if self.use_paired_heads:
+            target_logits_raw, target_q_raw = _paired_mlp_outputs(model.target_head, model.target_q_head, target_ctx, self._paired_head_cache)
+            target_logits = target_logits_raw.squeeze(-1)
+            target_q = target_q_raw.squeeze(-1)
+        else:
+            target_logits = model.target_head(target_ctx).squeeze(-1)
+            target_q = model.target_q_head(target_ctx).squeeze(-1)
 
         track_mask = token_active & ~selected_t
         track_mask[:, 0] = False
         row_is_search = self._row_is_search(rows, slot_t.device)
         valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
         action_ctx = model.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
-        action_ctx = model.action_coupler(action_ctx, src_key_padding_mask=~valid.reshape(bsz, rows * 2))
-        residual = model.action_policy_residual(action_ctx).reshape(bsz, rows, 2)
-        q_residual = model.action_q_residual(action_ctx).reshape(bsz, rows, 2)
+        action_mask = ~valid.reshape(bsz, rows * 2)
+        action_ctx = (
+            _maybe_direct_encoder(model.action_coupler, action_ctx, src_key_padding_mask=action_mask)
+            if self.use_direct_couplers
+            else model.action_coupler(action_ctx, src_key_padding_mask=action_mask)
+        )
+        if self.use_paired_heads:
+            residual_raw, q_residual_raw = _paired_mlp_outputs(
+                model.action_policy_residual,
+                model.action_q_residual,
+                action_ctx,
+                self._paired_head_cache,
+            )
+            residual = residual_raw.reshape(bsz, rows, 2)
+            q_residual = q_residual_raw.reshape(bsz, rows, 2)
+        else:
+            residual = model.action_policy_residual(action_ctx).reshape(bsz, rows, 2)
+            q_residual = model.action_q_residual(action_ctx).reshape(bsz, rows, 2)
 
         combined = slot_t.new_empty((bsz, rows, 2))
         combined[:, 0, :] = self.policy_weight * (type_logits[:, :, 0] + residual[:, 0, :])
