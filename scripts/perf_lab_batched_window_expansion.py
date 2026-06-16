@@ -108,13 +108,26 @@ def main() -> None:
         with torch.inference_mode():
             seq_parts = [scorer.score_prefixes([prefix]) for prefix in batch_prefixes]
             batched_ref = scorer.score_prefixes(batch_prefixes)
+            gpu_ref = scorer.score_prefixes_gpu_select(batch_prefixes)
+            prepared = scorer.prepare_prefixes_device(batch_prefixes)
+            prepared_ref = scorer.score_prepared_prefixes_device(prepared)
+            prepared_graph_ref = scorer.score_prepared_prefixes_device_graph(prepared)
         seq_actions = np.asarray([part.actions[0] for part in seq_parts], dtype=np.int64)
         seq_scores = np.asarray([part.scores[0] for part in seq_parts], dtype=np.float32)
         actions_match = bool(np.array_equal(seq_actions, batched_ref.actions))
+        gpu_actions_match = bool(np.array_equal(seq_actions, gpu_ref.actions))
+        prepared_actions_match = bool(np.array_equal(seq_actions, prepared_ref.actions))
+        prepared_graph_actions_match = bool(np.array_equal(seq_actions, prepared_graph_ref.actions))
         max_abs_score_diff = float(np.max(np.abs(seq_scores - batched_ref.scores))) if len(seq_scores) else 0.0
+        gpu_max_abs_score_diff = float(np.max(np.abs(seq_scores - gpu_ref.scores))) if len(seq_scores) else 0.0
+        prepared_max_abs_score_diff = float(np.max(np.abs(seq_scores - prepared_ref.scores))) if len(seq_scores) else 0.0
+        prepared_graph_max_abs_score_diff = float(np.max(np.abs(seq_scores - prepared_graph_ref.scores))) if len(seq_scores) else 0.0
 
         seq_times = []
         batch_times = []
+        gpu_select_times = []
+        prepared_times = []
+        prepared_graph_times = []
         with torch.inference_mode():
             for i in range(int(args.warmup) + int(args.iters)):
                 sync(device)
@@ -129,22 +142,67 @@ def main() -> None:
                 _ = scorer.score_prefixes(batch_prefixes)
                 sync(device)
                 batch_ms = (time.perf_counter() - t1) * 1000.0
+
+                sync(device)
+                t2 = time.perf_counter()
+                _ = scorer.score_prefixes_gpu_select(batch_prefixes)
+                sync(device)
+                gpu_select_ms = (time.perf_counter() - t2) * 1000.0
+
+                sync(device)
+                t3 = time.perf_counter()
+                _ = scorer.score_prepared_prefixes_device(prepared)
+                sync(device)
+                prepared_ms = (time.perf_counter() - t3) * 1000.0
+
+                sync(device)
+                t4 = time.perf_counter()
+                _ = scorer.score_prepared_prefixes_device_graph(prepared)
+                sync(device)
+                prepared_graph_ms = (time.perf_counter() - t4) * 1000.0
                 if i >= int(args.warmup):
                     seq_times.append(seq_ms)
                     batch_times.append(batch_ms)
+                    gpu_select_times.append(gpu_select_ms)
+                    prepared_times.append(prepared_ms)
+                    prepared_graph_times.append(prepared_graph_ms)
 
         seq_stat = stats(seq_times)
         batch_stat = stats(batch_times)
+        gpu_select_stat = stats(gpu_select_times)
+        prepared_stat = stats(prepared_times)
+        prepared_graph_stat = stats(prepared_graph_times)
         report["prefix_batches"].append(
             {
                 "prefixes": int(len(batch_prefixes)),
                 "actions_match": actions_match,
+                "gpu_select_actions_match": gpu_actions_match,
+                "prepared_actions_match": prepared_actions_match,
+                "prepared_graph_actions_match": prepared_graph_actions_match,
                 "max_abs_score_diff": max_abs_score_diff,
+                "gpu_select_max_abs_score_diff": gpu_max_abs_score_diff,
+                "prepared_max_abs_score_diff": prepared_max_abs_score_diff,
+                "prepared_graph_max_abs_score_diff": prepared_graph_max_abs_score_diff,
                 "sequential_prefixes": seq_stat,
                 "batched_prefixes": batch_stat,
+                "batched_prefixes_gpu_select": gpu_select_stat,
+                "prepared_prefixes_device": prepared_stat,
+                "prepared_prefixes_device_graph": prepared_graph_stat,
                 "speedup_mean": float(seq_stat["mean_ms"] / max(batch_stat["mean_ms"], 1e-12)),
+                "gpu_select_speedup_mean": float(seq_stat["mean_ms"] / max(gpu_select_stat["mean_ms"], 1e-12)),
+                "prepared_speedup_mean": float(seq_stat["mean_ms"] / max(prepared_stat["mean_ms"], 1e-12)),
+                "prepared_graph_speedup_mean": float(seq_stat["mean_ms"] / max(prepared_graph_stat["mean_ms"], 1e-12)),
                 "prefixes_per_second_sequential": float(len(batch_prefixes) / max(seq_stat["mean_ms"], 1e-12) * 1000.0),
                 "prefixes_per_second_batched": float(len(batch_prefixes) / max(batch_stat["mean_ms"], 1e-12) * 1000.0),
+                "prefixes_per_second_batched_gpu_select": float(
+                    len(batch_prefixes) / max(gpu_select_stat["mean_ms"], 1e-12) * 1000.0
+                ),
+                "prefixes_per_second_prepared_device": float(
+                    len(batch_prefixes) / max(prepared_stat["mean_ms"], 1e-12) * 1000.0
+                ),
+                "prefixes_per_second_prepared_device_graph": float(
+                    len(batch_prefixes) / max(prepared_graph_stat["mean_ms"], 1e-12) * 1000.0
+                ),
             }
         )
 

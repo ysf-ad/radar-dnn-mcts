@@ -41,6 +41,24 @@ class BranchExpansionResult:
     score_tables: np.ndarray
 
 
+@dataclass
+class DevicePreparedPrefixBatch:
+    selected: torch.Tensor
+    slots: torch.Tensor
+    actions: torch.Tensor
+    flat_indices: torch.Tensor
+    bases: torch.Tensor
+    sensors: torch.Tensor
+    valid: torch.Tensor
+    count: int
+    graph: object | None = None
+    graph_best_actions: torch.Tensor | None = None
+    graph_best_scores: torch.Tensor | None = None
+    graph_best_bases: torch.Tensor | None = None
+    graph_best_sensors: torch.Tensor | None = None
+    graph_has_valid: torch.Tensor | None = None
+
+
 class BatchedWindowExpansionScorer:
     """Batch next-action scoring for many partial prefixes under one root obs."""
 
@@ -140,6 +158,200 @@ class BatchedWindowExpansionScorer:
             valid=out_valid,
             score_tables=np.asarray(score_tables, dtype=np.float32),
         )
+
+    def _physical_tables_for_prefixes(self, prefixes: list[BranchPrefix]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        width = 2 + 2 * int(MAXT)
+        n = len(prefixes)
+        actions_t = np.full((n, width), -1, dtype=np.int64)
+        bases_t = np.zeros((n, width), dtype=np.int64)
+        sensors_t = np.zeros((n, width), dtype=np.int64)
+        valid_t = np.zeros((n, width), dtype=bool)
+        for row, prefix in enumerate(prefixes):
+            actions, bases, sensors = physical_action_arrays(self.obs, selected=prefix.selected, max_trackers=MAXT)
+            take = min(int(actions.size), width)
+            if take <= 0:
+                continue
+            actions_t[row, :take] = actions[:take]
+            bases_t[row, :take] = bases[:take]
+            sensors_t[row, :take] = sensors[:take]
+            valid_t[row, :take] = True
+        return actions_t, bases_t, sensors_t, valid_t
+
+    def score_prefixes_gpu_select(self, prefixes: Iterable[BranchPrefix]) -> BranchExpansionResult:
+        """Score prefixes and keep valid-action argmax on the GPU.
+
+        This returns the same top-1 action fields as ``score_prefixes`` but does
+        not copy the full dense score table back to CPU. It is the better path
+        for MCTS/frontier code that only needs the selected child per prefix.
+        """
+        prefix_list = list(prefixes)
+        if not prefix_list:
+            empty = np.empty((0,), dtype=np.int64)
+            return BranchExpansionResult(
+                actions=empty,
+                scores=np.empty((0,), dtype=np.float32),
+                bases=empty,
+                sensors=empty,
+                valid=np.zeros((0,), dtype=bool),
+                score_tables=np.empty((0, 0, 0), dtype=np.float32),
+            )
+        actions_np, bases_np, sensors_np, valid_np = self._physical_tables_for_prefixes(prefix_list)
+        with torch.inference_mode():
+            selected_t = self._selected_masks(prefix_list)
+            slot_t = self._slots(prefix_list)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.planner.use_amp):
+                score_t = self.planner.score_slots_from_encoded(
+                    self.cls_out,
+                    self.tok_out,
+                    selected_t,
+                    self.token_active,
+                    slot_t,
+                ).float()
+            score_t[:, 0, :] += self.planner.search_score_bias
+            flat_scores = score_t.reshape(len(prefix_list), -1)
+            flat_idx_np = bases_np * 2 + sensors_np
+            actions_dev = torch.as_tensor(actions_np, device=self.planner.device, dtype=torch.long)
+            bases_dev = torch.as_tensor(bases_np, device=self.planner.device, dtype=torch.long)
+            sensors_dev = torch.as_tensor(sensors_np, device=self.planner.device, dtype=torch.long)
+            flat_idx = torch.as_tensor(flat_idx_np, device=self.planner.device, dtype=torch.long)
+            valid_dev = torch.as_tensor(valid_np, device=self.planner.device, dtype=torch.bool)
+            candidate_scores = torch.gather(flat_scores, 1, flat_idx)
+            candidate_scores = candidate_scores.masked_fill(~(valid_dev & torch.isfinite(candidate_scores)), -torch.inf)
+            idx = torch.argmax(candidate_scores, dim=1)
+            rows = torch.arange(len(prefix_list), device=self.planner.device)
+            best_scores = candidate_scores[rows, idx]
+            best_actions = actions_dev[rows, idx]
+            best_bases = bases_dev[rows, idx]
+            best_sensors = sensors_dev[rows, idx]
+            has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
+            best_actions = torch.where(has_valid, best_actions, torch.full_like(best_actions, -1))
+            best_scores = torch.where(has_valid, best_scores, torch.full_like(best_scores, -torch.inf))
+            best_bases = torch.where(has_valid, best_bases, torch.full_like(best_bases, -1))
+            best_sensors = torch.where(has_valid, best_sensors, torch.full_like(best_sensors, -1))
+            return BranchExpansionResult(
+                actions=best_actions.cpu().numpy().astype(np.int64, copy=False),
+                scores=best_scores.cpu().numpy().astype(np.float32, copy=False),
+                bases=best_bases.cpu().numpy().astype(np.int64, copy=False),
+                sensors=best_sensors.cpu().numpy().astype(np.int64, copy=False),
+                valid=has_valid.cpu().numpy().astype(bool, copy=False),
+                score_tables=np.empty((0, 0, 0), dtype=np.float32),
+            )
+
+    def prepare_prefixes_device(self, prefixes: Iterable[BranchPrefix]) -> DevicePreparedPrefixBatch:
+        """Precompute prefix masks, slots, and valid action tables on device."""
+        prefix_list = list(prefixes)
+        n = len(prefix_list)
+        if n <= 0:
+            empty_long = torch.empty((0, 0), device=self.planner.device, dtype=torch.long)
+            empty_bool = torch.empty((0, 0), device=self.planner.device, dtype=torch.bool)
+            return DevicePreparedPrefixBatch(
+                selected=torch.empty((0, int(self.root_selected.shape[1])), device=self.planner.device, dtype=torch.bool),
+                slots=torch.empty((0, 0), device=self.planner.device, dtype=torch.float32),
+                actions=empty_long,
+                flat_indices=empty_long,
+                bases=empty_long,
+                sensors=empty_long,
+                valid=empty_bool,
+                count=0,
+            )
+        actions_np, bases_np, sensors_np, valid_np = self._physical_tables_for_prefixes(prefix_list)
+        return DevicePreparedPrefixBatch(
+            selected=self._selected_masks(prefix_list),
+            slots=self._slots(prefix_list),
+            actions=torch.as_tensor(actions_np, device=self.planner.device, dtype=torch.long),
+            flat_indices=torch.as_tensor(bases_np * 2 + sensors_np, device=self.planner.device, dtype=torch.long),
+            bases=torch.as_tensor(bases_np, device=self.planner.device, dtype=torch.long),
+            sensors=torch.as_tensor(sensors_np, device=self.planner.device, dtype=torch.long),
+            valid=torch.as_tensor(valid_np, device=self.planner.device, dtype=torch.bool),
+            count=int(n),
+        )
+
+    def _best_from_prepared_device(self, prepared: DevicePreparedPrefixBatch):
+        n = int(prepared.count)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.planner.use_amp):
+            score_t = self.planner.score_slots_from_encoded(
+                self.cls_out,
+                self.tok_out,
+                prepared.selected,
+                self.token_active,
+                prepared.slots,
+            ).float()
+        score_t[:, 0, :] += self.planner.search_score_bias
+        flat_scores = score_t.reshape(n, -1)
+        candidate_scores = torch.gather(flat_scores, 1, prepared.flat_indices)
+        candidate_scores = candidate_scores.masked_fill(~(prepared.valid & torch.isfinite(candidate_scores)), -torch.inf)
+        idx = torch.argmax(candidate_scores, dim=1)
+        rows = torch.arange(n, device=self.planner.device)
+        has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
+        best_actions = prepared.actions[rows, idx]
+        best_scores = candidate_scores[rows, idx]
+        best_bases = prepared.bases[rows, idx]
+        best_sensors = prepared.sensors[rows, idx]
+        best_actions = torch.where(has_valid, best_actions, torch.full_like(best_actions, -1))
+        best_scores = torch.where(has_valid, best_scores, torch.full_like(best_scores, -torch.inf))
+        best_bases = torch.where(has_valid, best_bases, torch.full_like(best_bases, -1))
+        best_sensors = torch.where(has_valid, best_sensors, torch.full_like(best_sensors, -1))
+        return best_actions, best_scores, best_bases, best_sensors, has_valid
+
+    def score_prepared_prefixes_device(self, prepared: DevicePreparedPrefixBatch) -> BranchExpansionResult:
+        n = int(prepared.count)
+        if n <= 0:
+            empty = np.empty((0,), dtype=np.int64)
+            return BranchExpansionResult(
+                actions=empty,
+                scores=np.empty((0,), dtype=np.float32),
+                bases=empty,
+                sensors=empty,
+                valid=np.zeros((0,), dtype=bool),
+                score_tables=np.empty((0, 0, 0), dtype=np.float32),
+            )
+        with torch.inference_mode():
+            best_actions, best_scores, best_bases, best_sensors, has_valid = self._best_from_prepared_device(prepared)
+            return BranchExpansionResult(
+                actions=best_actions.cpu().numpy().astype(np.int64, copy=False),
+                scores=best_scores.cpu().numpy().astype(np.float32, copy=False),
+                bases=best_bases.cpu().numpy().astype(np.int64, copy=False),
+                sensors=best_sensors.cpu().numpy().astype(np.int64, copy=False),
+                valid=has_valid.cpu().numpy().astype(bool, copy=False),
+                score_tables=np.empty((0, 0, 0), dtype=np.float32),
+            )
+
+    def score_prepared_prefixes_device_graph(self, prepared: DevicePreparedPrefixBatch) -> BranchExpansionResult:
+        n = int(prepared.count)
+        if n <= 0 or self.planner.device.type != "cuda":
+            return self.score_prepared_prefixes_device(prepared)
+        try:
+            if prepared.graph is None:
+                with torch.inference_mode():
+                    for _ in range(3):
+                        _ = self._best_from_prepared_device(prepared)
+                    torch.cuda.synchronize(self.planner.device)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        (
+                            graph_best_actions,
+                            graph_best_scores,
+                            graph_best_bases,
+                            graph_best_sensors,
+                            graph_has_valid,
+                        ) = self._best_from_prepared_device(prepared)
+                prepared.graph = graph
+                prepared.graph_best_actions = graph_best_actions
+                prepared.graph_best_scores = graph_best_scores
+                prepared.graph_best_bases = graph_best_bases
+                prepared.graph_best_sensors = graph_best_sensors
+                prepared.graph_has_valid = graph_has_valid
+            prepared.graph.replay()
+            return BranchExpansionResult(
+                actions=prepared.graph_best_actions.cpu().numpy().astype(np.int64, copy=False),
+                scores=prepared.graph_best_scores.cpu().numpy().astype(np.float32, copy=False),
+                bases=prepared.graph_best_bases.cpu().numpy().astype(np.int64, copy=False),
+                sensors=prepared.graph_best_sensors.cpu().numpy().astype(np.int64, copy=False),
+                valid=prepared.graph_has_valid.cpu().numpy().astype(bool, copy=False),
+                score_tables=np.empty((0, 0, 0), dtype=np.float32),
+            )
+        except Exception:
+            return self.score_prepared_prefixes_device(prepared)
 
     def expand_prefixes(self, prefixes: Iterable[BranchPrefix], top_k: int = 1) -> list[BranchPrefix]:
         prefix_list = list(prefixes)

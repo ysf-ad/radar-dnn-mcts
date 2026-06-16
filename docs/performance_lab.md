@@ -1215,6 +1215,45 @@ of candidate roots or leaves. For changing observations, the normal prepared
 path is still needed because the tokens, slots, validity masks, and action
 tables must be rebuilt.
 
+## Batched Prefix/Frontier Expansion
+
+`BatchedWindowExpansionScorer` batches many partial within-window prefixes under
+one encoded root state. The original path already scored prefixes in one model
+call, but copied the full dense `[prefixes, targets, sensors]` score table back
+to CPU and selected valid actions in Python.
+
+The prefix scorer now has two top-1-oriented alternatives:
+
+- `score_prefixes_gpu_select(...)`: keeps valid-action gather/argmax on GPU, but
+  still rebuilds prefix masks, slots, and action tables each call.
+- `prepare_prefixes_device(...)` plus
+  `score_prepared_prefixes_device_graph(...)`: keeps fixed prefix masks, slots,
+  and action tables resident on GPU and replays model scoring plus selection
+  through a CUDA Graph.
+
+Measured on a hard root state:
+
+```text
+script: scripts/perf_lab_batched_window_expansion.py
+device=cuda, initial_targets=60, arrival_rate=4, seed=916,
+warmup=10, iterations=50
+
+prefixes  current full table   prepared device graph   speedup vs sequential
+1         ~2.64 ms             ~0.49 ms                ~6.0x
+8         ~4.07 ms             ~0.69 ms                ~33.3x
+32        ~8.45 ms             ~1.89 ms                ~47.9x
+64        ~14.40 ms            ~3.12 ms                ~55.6x
+128       ~26.70 ms            ~5.26 ms                ~67.0x
+
+selected actions match: true
+max score difference:   < 2e-7
+```
+
+The plain GPU-select path was not faster than the existing full-table path for
+most prefix counts because it still paid Python/Numpy preparation and tensor
+construction costs. The prepared device graph path is the useful one for dense
+MCTS/frontier batches that can be prepared once and replayed many times.
+
 The staged profiler makes the bottleneck explicit. For batch 128, the full path
 spent about `5.8 ms` in tokenization and `3.6-4.0 ms` in slot-feature
 construction before the GPU model forward. The prepared path removes that
