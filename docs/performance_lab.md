@@ -2141,6 +2141,55 @@ full combined scorer, but the end-to-end gain is small and noisy because CUDA
 graph build/replay, environment stepping, and root packing also contribute. It
 is kept as an opt-in lab switch rather than replacing the recommended command.
 
+`--padded-live-graph` keeps using the fixed full-batch score CUDA graph after
+some environments in the batch finish their 200 ms window. The previous graph
+path replayed only while every root in the batch was live; partial live batches
+fell back to raw eager scoring:
+
+```text
+full live batch:    replay fixed score graph
+partial live batch: raw score forward
+```
+
+The padded path instead builds a full slot batch, replays the same graph, then
+gathers the live rows:
+
+```text
+full slot batch -> fixed score graph -> live-row gather -> action selection
+```
+
+This does extra GPU work for inactive rows, but it avoids many slow partial
+eager forwards and preserves fixed-shape graph replay. On the trained action
+attention checkpoint:
+
+```bash
+python scripts/perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --cached-action-table --gpu-action-template --gpu-valid-mask --batch-env-step --checkpoint ../CreateValid1/results/critic_bootstrap_medium_eval_two_row_action_attention_qpolicy_factored_loss.pt
+python scripts/perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --cached-action-table --gpu-action-template --gpu-valid-mask --batch-env-step --padded-live-graph --checkpoint ../CreateValid1/results/critic_bootstrap_medium_eval_two_row_action_attention_qpolicy_factored_loss.pt
+```
+
+Same-condition clean A/B:
+
+```text
+base graph path:        ~383.9 env-windows/s
+padded live graph path: ~731.6 env-windows/s
+raw score rounds:       221 -> 0
+reward delta:           0.0
+executed actions delta: 0
+```
+
+A synchronized 64-env, 10-window profile confirmed that the raw partial-score
+bucket disappeared:
+
+```text
+graph_score_replay:        ~1.86 ms mean
+graph_padded_score_replay: ~2.06 ms mean
+raw score forward:         0 calls
+```
+
+The padded branch also reuses a fixed GPU slot buffer and caches live-position
+tensors for repeated active-set patterns. With this change, the recommended
+multi-env graph benchmark includes `--padded-live-graph`.
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer
@@ -2416,7 +2465,7 @@ re-encoding unchanged root state across repeated eval/training batches.
 ## Next Work
 
 - Promote cached-root multi-environment batching from benchmark script to a reusable evaluator/training data path.
-- Revisit fixed-shape CUDA Graph replay only if graph capture can be amortized across repeated prepared root batches.
+- Continue reducing the fixed-shape score graph body; padded live replay removes partial eager forwards, so the graph score kernels are again the main neural target.
 - Reduce root observation attachment and root encoding overhead for multi-env runs.
 - Replace list-of-dict observations with a packed batched observation structure for multi-env runs.
 - Expand `DenseRootSearchState` beyond the root into full batched tree tensors.

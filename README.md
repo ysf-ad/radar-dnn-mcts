@@ -124,5 +124,5 @@ python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached_cursor
 python scripts\perf_lab_coupler_variants.py --device cuda --amp --prefixes 64
-python scripts\perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --cached-action-table --gpu-action-template --gpu-valid-mask --batch-env-step
+python scripts\perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --cached-action-table --gpu-action-template --gpu-valid-mask --batch-env-step --padded-live-graph
 ```

@@ -1223,6 +1223,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     root_raw_encodes = 0
     graph_replay_rounds = 0
     raw_rounds = 0
+    padded_graph_rounds = 0
     batch_env_step_fn = getattr(radar_binding, "vec_step_selected_known_valid_into", None)
     if batch_env_step_fn is None:
         batch_env_step_fn = getattr(radar_binding, "vec_step_selected_validated_into", None)
@@ -1344,6 +1345,9 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         prealloc_action_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.long)
         prealloc_flat_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.long)
         prealloc_valid_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.bool)
+        all_root_pos = list(range(len(root_env_ids)))
+        prealloc_full_slot_t = torch.empty((len(root_env_ids), slot_template.shape[1]), device=device, dtype=torch.float32)
+        live_pos_tensor_cache: dict[tuple[int, ...], torch.Tensor] = {}
         depth = 0
         while live_pos and depth < int(args.max_depth):
             slots = time_stage(
@@ -1383,6 +1387,28 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                         lambda: graph_replay(selected_t_all, slot_t),
                     )
                     graph_replay_rounds += 1
+                elif graph_replay is not None and bool(getattr(args, "padded_live_graph", False)):
+                    def padded_graph_score_path():
+                        all_slots = make_live_slots(
+                            slot_template,
+                            all_root_pos,
+                            elapsed,
+                            search_count,
+                            track_count,
+                            last,
+                            float(args.window_ms),
+                        )
+                        prealloc_full_slot_t.copy_(torch.from_numpy(all_slots), non_blocking=False)
+                        key = tuple(live_pos)
+                        pos_t = live_pos_tensor_cache.get(key)
+                        if pos_t is None:
+                            pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
+                            live_pos_tensor_cache[key] = pos_t
+                        full_score_t = graph_replay(selected_t_all, prealloc_full_slot_t)
+                        return full_score_t.index_select(0, pos_t)
+
+                    score_t = time_stage(device, profile_enabled, stage_buckets, "graph_padded_score_replay", padded_graph_score_path)
+                    padded_graph_rounds += 1
                 else:
                     def raw_score_path():
                         pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
@@ -1523,6 +1549,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         "root_graph_replays": int(root_graph_replays),
         "root_raw_encodes": int(root_raw_encodes),
         "graph_replay_rounds": int(graph_replay_rounds),
+        "padded_graph_rounds": int(padded_graph_rounds),
         "raw_rounds": int(raw_rounds),
         "batch_env_step_calls": int(batch_env_step_calls),
         "scalar_env_step_calls": int(scalar_env_step_calls),
@@ -1567,6 +1594,7 @@ def main() -> None:
     parser.add_argument("--cached-action-table", action="store_true", help="Cache per-window physical action ordering/layout in the graph path.")
     parser.add_argument("--gpu-action-template", action="store_true", help="Keep cached action IDs and score indices resident on GPU.")
     parser.add_argument("--gpu-valid-mask", action="store_true", help="Derive per-decision action validity from cached GPU bases and selected masks.")
+    parser.add_argument("--padded-live-graph", action="store_true", help="Replay the full-batch score graph for partial live batches and gather live rows.")
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--profile-cpu-top", type=int, default=0, help="Record top cumulative cProfile functions for each benchmark path.")
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
