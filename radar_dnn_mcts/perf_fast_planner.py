@@ -301,6 +301,50 @@ class FastActionAttentionPlanner:
         q = (base_q + q_residual).masked_fill(~valid, 0.0)
         return self.policy_weight * scores + self.q_weight * q
 
+    def _combined_scores_from_encoded(self, cls_out, tok_out, selected_t, token_active, slot_t):
+        """Compute policy/Q weighted scores directly for inference.
+
+        This is algebraically equivalent to `_scores_from_encoded`, but avoids
+        allocating and masking separate full policy and Q score tables before
+        combining them.
+        """
+        model = self.model
+        slot_emb = model.backbone.slot_proj(slot_t)
+        bsz, rows, _ = tok_out.shape
+
+        sensor = model.sensor_embed[None, :, :].expand(bsz, -1, -1)
+        cls_s = cls_out[:, None, :].expand(-1, 2, -1)
+        slot_s = slot_emb[:, None, :].expand(-1, 2, -1)
+        sensor_state = model.sensor_state_proj(torch.cat([cls_s, slot_s, sensor], dim=-1))
+        coupled_sensor = model.sensor_coupler(sensor_state)
+        type_ctx = torch.cat([cls_s, slot_s, coupled_sensor], dim=-1)
+        type_logits = model.type_head(type_ctx)
+        type_q = model.type_q_head(type_ctx)
+
+        tok_st = tok_out[:, :, None, :].expand(-1, -1, 2, -1)
+        cls_st = cls_out[:, None, None, :].expand(-1, rows, 2, -1)
+        slot_st = slot_emb[:, None, None, :].expand(-1, rows, 2, -1)
+        sensor_st = coupled_sensor[:, None, :, :].expand(bsz, rows, -1, -1)
+        target_ctx = torch.cat([tok_st, cls_st, slot_st, sensor_st], dim=-1)
+        target_logits = model.target_head(target_ctx).squeeze(-1)
+        target_q = model.target_q_head(target_ctx).squeeze(-1)
+
+        track_mask = token_active & ~selected_t
+        track_mask[:, 0] = False
+        row_is_search = torch.arange(rows, device=slot_t.device)[None, :, None] == 0
+        valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
+        action_ctx = model.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
+        action_ctx = model.action_coupler(action_ctx, src_key_padding_mask=~valid.reshape(bsz, rows * 2))
+        residual = model.action_policy_residual(action_ctx).reshape(bsz, rows, 2)
+        q_residual = model.action_q_residual(action_ctx).reshape(bsz, rows, 2)
+
+        combined = slot_t.new_empty((bsz, rows, 2))
+        combined[:, 0, :] = self.policy_weight * (type_logits[:, :, 0] + residual[:, 0, :])
+        combined[:, 0, :] += self.q_weight * (type_q[:, :, 0] + q_residual[:, 0, :])
+        combined[:, 1:, :] = self.policy_weight * (type_logits[:, None, :, 1] + target_logits + residual)[:, 1:, :]
+        combined[:, 1:, :] += self.q_weight * (type_q[:, None, :, 1] + target_q + q_residual)[:, 1:, :]
+        return combined.masked_fill(~valid, -1e9)
+
     def score_slots_from_encoded(self, cls_out, tok_out, selected_t, token_active, slot_t):
         """Score many slot/selected contexts against one cached target encoding.
 
@@ -324,7 +368,7 @@ class FastActionAttentionPlanner:
             cls_out = cls_out.expand(batch, -1)
         if tok_out.shape[0] == 1 and batch > 1:
             tok_out = tok_out.expand(batch, -1, -1)
-        return self._scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t)
+        return self._combined_scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t)
 
     def plan(self, obs, budget_ms=200):
         obs = attach_env_obs(obs, self.env_cfg, True, True)
@@ -402,6 +446,45 @@ class BatchedActionAttentionScorer:
         self.use_amp = bool(use_amp and dev.type == "cuda")
         self.adapt = adapter()
 
+    def _combined_scores_from_tokens(self, tokens: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
+        model = self.model
+        cls_out, tok_out, selected, token_active = model.backbone.encode_tokens(tokens)
+        slot_emb = model.backbone.slot_proj(slot)
+        bsz, rows, _ = tok_out.shape
+
+        sensor = model.sensor_embed[None, :, :].expand(bsz, -1, -1)
+        cls_s = cls_out[:, None, :].expand(-1, 2, -1)
+        slot_s = slot_emb[:, None, :].expand(-1, 2, -1)
+        sensor_state = model.sensor_state_proj(torch.cat([cls_s, slot_s, sensor], dim=-1))
+        coupled_sensor = model.sensor_coupler(sensor_state)
+        type_ctx = torch.cat([cls_s, slot_s, coupled_sensor], dim=-1)
+        type_logits = model.type_head(type_ctx)
+        type_q = model.type_q_head(type_ctx)
+
+        tok_st = tok_out[:, :, None, :].expand(-1, -1, 2, -1)
+        cls_st = cls_out[:, None, None, :].expand(-1, rows, 2, -1)
+        slot_st = slot_emb[:, None, None, :].expand(-1, rows, 2, -1)
+        sensor_st = coupled_sensor[:, None, :, :].expand(bsz, rows, -1, -1)
+        target_ctx = torch.cat([tok_st, cls_st, slot_st, sensor_st], dim=-1)
+        target_logits = model.target_head(target_ctx).squeeze(-1)
+        target_q = model.target_q_head(target_ctx).squeeze(-1)
+
+        track_mask = token_active & ~selected
+        track_mask[:, 0] = False
+        row_is_search = torch.arange(rows, device=tokens.device)[None, :, None] == 0
+        valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
+        action_ctx = model.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
+        action_ctx = model.action_coupler(action_ctx, src_key_padding_mask=~valid.reshape(bsz, rows * 2))
+        residual = model.action_policy_residual(action_ctx).reshape(bsz, rows, 2)
+        q_residual = model.action_q_residual(action_ctx).reshape(bsz, rows, 2)
+
+        combined = tokens.new_empty((bsz, rows, 2))
+        combined[:, 0, :] = self.policy_weight * (type_logits[:, :, 0] + residual[:, 0, :])
+        combined[:, 0, :] += self.q_weight * (type_q[:, :, 0] + q_residual[:, 0, :])
+        combined[:, 1:, :] = self.policy_weight * (type_logits[:, None, :, 1] + target_logits + residual)[:, 1:, :]
+        combined[:, 1:, :] += self.q_weight * (type_q[:, None, :, 1] + target_q + q_residual)[:, 1:, :]
+        return combined.masked_fill(~valid, -1e9)
+
     def _score_dense(
         self,
         observations: list[dict],
@@ -433,8 +516,8 @@ class BatchedActionAttentionScorer:
             x = torch.from_numpy(tokens).to(self.device, dtype=torch.float32)
             s = torch.from_numpy(slots).to(self.device, dtype=torch.float32)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
-                scores, q = self.model.forward_scores(x, s)
-            score = (self.policy_weight * scores + self.q_weight * q).float().cpu().numpy()
+                score_t = self._combined_scores_from_tokens(x, s)
+            score = score_t.float().cpu().numpy()
         score[:, 0, :] += self.search_score_bias
         return np.asarray(score, dtype=np.float32), obs2, selected
 
@@ -469,8 +552,7 @@ class BatchedActionAttentionScorer:
             x = torch.from_numpy(tokens).to(self.device, dtype=torch.float32)
             s = torch.from_numpy(slots).to(self.device, dtype=torch.float32)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
-                scores, q = self.model.forward_scores(x, s)
-            score = (self.policy_weight * scores + self.q_weight * q).float()
+                score = self._combined_scores_from_tokens(x, s).float()
             score[:, 0, :] += self.search_score_bias
         return score, obs2, selected
 

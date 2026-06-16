@@ -233,6 +233,71 @@ This means large multi-root evaluations can now keep the high-volume score
 gather/sort work on the GPU, while small online batches stay on the lower
 overhead CPU/NumPy path.
 
+## Combined Policy/Q Inference
+
+For online planning and root-table construction, callers usually need only:
+
+```text
+combined_score = policy_weight * policy_score + q_weight * q_score
+```
+
+The earlier inference path built two full dense tensors first:
+
+```text
+policy_scores [batch, rows, sensors]
+q_scores      [batch, rows, sensors]
+mask both
+combine
+```
+
+The optimized inference path computes the same weighted score directly. It still
+evaluates all action policy and Q heads, but it avoids allocating and masking two
+separate full score tables before combining them:
+
+```text
+type/target policy + type/target Q + action residual policy/Q
+    -> one combined dense score table
+    -> one final validity mask
+```
+
+Equivalence checks on cached-prefix scoring and root scoring matched exactly:
+
+```text
+cached max abs diff: 0.0
+root max abs diff:   0.0
+```
+
+Updated cached action-attention profile on CUDA:
+
+```text
+prefixes=1:   full cached score ~2.24 ms,   ~446 score batches/sec
+prefixes=8:   full cached score ~2.40 ms,  ~3335 score batches/sec
+prefixes=32:  full cached score ~2.50 ms, ~12787 score batches/sec
+prefixes=64:  full cached score ~3.54 ms, ~18092 score batches/sec
+```
+
+The remaining model-side costs are the transformer-style pieces and head MLPs:
+
+```text
+sensor coupling:       ~0.61 ms
+action self-attention: ~0.46 ms at batch 1, ~1.16 ms at batch 64
+target/type/residual heads: still a large cumulative share
+```
+
+Updated root-table timings after combined-score inference:
+
+```text
+batch=32:   torch root tables ~7.48 ms,  ~16.2x vs per-root loop
+batch=128:  torch root tables ~18.21 ms, ~26.0x vs per-root loop
+```
+
+The next likely model-side optimization is to reduce the action-attention
+TransformerEncoder overhead. Options include a lean custom action-mixing block
+for the fixed 2-sensor action grid, or compiling/fusing the small MLP heads into
+larger shared projections. Custom CUDA kernels are only justified after that,
+because the current bottleneck is still high-level transformer/head dispatch
+rather than a single obvious scalar kernel.
+
 ## Current Optimization
 
 `FastActionAttentionPlanner` reuses the root target encoding inside a scheduling window:
