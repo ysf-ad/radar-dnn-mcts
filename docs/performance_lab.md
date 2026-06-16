@@ -19,6 +19,7 @@ python scripts\perf_lab_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16
 python scripts\perf_lab_persistent_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached
+python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached_cursor
 ```
 
 ## First Findings
@@ -465,6 +466,36 @@ cached + fast branch root:      ~2.0 ms
 ```
 
 That is roughly a 32x speedup for this root-wave workload.
+
+The root table can also be consumed with a cursor instead of rebuilding an
+`exclude` set each wave:
+
+```text
+cached sorted root action table
+    -> wave 0 consumes actions [0:top_k]
+    -> wave 1 consumes actions [top_k:2*top_k]
+    -> ...
+```
+
+Because cursor waves contain unseen actions by construction, dense tree updates can bulk-append array slices instead of running the generic duplicate-aware update loop.
+
+Measured CUDA profile with cursor proposals and bulk appends:
+
+```text
+cursor + bulk append + final selection:
+    combined iteration:         ~1.31 ms
+    proposal lookup total:      ~0.14 ms
+    exact branch sim total:     ~0.75 ms
+    dense tree update total:    ~0.11 ms
+    final PUCT selection:       ~0.09 ms
+    total visits:                58 unique valid root actions
+
+cursor + bulk append + select every wave:
+    combined iteration:         ~1.93 ms
+    PUCT selection total:       ~0.65 ms
+```
+
+The final-selection number is the root-expansion throughput lower bound for this workload. The select-every-wave number is closer to a tree-policy loop that needs a selection after each expansion.
 
 ## Cached Action-Attention Internals
 

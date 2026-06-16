@@ -119,4 +119,5 @@ python scripts\perf_lab_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16
 python scripts\perf_lab_persistent_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached
+python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached_cursor
 ```

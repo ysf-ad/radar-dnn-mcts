@@ -44,6 +44,7 @@ class PersistentDenseRootTree:
         self.executed = np.full((self.capacity,), -1, dtype=np.int32)
         self.valid = np.zeros((self.capacity,), dtype=bool)
         self._action_to_index: dict[int, int] = {}
+        self._root_action_cursor = 0
         self.size = 0
 
     @property
@@ -95,6 +96,57 @@ class PersistentDenseRootTree:
             updated=int(updated),
         )
 
+    def append_new_from_wave(self, wave: RootSearchWave) -> DenseRootTreeUpdate:
+        """Append a wave known to contain previously unseen actions.
+
+        Cursor-based root expansion slices a sorted action table exactly once,
+        so duplicate checking is unnecessary on the hot path. This preserves the
+        action index map for callers that still need it, but moves array writes
+        into one bulk slice assignment.
+        """
+        actions = np.asarray(wave.actions, dtype=np.int32)
+        prior_scores = np.asarray(wave.scores, dtype=np.float32)
+        rewards = np.asarray(wave.sim.rewards, dtype=np.float32)
+        executed = np.asarray(wave.sim.executed, dtype=np.int32)
+        dt_ms = np.asarray(wave.sim.dt_ms, dtype=np.float32)
+        take = min(int(actions.size), max(0, self.capacity - self.size))
+        indices = np.full((actions.size,), -1, dtype=np.int32)
+        if take <= 0:
+            return DenseRootTreeUpdate(
+                actions=actions,
+                prior_scores=prior_scores,
+                rewards=rewards,
+                executed=executed,
+                indices=indices,
+                inserted=0,
+                updated=0,
+            )
+
+        start = int(self.size)
+        stop = start + int(take)
+        idx = np.arange(start, stop, dtype=np.int32)
+        self.actions[start:stop] = actions[:take]
+        self.prior_scores[start:stop] = prior_scores[:take]
+        self.visits[start:stop] = 1
+        self.value_sums[start:stop] = rewards[:take]
+        self.reward_sums[start:stop] = rewards[:take]
+        self.elapsed_ms[start:stop] = dt_ms[:take]
+        self.executed[start:stop] = executed[:take]
+        self.valid[start:stop] = True
+        indices[:take] = idx
+        for action, action_idx in zip(actions[:take].tolist(), idx.tolist()):
+            self._action_to_index[int(action)] = int(action_idx)
+        self.size = stop
+        return DenseRootTreeUpdate(
+            actions=actions,
+            prior_scores=prior_scores,
+            rewards=rewards,
+            executed=executed,
+            indices=indices,
+            inserted=int(take),
+            updated=0,
+        )
+
     def expand_root(self, top_k: int) -> DenseRootTreeUpdate:
         return self.update_from_wave(self.search.search_wave(top_k=int(top_k)))
 
@@ -111,7 +163,27 @@ class PersistentDenseRootTree:
             )
             return self.update_from_wave(RootSearchWave(actions=actions, scores=scores, sim=empty_sim))
         result = self.search.simulate(actions)
-        return self.update_from_wave(RootSearchWave(actions=actions, scores=scores, sim=result))
+        wave = RootSearchWave(actions=actions, scores=scores, sim=result)
+        return self.append_new_from_wave(wave) if only_new else self.update_from_wave(wave)
+
+    def propose_cached_cursor(self, top_k: int) -> tuple[np.ndarray, np.ndarray]:
+        actions, scores = self.search.propose_cached(top_k=int(top_k), offset=int(self._root_action_cursor))
+        self._root_action_cursor += int(actions.size)
+        return actions, scores
+
+    def expand_root_cached_cursor(self, top_k: int) -> DenseRootTreeUpdate:
+        actions, scores = self.propose_cached_cursor(top_k=int(top_k))
+        if actions.size == 0:
+            empty_sim = BranchStepResult(
+                rewards=np.empty((0,), dtype=np.float32),
+                dt_ms=np.empty((0,), dtype=np.float32),
+                executed=np.empty((0,), dtype=np.int32),
+                terminals=np.empty((0,), dtype=np.uint8),
+                observations=[],
+            )
+            return self.update_from_wave(RootSearchWave(actions=actions, scores=scores, sim=empty_sim))
+        result = self.search.simulate(actions)
+        return self.append_new_from_wave(RootSearchWave(actions=actions, scores=scores, sim=result))
 
     def q_values(self) -> np.ndarray:
         q = np.full((self.capacity,), -np.inf, dtype=np.float32)

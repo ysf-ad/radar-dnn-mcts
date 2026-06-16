@@ -43,7 +43,8 @@ def main() -> None:
     parser.add_argument("--rate", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=916)
     parser.add_argument("--capacity", type=int, default=512)
-    parser.add_argument("--proposal-mode", choices=["recompute", "cached"], default="recompute")
+    parser.add_argument("--proposal-mode", choices=["recompute", "cached", "cached_cursor"], default="recompute")
+    parser.add_argument("--select-every-wave", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("perf_lab_persistent_dense_root_tree.json"))
     args = parser.parse_args()
 
@@ -91,6 +92,7 @@ def main() -> None:
         "top_k": int(args.top_k),
         "capacity": int(args.capacity),
         "proposal_mode": str(args.proposal_mode),
+        "select_every_wave": bool(args.select_every_wave),
         "one_time_setup_ms": float(setup_ms),
     }
 
@@ -118,7 +120,13 @@ def main() -> None:
             t_update_total = 0.0
             t_select_total = 0.0
             for _ in range(int(args.waves)):
-                if str(args.proposal_mode) == "cached":
+                if str(args.proposal_mode) == "cached_cursor":
+                    sync(device)
+                    t0 = time.perf_counter()
+                    actions, scores = tree.propose_cached_cursor(int(args.top_k))
+                    sync(device)
+                    t_prop_total += (time.perf_counter() - t0) * 1000.0
+                elif str(args.proposal_mode) == "cached":
                     sync(device)
                     t0 = time.perf_counter()
                     actions, scores = search.propose_cached(int(args.top_k), exclude=set(tree._action_to_index))
@@ -148,10 +156,20 @@ def main() -> None:
                     t_sim_total += (time.perf_counter() - t1) * 1000.0
 
                 t2 = time.perf_counter()
-                update = tree.update_from_wave(RootSearchWave(actions=actions, scores=scores, sim=sim))
+                wave = RootSearchWave(actions=actions, scores=scores, sim=sim)
+                if str(args.proposal_mode) == "cached_cursor":
+                    update = tree.append_new_from_wave(wave)
+                else:
+                    update = tree.update_from_wave(wave)
                 t_update_total += (time.perf_counter() - t2) * 1000.0
                 iter_reward += float(np.sum(update.rewards))
 
+                if bool(args.select_every_wave):
+                    t3 = time.perf_counter()
+                    _ = tree.select_action()
+                    t_select_total += (time.perf_counter() - t3) * 1000.0
+
+            if not bool(args.select_every_wave):
                 t3 = time.perf_counter()
                 _ = tree.select_action()
                 t_select_total += (time.perf_counter() - t3) * 1000.0
