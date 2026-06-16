@@ -1282,6 +1282,39 @@ The graph path is optional because capture has a one-time cost and depends on
 CUDA availability. It is most useful for repeated fixed-shape online planning,
 where the graph cache is reused across windows.
 
+End-to-end profiling of the current fast path shows the full control-loop
+shape:
+
+```text
+script: scripts/profile_online_pipeline.py
+planner: fast_graph_gpu_select
+device=cuda, initial_targets=60, arrival_rate=4, seed=916,
+windows=30, window_ms=200
+
+planner plan:                14.71 ms/window
+environment execution:        2.08 ms/window
+state metrics:                0.12 ms/window
+observation extraction:       0.05 ms/window
+one-time warmup/capture:    220.05 ms
+```
+
+Planner-internal timing for the same run:
+
+```text
+CUDA graph score replay:      0.312 ms/decision
+GPU action selection:         0.139 ms/decision
+root transformer encode:      1.43 ms/window
+root tokenization:            0.43 ms/window
+slot feature update:          0.022 ms/decision
+bookkeeping:                  0.021 ms/decision
+```
+
+The main online bottleneck is therefore still repeated per-decision score
+replay plus GPU action selection. The simulator, observation extraction, and
+window execution are not the limiting path in this configuration. For batched
+root/frontier workloads, the bottleneck shifts to CPU preprocessing unless the
+prepared-batch path is used.
+
 ## Next Work
 
 - Batch multiple environment windows during evaluation.
