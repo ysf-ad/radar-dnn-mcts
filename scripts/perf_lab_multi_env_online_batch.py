@@ -1294,6 +1294,12 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     env_executed_buf = np.empty((len(envs),), dtype=np.int32)
     batch_env_step_calls = 0
     scalar_env_step_calls = 0
+    pinned_action_cpu = None
+    if bool(getattr(args, "pinned_action_d2h", False)) and device.type == "cuda" and len(envs) > 0:
+        try:
+            pinned_action_cpu = torch.empty((len(envs),), dtype=torch.long, pin_memory=True)
+        except Exception:
+            pinned_action_cpu = None
     if envs and hasattr(planner, "warmup"):
         planner.warmup(get_obs(envs[0], 0.0), budget_ms=int(args.window_ms))
     sync(device)
@@ -1518,12 +1524,20 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                     return torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
 
                 best = time_stage(device, profile_enabled, stage_buckets, "graph_decision_select_device", select_actions)
+
+                def action_d2h():
+                    if pinned_action_cpu is not None:
+                        view = pinned_action_cpu[: len(live_pos)]
+                        view.copy_(best, non_blocking=True)
+                        return view.numpy().astype(np.int64, copy=False)
+                    return best.cpu().numpy().astype(np.int64, copy=False)
+
                 actions = time_stage(
                     device,
                     profile_enabled,
                     stage_buckets,
                     "graph_decision_action_d2h",
-                    lambda: best.cpu().numpy().astype(np.int64, copy=False),
+                    action_d2h,
                 )
             sync(device)
             plan_round_times.append((time.perf_counter() - t0) * 1000.0)
@@ -1622,6 +1636,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         "raw_rounds": int(raw_rounds),
         "batch_env_step_calls": int(batch_env_step_calls),
         "scalar_env_step_calls": int(scalar_env_step_calls),
+        "pinned_action_d2h": bool(pinned_action_cpu is not None),
         "mean_batch_size": float(np.mean(batch_sizes)) if batch_sizes else 0.0,
         "mean_depth": float(np.mean(depth_counts)) if depth_counts else 0.0,
         "planning_round_stats": stats(plan_round_times),
@@ -1669,6 +1684,7 @@ def main() -> None:
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
     parser.add_argument("--batch-env-step", action="store_true", help="Use the selected-index C batch step in the cached-root graph path.")
     parser.add_argument("--direct-root-pack", action="store_true", help="Pack cached-root observations directly from C engine buffers.")
+    parser.add_argument("--pinned-action-d2h", action="store_true", help="Use a preallocated pinned CPU buffer for graph-path selected action transfers.")
     parser.add_argument(
         "--sdp-backend",
         default="default",
@@ -1763,6 +1779,7 @@ def main() -> None:
         "sdp_backend": str(args.sdp_backend),
         "active_sdp_state": active_sdp_state,
         "matmul_precision": str(args.matmul_precision) if str(args.matmul_precision) else None,
+        "pinned_action_d2h_requested": bool(args.pinned_action_d2h),
         "envs": int(args.envs),
         "windows": int(args.windows),
         "window_ms": int(args.window_ms),

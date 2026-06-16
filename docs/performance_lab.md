@@ -2682,6 +2682,22 @@ action tensor without an immediate device-to-host synchronization. CUDA Graph
 replay is shape-compatible and action-compatible in this probe, but not
 consistently faster, so it should stay behind the measured opt-in path.
 
+The online cached-root graph path still has one unavoidable host boundary today:
+the C simulator step consumes NumPy action ids. `--pinned-action-d2h` adds a
+preallocated pinned CPU transfer buffer for that boundary. On a paired
+32-env/8-window CUDA AMP run with the trained action-attention checkpoint and
+the full graph/cached-action-table/batched-env-step path:
+
+```text
+mode             env-windows/s  plan ms/env-action  action D2H mean
+regular D2H      396.46         0.06581             0.06998 ms
+pinned D2H       397.95         0.06443             0.06850 ms
+```
+
+This is intentionally a small opt-in optimization. It does not change reward or
+executed action count in the paired run; it just removes repeated CPU transfer
+allocation and stabilizes the GPU-to-simulator boundary.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only
