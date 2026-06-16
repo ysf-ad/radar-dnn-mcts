@@ -267,6 +267,7 @@ class FastActionAttentionPlanner:
         self.stats = FastPlannerStats(True, str(dev), self.use_amp, self.use_compile)
         self._row_is_search_cache: dict[tuple[int, str, int | None], torch.Tensor] = {}
         self._cuda_graph_score_cache: dict[tuple, dict[str, object]] = {}
+        self._action_base_cache: dict[int, np.ndarray] = {}
         self.profile_enabled = False
         self._profile_values: dict[str, list[float]] = defaultdict(list)
 
@@ -540,6 +541,23 @@ class FastActionAttentionPlanner:
     def _slot_template(self, obs: dict, budget_ms: float) -> np.ndarray:
         return slot_features(obs, 0.0, 0, 0, -1, float(budget_ms)).astype(np.float32, copy=True)
 
+    def _action_base_lookup(self, max_trackers: int = MAXT) -> np.ndarray:
+        max_trackers = int(max_trackers)
+        cached = self._action_base_cache.get(max_trackers)
+        if cached is not None:
+            return cached
+        size = xs_x_track_action(max_trackers, max_trackers) + 1
+        lookup = np.full((size,), -1, dtype=np.int32)
+        lookup[xs_s_search_action(max_trackers)] = 0
+        lookup[xs_x_search_action(max_trackers)] = 0
+        s0 = xs_s_track_action(1, max_trackers)
+        x0 = xs_x_track_action(1, max_trackers)
+        bases = np.arange(1, max_trackers + 1, dtype=np.int32)
+        lookup[s0 : s0 + max_trackers] = bases
+        lookup[x0 : x0 + max_trackers] = bases
+        self._action_base_cache[max_trackers] = lookup
+        return lookup
+
     @staticmethod
     def _update_slot_inplace(
         slot: np.ndarray,
@@ -581,6 +599,8 @@ class FastActionAttentionPlanner:
         track_count = 0
         last = -1
         selected_t = root_selected.clone()
+        action_base_lookup = self._action_base_lookup(MAXT)
+        dwell_arr = np.asarray(obs["t_dwell"], dtype=np.float32)
         slot_width = int(self.model.backbone.slot_proj[0].normalized_shape[0])
         t0 = self._profile_start()
         action_tensors = None
@@ -651,7 +671,7 @@ class FastActionAttentionPlanner:
                 break
             t0 = self._profile_start()
             plan.append(best_action)
-            base, _sensor = xs_decode_action(best_action, MAXT)
+            base = int(action_base_lookup[int(best_action)]) if 0 <= int(best_action) < int(action_base_lookup.size) else xs_decode_action(best_action, MAXT)[0]
             if int(base) == 0:
                 search_count += 1
                 dt = 10.0
@@ -660,8 +680,7 @@ class FastActionAttentionPlanner:
                 if 0 <= int(base) < selected_t.shape[1]:
                     selected_t[0, int(base)] = True
                 track_count += 1
-                dwell = np.asarray(obs["t_dwell"], dtype=np.float32)
-                dt = float(dwell[int(base) - 1]) if int(base) - 1 < len(dwell) else 10.0
+                dt = float(dwell_arr[int(base) - 1]) if int(base) - 1 < len(dwell_arr) else 10.0
             elapsed += max(1.0, float(dt))
             last = int(base)
             self._profile_end("loop_bookkeeping", t0)

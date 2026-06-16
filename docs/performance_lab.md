@@ -1174,6 +1174,12 @@ tensor once per plan call and reused for all graph replays. Internal timing for
 the graph replay stage improved from about `0.345 ms/decision` to
 `0.326 ms/decision`.
 
+The action bookkeeping path now also precomputes an action-id to target-base
+lookup table and the dwell array once per plan call. This removes repeated
+`xs_decode_action(...)` calls and repeated `np.asarray(obs["t_dwell"])` wrapping
+inside the decision loop. It is a small cleanup, but the profiled bookkeeping
+stage dropped from roughly `0.022 ms/decision` to `0.021 ms/decision`.
+
 The fast planner also now builds a per-window slot-feature template. The
 observation-dependent slot terms are constant throughout a planning call, so the
 loop only updates:
