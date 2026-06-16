@@ -1326,6 +1326,18 @@ beam width 8, device top-1:           ~63.59 ms/window
 plans match fast planner:             true
 ```
 
+Prefix selected-mask construction and action-validity construction are now
+fused into one pass over each prefix batch. This avoids walking
+`prefix.selected` twice for every dynamic frontier. The live top-1 beam path
+improved again:
+
+```text
+beam width 1, full-table top-1:       ~51.20 ms/window
+beam width 4, full-table top-1:       ~49.57 ms/window
+beam width 8, full-table top-1:       ~52.34 ms/window
+plans match fast planner:             true
+```
+
 Live beam-planner A/B confirms that distinction. With a dynamic frontier, each
 depth creates a new prefix batch, so graph capture cannot be reused and the
 device-selection setup cost is paid every depth:

@@ -92,8 +92,14 @@ class BatchedWindowExpansionScorer:
         self._slot_template = slot_features(self.obs, 0.0, 0, 0, -1, self.budget_ms).astype(np.float32, copy=True)
 
     def _selected_masks(self, prefixes: list[BranchPrefix]) -> torch.Tensor:
+        selected_t, _valid_t = self._prefix_selected_and_valid(prefixes)
+        return selected_t
+
+    def _prefix_selected_and_valid(self, prefixes: list[BranchPrefix]) -> tuple[torch.Tensor, np.ndarray]:
+        n = len(prefixes)
         rows = int(self._root_selected_cpu.shape[0])
-        masks = np.broadcast_to(self._root_selected_cpu[None, :], (len(prefixes), rows)).copy()
+        masks = np.broadcast_to(self._root_selected_cpu[None, :], (n, rows)).copy()
+        valid_t = np.ones((n, int(self._root_width)), dtype=bool)
         row_idx: list[int] = []
         col_idx: list[int] = []
         for row, prefix in enumerate(prefixes):
@@ -103,8 +109,17 @@ class BatchedWindowExpansionScorer:
                     row_idx.append(row)
                     col_idx.append(base_i)
         if row_idx:
-            masks[np.asarray(row_idx, dtype=np.int64), np.asarray(col_idx, dtype=np.int64)] = True
-        return torch.as_tensor(masks, device=self.planner.device, dtype=torch.bool)
+            row_arr = np.asarray(row_idx, dtype=np.int64)
+            col_arr = np.asarray(col_idx, dtype=np.int64)
+            masks[row_arr, col_arr] = True
+            track_cols = self._root_bases > 0
+            if np.any(track_cols):
+                selected_mask = np.zeros((n, int(MAXT) + 1), dtype=bool)
+                in_range = (1 <= col_arr) & (col_arr <= int(MAXT))
+                if np.any(in_range):
+                    selected_mask[row_arr[in_range], col_arr[in_range]] = True
+                valid_t[:, track_cols] &= ~selected_mask[:, self._root_bases[track_cols]]
+        return torch.as_tensor(masks, device=self.planner.device, dtype=torch.bool), valid_t
 
     def _slots(self, prefixes: list[BranchPrefix]) -> torch.Tensor:
         n = len(prefixes)
@@ -133,7 +148,7 @@ class BatchedWindowExpansionScorer:
                 score_tables=np.empty((0, MAXT + 1, 2), dtype=np.float32),
             )
         with torch.inference_mode():
-            selected_t = self._selected_masks(prefix_list)
+            selected_t, valid_t = self._prefix_selected_and_valid(prefix_list)
             slot_t = self._slots(prefix_list)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.planner.use_amp):
                 score_t = self.planner.score_slots_from_encoded(
@@ -146,7 +161,7 @@ class BatchedWindowExpansionScorer:
             score_tables = score_t.float().cpu().numpy()
         score_tables[:, 0, :] += self.planner.search_score_bias
 
-        actions_t, bases_t, sensors_t, valid_t = self._physical_tables_for_prefixes(prefix_list)
+        actions_t, bases_t, sensors_t = self._physical_tables_for_prefixes(prefix_list)
         rows = np.arange(len(prefix_list), dtype=np.int64)[:, None]
         vals = score_tables[rows, bases_t, sensors_t]
         vals = np.where(valid_t & np.isfinite(vals), vals, -np.inf)
@@ -167,31 +182,16 @@ class BatchedWindowExpansionScorer:
         )
 
     def _valid_table_for_prefixes(self, prefixes: list[BranchPrefix]) -> np.ndarray:
-        n = len(prefixes)
-        width = int(self._root_width)
-        valid_t = np.ones((n, width), dtype=bool)
-        if width <= 0:
-            return np.zeros((n, width), dtype=bool)
-
-        selected_mask = np.zeros((n, int(MAXT) + 1), dtype=bool)
-        for row, prefix in enumerate(prefixes):
-            for base in prefix.selected:
-                base_i = int(base)
-                if 1 <= base_i <= int(MAXT):
-                    selected_mask[row, base_i] = True
-        track_cols = self._root_bases > 0
-        if np.any(track_cols):
-            valid_t[:, track_cols] &= ~selected_mask[:, self._root_bases[track_cols]]
+        _selected_t, valid_t = self._prefix_selected_and_valid(prefixes)
         return valid_t
 
-    def _physical_tables_for_prefixes(self, prefixes: list[BranchPrefix]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _physical_tables_for_prefixes(self, prefixes: list[BranchPrefix]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         n = len(prefixes)
         width = int(self._root_width)
         actions_t = np.broadcast_to(self._root_actions[None, :], (n, width)).astype(np.int64, copy=True)
         bases_t = np.broadcast_to(self._root_bases[None, :], (n, width)).astype(np.int64, copy=True)
         sensors_t = np.broadcast_to(self._root_sensors[None, :], (n, width)).astype(np.int64, copy=True)
-        valid_t = self._valid_table_for_prefixes(prefixes)
-        return actions_t, bases_t, sensors_t, valid_t
+        return actions_t, bases_t, sensors_t
 
     def score_prefixes_gpu_select(self, prefixes: Iterable[BranchPrefix]) -> BranchExpansionResult:
         """Score prefixes and keep valid-action argmax on the GPU.
@@ -211,9 +211,8 @@ class BatchedWindowExpansionScorer:
                 valid=np.zeros((0,), dtype=bool),
                 score_tables=np.empty((0, 0, 0), dtype=np.float32),
             )
-        valid_np = self._valid_table_for_prefixes(prefix_list)
         with torch.inference_mode():
-            selected_t = self._selected_masks(prefix_list)
+            selected_t, valid_np = self._prefix_selected_and_valid(prefix_list)
             slot_t = self._slots(prefix_list)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.planner.use_amp):
                 score_t = self.planner.score_slots_from_encoded(
@@ -269,9 +268,9 @@ class BatchedWindowExpansionScorer:
                 valid=empty_bool,
                 count=0,
             )
-        valid_np = self._valid_table_for_prefixes(prefix_list)
+        selected_t, valid_np = self._prefix_selected_and_valid(prefix_list)
         return DevicePreparedPrefixBatch(
-            selected=self._selected_masks(prefix_list),
+            selected=selected_t,
             slots=self._slots(prefix_list),
             actions=self._root_actions_dev.expand(n, -1),
             flat_indices=self._root_flat_indices_dev.expand(n, -1),
