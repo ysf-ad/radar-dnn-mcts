@@ -28,6 +28,7 @@ class BranchPrefix:
     search_count: int = 0
     track_count: int = 0
     last: int = -1
+    score_sum: float = 0.0
 
 
 @dataclass
@@ -140,8 +141,69 @@ class BatchedWindowExpansionScorer:
             score_tables=np.asarray(score_tables, dtype=np.float32),
         )
 
+    def expand_prefixes(self, prefixes: Iterable[BranchPrefix], top_k: int = 1) -> list[BranchPrefix]:
+        prefix_list = list(prefixes)
+        if not prefix_list:
+            return []
+        scored = self.score_prefixes(prefix_list)
+        out: list[BranchPrefix] = []
+        for row, prefix in enumerate(prefix_list):
+            actions, bases, sensors = physical_action_arrays(self.obs, selected=prefix.selected, max_trackers=MAXT)
+            if actions.size == 0:
+                continue
+            vals = scored.score_tables[row, bases, sensors]
+            finite = np.isfinite(vals)
+            if not finite.any():
+                continue
+            row_actions = actions[finite]
+            row_vals = vals[finite]
+            take = min(int(top_k), int(row_vals.size))
+            if take <= 0:
+                continue
+            part = np.argpartition(-row_vals, take - 1)[:take]
+            order = part[np.argsort(-row_vals[part])]
+            for idx in order:
+                out.append(prefix_after_action(self.obs, prefix, int(row_actions[idx]), float(row_vals[idx])))
+        return out
 
-def prefix_after_action(obs: dict, prefix: BranchPrefix, action: int) -> BranchPrefix:
+
+class BatchedBeamWindowPlanner:
+    """Window planner that expands many partial prefixes per model call."""
+
+    def __init__(
+        self,
+        planner: FastActionAttentionPlanner,
+        beam_width: int = 8,
+        branch_top_k: int = 2,
+        max_depth: int = 64,
+    ):
+        self.planner = planner
+        self.beam_width = int(beam_width)
+        self.branch_top_k = int(branch_top_k)
+        self.max_depth = int(max_depth)
+
+    def plan(self, obs, budget_ms=200):
+        scorer = BatchedWindowExpansionScorer(self.planner, obs, budget_ms=float(budget_ms))
+        frontier = [BranchPrefix()]
+        best = frontier[0]
+        for _depth in range(max(1, self.max_depth)):
+            live = [p for p in frontier if float(p.elapsed_ms) < float(budget_ms)]
+            if not live:
+                break
+            children = scorer.expand_prefixes(live, top_k=max(1, self.branch_top_k))
+            children = [p for p in children if p.actions]
+            if not children:
+                break
+            children.sort(key=lambda p: (float(p.score_sum), -float(p.elapsed_ms)), reverse=True)
+            frontier = children[: max(1, self.beam_width)]
+            if frontier and float(frontier[0].score_sum) >= float(best.score_sum):
+                best = frontier[0]
+            if best.actions and float(best.elapsed_ms) >= float(budget_ms):
+                break
+        return list(best.actions) if best.actions else [int(MAXT) + 3]
+
+
+def prefix_after_action(obs: dict, prefix: BranchPrefix, action: int, score_delta: float = 0.0) -> BranchPrefix:
     base, _sensor = xs_decode_action(int(action), MAXT)
     actions = (*prefix.actions, int(action))
     if int(base) == 0:
@@ -152,6 +214,7 @@ def prefix_after_action(obs: dict, prefix: BranchPrefix, action: int) -> BranchP
             search_count=int(prefix.search_count) + 1,
             track_count=int(prefix.track_count),
             last=0,
+            score_sum=float(prefix.score_sum) + float(score_delta),
         )
     selected = set(prefix.selected)
     selected.add(int(base))
@@ -164,4 +227,5 @@ def prefix_after_action(obs: dict, prefix: BranchPrefix, action: int) -> BranchP
         search_count=int(prefix.search_count),
         track_count=int(prefix.track_count) + 1,
         last=int(base),
+        score_sum=float(prefix.score_sum) + float(score_delta),
     )

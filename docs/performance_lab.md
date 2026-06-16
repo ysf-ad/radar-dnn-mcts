@@ -13,6 +13,7 @@ python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
 python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast
 python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
 python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batches 1,4,8,16,32,64
+python scripts\perf_lab_batched_beam_planner.py --device cuda --beam-widths 1,4,8,16 --max-depth 24
 ```
 
 ## First Findings
@@ -237,6 +238,30 @@ max absolute score difference: <= 2.1e-7
 ```
 
 Compared with pure slot scoring, expansion waves include prefix metadata, selected-target masks, candidate construction, and best-action selection, so this is the more realistic speedup to expect when wiring batched scoring into MCTS/root expansion.
+
+## Batched Beam Planner
+
+`BatchedBeamWindowPlanner` is the first usable planner built on the expansion-wave scorer. It maintains a beam of partial window plans and expands the beam in batched waves:
+
+```text
+frontier prefixes -> batched score_prefixes/expand_prefixes
+                  -> keep top beam_width prefixes by cumulative model score
+                  -> repeat until the window budget or max depth is reached
+```
+
+The compatibility mode `beam_width=1, branch_top_k=1` matches the current greedy fast planner on the benchmarked root state.
+
+Measured CUDA latency on the same 40-target, rate-3 profile state:
+
+```text
+fast cached greedy planner:  ~96.7 ms/window
+beam=1, top_k=1:            ~104.4 ms/window  (~1.08x fast latency)
+beam=4, top_k=2:            ~128.0 ms/window  (~1.32x fast latency)
+beam=8, top_k=2:            ~168.7 ms/window  (~1.74x fast latency)
+beam=16, top_k=2:           ~239.9 ms/window  (~2.48x fast latency)
+```
+
+This is not a replacement for the greedy fast planner when no extra search is needed. Its purpose is different: it provides a concrete batched-search path where additional beam/MCTS work is grouped into expansion waves instead of serial model calls. The remaining optimization target is to reduce Python prefix/candidate overhead and connect these expansion waves to exact branch simulation.
 
 ## MCTX Takeaway
 
