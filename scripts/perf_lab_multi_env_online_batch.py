@@ -71,6 +71,18 @@ def run_maybe_profiled(name: str, fn, limit: int) -> tuple[dict, list[dict[str, 
     return result, cprofile_top(profile, int(limit))
 
 
+def load_model_checkpoint(model, checkpoint: str | Path | None):
+    if checkpoint is None or str(checkpoint).strip() == "":
+        return model
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
+        state = state["model"]
+    model.load_state_dict(state, strict=True)
+    return model
+
+
 def time_stage(device: torch.device, enabled: bool, buckets: dict[str, list[float]], name: str, fn):
     if not enabled:
         return fn()
@@ -927,6 +939,7 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
             "root_h2d_encode",
             encode_root,
         )
+        selected_t_all = selected_t_all.clone()
         sync(device)
         encode_times.append((time.perf_counter() - t0) * 1000.0)
         live_pos = list(range(len(root_env_ids)))
@@ -1314,6 +1327,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                 with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
                     cls_out, tok_out, selected_t_all, token_active = planner.model.backbone.encode_tokens(root_x)
                 root_raw_encodes += 1
+        selected_t_all = selected_t_all.clone()
         sync(device)
         encode_times.append((time.perf_counter() - t0) * 1000.0)
 
@@ -1557,6 +1571,7 @@ def main() -> None:
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
     parser.add_argument("--batch-env-step", action="store_true", help="Use the selected-index C batch step in the cached-root graph path.")
     parser.add_argument("--direct-root-pack", action="store_true", help="Pack cached-root observations directly from C engine buffers.")
+    parser.add_argument("--checkpoint", type=Path, default=None, help="Optional ActionAttentionFactorizedNet state dict to benchmark.")
     parser.add_argument("--out", type=Path, default=Path("results/perf_lab_multi_env_online_batch.json"))
     args = parser.parse_args()
 
@@ -1572,7 +1587,7 @@ def main() -> None:
     env_cfg["poisson_rate_per_second"] = float(args.rate)
     env_cfg["enable_x_band"] = 1
 
-    serial_model = ActionAttentionFactorizedNet(48, 4, 2).eval()
+    serial_model = load_model_checkpoint(ActionAttentionFactorizedNet(48, 4, 2).eval(), args.checkpoint)
     batch_model = ActionAttentionFactorizedNet(48, 4, 2).eval()
     batch_model.load_state_dict(serial_model.state_dict())
     serial = FastActionAttentionPlanner(

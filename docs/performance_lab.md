@@ -2084,6 +2084,40 @@ compile full cached score:    ~2.51 ms
 
 So `torch.compile` is not part of the recommended path on this stack.
 
+The online benchmark and internal cached-score profiler now accept
+`--checkpoint` for trained `ActionAttentionFactorizedNet` state dicts. This is
+important because the default performance lab uses a freshly initialized model,
+while trained action-attention checkpoints have nonzero action residual heads.
+
+Example trained-model profiler command:
+
+```bash
+python scripts/profile_cached_action_attention_internals.py --device cuda --amp --prefix-batches 64 --iters 80 --warmup 20 --initial-targets 60 --rate 4 --checkpoint ../CreateValid1/results/critic_bootstrap_medium_eval_two_row_action_attention_qpolicy_factored_loss.pt
+```
+
+On that checkpoint, the 64-prefix cached-score profile was similar to the
+default initialized model:
+
+```text
+full_cached_score:      ~2.36 ms
+action_self_attention:  ~0.88 ms
+sensor_coupling:        ~0.46 ms
+target_heads:           ~0.32 ms
+base_score_build:       ~0.33 ms
+residual_heads:         ~0.30 ms
+```
+
+The trained checkpoint also exposed a correctness issue in the benchmark
+harness: the selected-target mask returned from an inference-mode encoder was
+later mutated as actions were selected. The benchmark now clones that mask after
+root encoding so it remains mutable.
+
+Partial-live CUDA graph replay was tested for trained checkpoints because many
+envs finish early, reducing the live batch size. It removed raw score rounds but
+was slower overall because many distinct live-batch shapes triggered graph
+capture and produced high p99 stalls. The optimization was rejected; partial
+live batches continue to use the eager raw scoring path.
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer

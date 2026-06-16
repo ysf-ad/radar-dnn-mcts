@@ -39,6 +39,18 @@ def timed(device, buckets, name, fn):
     return out
 
 
+def load_model_checkpoint(model, checkpoint: str | Path | None):
+    if checkpoint is None or str(checkpoint).strip() == "":
+        return model
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
+        state = state["model"]
+    model.load_state_dict(state, strict=True)
+    return model
+
+
 def make_prefix_tensors(scorer, count: int):
     from batched_window_expansion import BranchPrefix, prefix_after_action
     from perf_fast_planner import physical_action_arrays
@@ -209,6 +221,7 @@ def main() -> None:
     parser.add_argument("--initial-targets", type=int, default=40)
     parser.add_argument("--rate", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=916)
+    parser.add_argument("--checkpoint", type=Path, default=None, help="Optional ActionAttentionFactorizedNet state dict to profile.")
     parser.add_argument("--out", type=Path, default=Path("profile_cached_action_attention_internals.json"))
     args = parser.parse_args()
 
@@ -229,7 +242,7 @@ def main() -> None:
     eng = build_env(EDFPlanner(MAXT), args.initial_targets, MAXT, args.seed, 200, env_cfg)
     eng.reset(seed=args.seed)
     obs = get_obs(eng, 0.0)
-    model = ActionAttentionFactorizedNet(48, 4, 2).eval()
+    model = load_model_checkpoint(ActionAttentionFactorizedNet(48, 4, 2).eval(), args.checkpoint)
     planner = FastActionAttentionPlanner(model, env_cfg, device=device, use_amp=bool(args.amp), use_compile=bool(args.compile))
     scorer = BatchedWindowExpansionScorer(planner, obs, budget_ms=200.0)
 
@@ -241,6 +254,7 @@ def main() -> None:
         "initial_targets": int(args.initial_targets),
         "rate": float(args.rate),
         "seed": int(args.seed),
+        "checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
         "prefix_batches": [],
     }
 
