@@ -1842,6 +1842,55 @@ The improvement over score-only graph replay is modest, but it keeps moving
 fixed-shape model work into reusable graph capture. For short smoke tests,
 `--skip-graph` or raw cached-root timing remains easier to interpret.
 
+The same benchmark now supports whole-path Python profiling with
+`--profile-cpu-top N` in addition to synchronized stage timers. The profiled
+command was:
+
+```bash
+python scripts/perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --profile-stages --profile-cpu-top 20 --out results/perf_lab_multi_env_profile_full_steps.json
+```
+
+Because `--profile-stages` synchronizes around every timed block, this run is
+for attribution rather than headline throughput. Reward still matched the
+serial reference exactly. The optimized graph path stage profile was:
+
+```text
+graph_score_replay:            mean 1.90 ms, p50 1.58 ms
+graph_env_step_batch:          mean 1.10 ms, p50 1.08 ms
+graph_root_pack_direct:        mean 0.82 ms, p50 0.79 ms
+graph_root_tokenize_batch:     mean 0.63 ms, p50 0.61 ms
+graph_physical_action_table:   mean 0.39 ms, p50 0.38 ms
+graph_root_slot_template:      mean 0.29 ms, p50 0.27 ms
+graph_decision_select_device:  mean 0.17 ms, p50 0.16 ms
+graph_action_tensor_prep_h2d:  mean 0.16 ms, p50 0.15 ms
+graph_slot_h2d:                mean 0.12 ms, p50 0.09 ms
+graph_slot_context_update:     mean 0.08 ms, p50 0.08 ms
+```
+
+The matching Python cumulative profile for the graph path confirms that most
+remaining non-model time is in environment stepping and physical action table
+construction:
+
+```text
+sync / cuda synchronize:             profiling overhead from synchronized timers
+step_envs:                           ~425 ms cumulative
+execute_known_valid_action_fast:     ~275 ms cumulative
+binding.vec_step:                    ~229 ms cumulative
+physical_action_table_from_packed:   ~142 ms cumulative
+```
+
+Current opportunity order:
+
+1. Reduce graph score replay latency further, likely by simplifying the cached
+   action-attention score graph or moving more of the static gather/mask work
+   into capture.
+2. Batch or vectorize environment stepping across envs; we still call
+   `binding.vec_step` once per executed action.
+3. Move direct root packing/tokenization closer to the C buffers or a reusable
+   tensor buffer.
+4. Replace Python physical action-table construction with a preallocated or C
+   backed path.
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer

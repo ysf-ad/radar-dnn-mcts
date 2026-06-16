@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import cProfile
 import json
+import pstats
 import sys
 import time
 from dataclasses import dataclass
@@ -39,6 +41,34 @@ def add_profile_stage(buckets: dict[str, list[float]], name: str, value_ms: floa
 
 def profile_summary(buckets: dict[str, list[float]]) -> dict[str, dict[str, float]]:
     return dict(sorted(((name, stats(values)) for name, values in buckets.items()), key=lambda item: item[1]["mean_ms"], reverse=True))
+
+
+def cprofile_top(profile: cProfile.Profile, limit: int) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for (filename, line, func), stat in pstats.Stats(profile).stats.items():
+        ccalls, ncalls, total_time, cumulative_time, _callers = stat
+        rows.append(
+            {
+                "function": f"{Path(filename).name}:{line}:{func}",
+                "ncalls": int(ncalls),
+                "primitive_calls": int(ccalls),
+                "total_ms": float(total_time * 1000.0),
+                "cumulative_ms": float(cumulative_time * 1000.0),
+            }
+        )
+    rows.sort(key=lambda item: float(item["cumulative_ms"]), reverse=True)
+    return rows[: max(0, int(limit))]
+
+
+def run_maybe_profiled(name: str, fn, limit: int) -> tuple[dict, list[dict[str, object]]]:
+    if int(limit) <= 0:
+        return fn(), []
+    profile = cProfile.Profile()
+    try:
+        result = profile.runcall(fn)
+    finally:
+        profile.disable()
+    return result, cprofile_top(profile, int(limit))
 
 
 def time_stage(device: torch.device, enabled: bool, buckets: dict[str, list[float]], name: str, fn):
@@ -1364,6 +1394,7 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--skip-graph", action="store_true")
     parser.add_argument("--profile-stages", action="store_true")
+    parser.add_argument("--profile-cpu-top", type=int, default=0, help="Record top cumulative cProfile functions for each benchmark path.")
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
     parser.add_argument("--direct-root-pack", action="store_true", help="Pack cached-root observations directly from C engine buffers.")
     parser.add_argument("--out", type=Path, default=Path("results/perf_lab_multi_env_online_batch.json"))
@@ -1403,11 +1434,32 @@ def main() -> None:
     batch_envs = build_envs(args, env_cfg)
     cached_envs = build_envs(args, env_cfg)
     graph_envs = build_envs(args, env_cfg) if not bool(args.skip_graph) else []
+    cpu_profiles: dict[str, list[dict[str, object]]] = {}
     try:
-        serial_report = run_serial(serial, serial_envs, args, device)
-        batched_report = run_batched(batched, batch_envs, args, device)
-        cached_report = run_batched_cached(serial, cached_envs, args, device)
-        graph_report = run_batched_cached_graph(serial, graph_envs, args, device) if graph_envs else {}
+        serial_report, cpu_profiles["serial_fast_graph_gpu_select"] = run_maybe_profiled(
+            "serial_fast_graph_gpu_select",
+            lambda: run_serial(serial, serial_envs, args, device),
+            int(args.profile_cpu_top),
+        )
+        batched_report, cpu_profiles["batched_multi_env_reencode"] = run_maybe_profiled(
+            "batched_multi_env_reencode",
+            lambda: run_batched(batched, batch_envs, args, device),
+            int(args.profile_cpu_top),
+        )
+        cached_report, cpu_profiles["batched_multi_env_cached_root"] = run_maybe_profiled(
+            "batched_multi_env_cached_root",
+            lambda: run_batched_cached(serial, cached_envs, args, device),
+            int(args.profile_cpu_top),
+        )
+        if graph_envs:
+            graph_report, cpu_profiles["batched_multi_env_cached_root_graph"] = run_maybe_profiled(
+                "batched_multi_env_cached_root_graph",
+                lambda: run_batched_cached_graph(serial, graph_envs, args, device),
+                int(args.profile_cpu_top),
+            )
+        else:
+            graph_report = {}
+            cpu_profiles["batched_multi_env_cached_root_graph"] = []
     finally:
         for eng in [*serial_envs, *batch_envs, *cached_envs, *graph_envs]:
             eng.close()
@@ -1440,6 +1492,7 @@ def main() -> None:
         if graph_report
         else None,
         "reward_delta_reencode_minus_serial": float(batched_report["total_reward"] - serial_report["total_reward"]),
+        "cpu_profile_top": cpu_profiles if int(args.profile_cpu_top) > 0 else {},
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")
