@@ -138,25 +138,17 @@ class BatchedWindowExpansionScorer:
             score_tables = score_t.float().cpu().numpy()
         score_tables[:, 0, :] += self.planner.search_score_bias
 
-        out_actions = np.full((len(prefix_list),), -1, dtype=np.int64)
-        out_scores = np.full((len(prefix_list),), -np.inf, dtype=np.float32)
-        out_bases = np.full((len(prefix_list),), -1, dtype=np.int64)
-        out_sensors = np.full((len(prefix_list),), -1, dtype=np.int64)
-        out_valid = np.zeros((len(prefix_list),), dtype=bool)
-        for row, prefix in enumerate(prefix_list):
-            actions, bases, sensors = physical_action_arrays(self.obs, selected=prefix.selected, max_trackers=MAXT)
-            if actions.size == 0:
-                continue
-            vals = score_tables[row, bases, sensors]
-            finite = np.isfinite(vals)
-            if not finite.any():
-                continue
-            pick_local = int(np.nanargmax(np.where(finite, vals, -np.inf)))
-            out_actions[row] = int(actions[pick_local])
-            out_scores[row] = float(vals[pick_local])
-            out_bases[row] = int(bases[pick_local])
-            out_sensors[row] = int(sensors[pick_local])
-            out_valid[row] = True
+        actions_t, bases_t, sensors_t, valid_t = self._physical_tables_for_prefixes(prefix_list)
+        rows = np.arange(len(prefix_list), dtype=np.int64)[:, None]
+        vals = score_tables[rows, bases_t, sensors_t]
+        vals = np.where(valid_t & np.isfinite(vals), vals, -np.inf)
+        pick = np.argmax(vals, axis=1)
+        row1 = np.arange(len(prefix_list), dtype=np.int64)
+        out_scores = vals[row1, pick].astype(np.float32, copy=False)
+        out_valid = np.isfinite(out_scores)
+        out_actions = np.where(out_valid, actions_t[row1, pick], -1).astype(np.int64, copy=False)
+        out_bases = np.where(out_valid, bases_t[row1, pick], -1).astype(np.int64, copy=False)
+        out_sensors = np.where(out_valid, sensors_t[row1, pick], -1).astype(np.int64, copy=False)
         return BranchExpansionResult(
             actions=out_actions,
             scores=out_scores,
@@ -368,6 +360,12 @@ class BatchedWindowExpansionScorer:
         if not prefix_list:
             return []
         scored = self.score_prefixes(prefix_list)
+        if int(top_k) == 1:
+            return [
+                prefix_after_action(self.obs, prefix, int(scored.actions[row]), float(scored.scores[row]))
+                for row, prefix in enumerate(prefix_list)
+                if bool(scored.valid[row]) and int(scored.actions[row]) >= 0
+            ]
         out: list[BranchPrefix] = []
         for row, prefix in enumerate(prefix_list):
             actions, bases, sensors = physical_action_arrays(self.obs, selected=prefix.selected, max_trackers=MAXT)

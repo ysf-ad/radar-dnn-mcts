@@ -1300,6 +1300,20 @@ selected actions match: true
 max score difference:   < 2e-7
 ```
 
+The default full-table path also now uses the cached root action table for its
+top-1 CPU selection. `score_prefixes(...)` gathers valid candidate scores with
+one NumPy operation, and `expand_prefixes(top_k=1)` consumes those top-1 results
+directly instead of rebuilding physical action arrays per prefix. The measured
+prefix benchmark remains noisy at large batch sizes, but the live top-1 beam
+planner stays in the same improved range while preserving plans:
+
+```text
+beam width 1, full-table top-1:       ~60.25 ms/window
+beam width 4, full-table top-1:       ~59.27 ms/window
+beam width 8, full-table top-1:       ~63.28 ms/window
+plans match fast planner:             true
+```
+
 Live beam-planner A/B confirms that distinction. With a dynamic frontier, each
 depth creates a new prefix batch, so graph capture cannot be reused and the
 device-selection setup cost is paid every depth:
