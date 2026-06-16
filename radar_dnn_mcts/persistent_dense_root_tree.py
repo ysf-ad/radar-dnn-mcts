@@ -48,7 +48,7 @@ class PersistentDenseRootTree:
 
     @property
     def total_visits(self) -> int:
-        return int(np.sum(self.visits[self.valid]))
+        return int(np.sum(self.visits[: self.size]))
 
     def update_from_wave(self, wave: RootSearchWave) -> DenseRootTreeUpdate:
         actions = np.asarray(wave.actions, dtype=np.int32)
@@ -133,17 +133,23 @@ class PersistentDenseRootTree:
         return probs
 
     def puct_scores(self, c_puct: float = 1.25) -> np.ndarray:
-        q = self.q_values()
-        prior = self.prior_probabilities()
+        q_live, prior_live = self._live_q_prior()
+        scores = np.full((self.capacity,), -np.inf, dtype=np.float32)
+        if self.size <= 0:
+            return scores
         parent_visits = max(self.total_visits, 1)
-        explore = float(c_puct) * prior * np.sqrt(float(parent_visits)) / (1.0 + self.visits)
-        score = q + explore
-        return np.where(self.valid, score, -np.inf)
+        visits = self.visits[: self.size]
+        explore = float(c_puct) * prior_live * np.sqrt(float(parent_visits)) / (1.0 + visits)
+        scores[: self.size] = q_live + explore
+        return scores
 
     def select_index(self, c_puct: float = 1.25) -> int:
-        scores = self.puct_scores(c_puct=float(c_puct))
-        if not np.isfinite(scores).any():
+        if self.size <= 0:
             return -1
+        q_live, prior_live = self._live_q_prior()
+        parent_visits = max(self.total_visits, 1)
+        visits = self.visits[: self.size]
+        scores = q_live + float(c_puct) * prior_live * np.sqrt(float(parent_visits)) / (1.0 + visits)
         return int(np.nanargmax(scores))
 
     def select_action(self, c_puct: float = 1.25) -> int:
@@ -152,3 +158,18 @@ class PersistentDenseRootTree:
 
     def close(self) -> None:
         self.search.close()
+
+    def _live_q_prior(self) -> tuple[np.ndarray, np.ndarray]:
+        visits = np.maximum(self.visits[: self.size], 1)
+        q = self.value_sums[: self.size] / visits
+        prior_scores = self.prior_scores[: self.size]
+        if prior_scores.size == 0:
+            return q.astype(np.float32), np.empty((0,), dtype=np.float32)
+        centered = prior_scores - np.max(prior_scores)
+        exp_scores = np.exp(centered, dtype=np.float32)
+        denom = float(np.sum(exp_scores))
+        if denom <= 0.0 or not np.isfinite(denom):
+            prior = np.full_like(exp_scores, 1.0 / float(exp_scores.size), dtype=np.float32)
+        else:
+            prior = exp_scores / denom
+        return q.astype(np.float32), prior.astype(np.float32)

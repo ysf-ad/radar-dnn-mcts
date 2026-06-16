@@ -79,12 +79,14 @@ def main() -> None:
         scalar_results = []
         batched_result = None
         scalar_times = []
-        batched_times = []
+        legacy_times = []
+        fast_times = []
         try:
             # One correctness pass.
             for action in actions:
-                scalar_results.append(scalar.step_actions(np.asarray([action], dtype=np.int32)))
-            batched_result = batched.step_actions(actions)
+                scalar_results.append(scalar.step_actions(np.asarray([action], dtype=np.int32), include_observations=False))
+            legacy_result = batched.step_actions_legacy(actions, include_observations=False)
+            batched_result = batched.step_actions(actions, include_observations=False)
             scalar_exec = np.asarray([r.executed[0] for r in scalar_results], dtype=np.int32)
             scalar_dt = np.asarray([r.dt_ms[0] for r in scalar_results], dtype=np.float32)
             scalar_rewards = np.asarray([r.rewards[0] for r in scalar_results], dtype=np.float32)
@@ -92,32 +94,44 @@ def main() -> None:
             for i in range(int(args.warmup) + int(args.iters)):
                 t0 = time.perf_counter()
                 for action in actions:
-                    _ = scalar.step_actions(np.asarray([action], dtype=np.int32))
+                    _ = scalar.step_actions(np.asarray([action], dtype=np.int32), include_observations=False)
                 scalar_ms = (time.perf_counter() - t0) * 1000.0
 
                 t1 = time.perf_counter()
-                _ = batched.step_actions(actions)
-                batched_ms = (time.perf_counter() - t1) * 1000.0
+                _ = batched.step_actions_legacy(actions, include_observations=False)
+                legacy_ms = (time.perf_counter() - t1) * 1000.0
+
+                t2 = time.perf_counter()
+                _ = batched.step_actions(actions, include_observations=False)
+                fast_ms = (time.perf_counter() - t2) * 1000.0
                 if i >= int(args.warmup):
                     scalar_times.append(scalar_ms)
-                    batched_times.append(batched_ms)
+                    legacy_times.append(legacy_ms)
+                    fast_times.append(fast_ms)
         finally:
             scalar.close()
             batched.close()
 
         scalar_stat = stats(scalar_times)
-        batched_stat = stats(batched_times)
+        legacy_stat = stats(legacy_times)
+        fast_stat = stats(fast_times)
         report["branch_sizes"].append(
             {
                 "branches": int(branch_size),
                 "executed_match": bool(np.array_equal(scalar_exec, batched_result.executed)),
+                "legacy_executed_match": bool(np.array_equal(scalar_exec, legacy_result.executed)),
                 "dt_match": bool(np.allclose(scalar_dt, batched_result.dt_ms)),
+                "legacy_dt_match": bool(np.allclose(scalar_dt, legacy_result.dt_ms)),
                 "reward_match": bool(np.allclose(scalar_rewards, batched_result.rewards)),
+                "legacy_reward_match": bool(np.allclose(scalar_rewards, legacy_result.rewards)),
                 "scalar_loop": scalar_stat,
-                "batched_step": batched_stat,
-                "speedup_mean": float(scalar_stat["mean_ms"] / max(batched_stat["mean_ms"], 1e-12)),
+                "batched_legacy_step": legacy_stat,
+                "batched_fast_step": fast_stat,
+                "speedup_mean": float(scalar_stat["mean_ms"] / max(fast_stat["mean_ms"], 1e-12)),
+                "fast_vs_legacy_speedup_mean": float(legacy_stat["mean_ms"] / max(fast_stat["mean_ms"], 1e-12)),
                 "branches_per_second_scalar": float(branch_size / max(scalar_stat["mean_ms"], 1e-12) * 1000.0),
-                "branches_per_second_batched": float(branch_size / max(batched_stat["mean_ms"], 1e-12) * 1000.0),
+                "branches_per_second_batched_legacy": float(branch_size / max(legacy_stat["mean_ms"], 1e-12) * 1000.0),
+                "branches_per_second_batched_fast": float(branch_size / max(fast_stat["mean_ms"], 1e-12) * 1000.0),
             }
         )
 

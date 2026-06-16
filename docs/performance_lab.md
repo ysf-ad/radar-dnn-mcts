@@ -132,6 +132,26 @@ branches=58: ~1.46x
 
 The executed actions, elapsed times, and rewards matched the scalar path in the benchmark. The speedup is real but modest because the C binding still loops internally over vector envs. The larger win should come from combining this with batched neural scoring and dense tree tensors so MCTS expansion/evaluation happens in grouped batches instead of Python node-by-node control flow.
 
+The branch simulator now also has a lower-overhead C path:
+
+```text
+vec_restore_n(root snapshot, active_branch_count)
+vec_step_validated_into(dt_buffer, executed_buffer, active_branch_count)
+```
+
+This avoids restoring inactive vector slots, avoids Python lists for `dt`/`executed`, and lets root-search callers skip branch observation dictionaries when they only need rewards and execution metadata.
+
+Measured branch-sim correctness matched scalar execution for executed actions, dwell time, and reward. The isolated branch benchmark showed modest direct speedups over the legacy batched API:
+
+```text
+branches=1:  fast vs legacy ~1.22x
+branches=8:  fast vs legacy ~1.01x
+branches=32: fast vs legacy ~1.05x
+branches=58: fast vs legacy ~1.00x
+```
+
+The larger practical win appears in cached root search, where later waves may have fewer active actions and observation dictionaries are unnecessary.
+
 ## End-to-End Online Profile
 
 `profile_online_pipeline.py` times the full online evaluation loop:
@@ -424,6 +444,27 @@ rerun action attention for every root wave
 ```
 
 The remaining latency after this change is mostly exact branch simulation plus small PUCT/select overhead. For deeper MCTS, the analogous optimization is to cache action tables per expanded node and batch only genuinely new node/action evaluations.
+
+After adding active-count C stepping, skipping branch observations, and live-slice PUCT selection, the same cached root-tree benchmark improved again:
+
+```text
+cached root table + fast branch step + live PUCT:
+    combined iteration:         ~2.0 ms
+    proposal lookup total:      ~0.23 ms
+    exact branch sim total:     ~0.75 ms
+    dense tree update total:    ~0.21 ms
+    PUCT selection total:       ~0.60 ms
+    total visits:                58 unique valid root actions
+```
+
+Compared with the original repeated neural proposal benchmark:
+
+```text
+recompute proposal/root waves: ~65.5 ms
+cached + fast branch root:      ~2.0 ms
+```
+
+That is roughly a 32x speedup for this root-wave workload.
 
 ## Cached Action-Attention Internals
 

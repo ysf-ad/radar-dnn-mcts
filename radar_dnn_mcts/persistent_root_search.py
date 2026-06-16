@@ -113,8 +113,12 @@ class PersistentRootSearch:
         stop = start + max(0, int(top_k))
         return np.asarray(actions[start:stop], dtype=np.int32), np.asarray(scores[start:stop], dtype=np.float32)
 
-    def simulate(self, actions: np.ndarray) -> BranchStepResult:
-        return self.sim.step_actions(np.asarray(actions, dtype=np.int32), snapshot=self.root_snapshot)
+    def simulate(self, actions: np.ndarray, include_observations: bool = False) -> BranchStepResult:
+        return self.sim.step_actions(
+            np.asarray(actions, dtype=np.int32),
+            snapshot=self.root_snapshot,
+            include_observations=bool(include_observations),
+        )
 
     def search_wave(self, top_k: int) -> RootSearchWave:
         actions, scores = self.propose(top_k=int(top_k))

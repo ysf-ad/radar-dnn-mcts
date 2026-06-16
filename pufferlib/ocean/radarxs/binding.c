@@ -1,4 +1,5 @@
 #include <Python.h>
+#include <numpy/arrayobject.h>
 #include "radarxs.h"
 
 #define Env Radarxs
@@ -165,6 +166,43 @@ static PyObject* radarxs_vec_restore_all(PyObject* self, PyObject* args) {
         return NULL;
     }
     for (int i = 0; i < vec->num_envs; i++) {
+        if (!vec->envs[i]) {
+            PyErr_SetString(PyExc_ValueError, "invalid env in vector");
+            return NULL;
+        }
+        if (radarxs_restore_snapshot_into(vec->envs[i], dict) < 0) {
+            return NULL;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* radarxs_vec_restore_n(PyObject* self, PyObject* args) {
+    if (PyTuple_Size(args) != 3) {
+        PyErr_SetString(PyExc_TypeError, "vec_restore_n requires vec handle, snapshot dict, and count");
+        return NULL;
+    }
+    PyObject* handle_obj = PyTuple_GetItem(args, 0);
+    if (!PyObject_TypeCheck(handle_obj, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "vec env handle must be an integer");
+        return NULL;
+    }
+    RadarxsVecEnv* vec = (RadarxsVecEnv*)PyLong_AsVoidPtr(handle_obj);
+    if (!vec || vec->num_envs <= 0 || !vec->envs) {
+        PyErr_SetString(PyExc_ValueError, "invalid vec env handle");
+        return NULL;
+    }
+    PyObject* dict = PyTuple_GetItem(args, 1);
+    if (!PyDict_Check(dict)) {
+        PyErr_SetString(PyExc_TypeError, "snapshot must be a dict");
+        return NULL;
+    }
+    int count = (int)PyLong_AsLong(PyTuple_GetItem(args, 2));
+    if (count < 0 || count > vec->num_envs) {
+        PyErr_SetString(PyExc_ValueError, "restore count out of range");
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
         if (!vec->envs[i]) {
             PyErr_SetString(PyExc_ValueError, "invalid env in vector");
             return NULL;
@@ -384,13 +422,79 @@ static PyObject* radarxs_vec_step_validated(PyObject* self, PyObject* args) {
     return dict;
 }
 
+static PyObject* radarxs_vec_step_validated_into(PyObject* self, PyObject* args) {
+    if (PyTuple_Size(args) != 4) {
+        PyErr_SetString(PyExc_TypeError, "vec_step_validated_into requires vec handle, dt array, executed array, and count");
+        return NULL;
+    }
+    PyObject* handle_obj = PyTuple_GetItem(args, 0);
+    if (!PyObject_TypeCheck(handle_obj, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "vec env handle must be an integer");
+        return NULL;
+    }
+    RadarxsVecEnv* vec = (RadarxsVecEnv*)PyLong_AsVoidPtr(handle_obj);
+    if (!vec || vec->num_envs <= 0 || !vec->envs) {
+        PyErr_SetString(PyExc_ValueError, "invalid vec env handle");
+        return NULL;
+    }
+    PyObject* dt_obj = PyTuple_GetItem(args, 1);
+    PyObject* executed_obj = PyTuple_GetItem(args, 2);
+    if (!PyObject_TypeCheck(dt_obj, &PyArray_Type) || !PyObject_TypeCheck(executed_obj, &PyArray_Type)) {
+        PyErr_SetString(PyExc_TypeError, "dt and executed outputs must be NumPy arrays");
+        return NULL;
+    }
+    PyArrayObject* dt_arr = (PyArrayObject*)dt_obj;
+    PyArrayObject* executed_arr = (PyArrayObject*)executed_obj;
+    if (!PyArray_ISCONTIGUOUS(dt_arr) || !PyArray_ISCONTIGUOUS(executed_arr)) {
+        PyErr_SetString(PyExc_ValueError, "dt and executed outputs must be contiguous");
+        return NULL;
+    }
+    if (PyArray_TYPE(dt_arr) != NPY_FLOAT32 || PyArray_TYPE(executed_arr) != NPY_INT32) {
+        PyErr_SetString(PyExc_ValueError, "dt must be float32 and executed must be int32");
+        return NULL;
+    }
+    int count = (int)PyLong_AsLong(PyTuple_GetItem(args, 3));
+    if (count < 0 || count > vec->num_envs ||
+        PyArray_SIZE(dt_arr) < count || PyArray_SIZE(executed_arr) < count) {
+        PyErr_SetString(PyExc_ValueError, "step count out of range");
+        return NULL;
+    }
+    float* dt_out = (float*)PyArray_DATA(dt_arr);
+    int* executed_out = (int*)PyArray_DATA(executed_arr);
+    for (int i = 0; i < count; i++) {
+        Radarxs* env = vec->envs[i];
+        int raw_action = env->actions[0];
+        int logical_action;
+        int requested_sensor;
+        int before_tick = env->tick;
+        radarxs_decode_physical_action(env, raw_action, &logical_action, &requested_sensor);
+        int valid = radarxs_action_valid_for_wrapper(env, raw_action);
+        if (valid) {
+            c_step(env);
+            float dt = (float)(env->tick - before_tick);
+            if (logical_action == SEARCH && dt <= 0.0f) {
+                dt = (float)SEARCH_DWELL_TIME;
+            }
+            executed_out[i] = raw_action;
+            dt_out[i] = dt;
+        } else {
+            env->rewards[0] = 0.0f;
+            executed_out[i] = -1;
+            dt_out[i] = 0.0f;
+        }
+    }
+    return PyLong_FromLong(count);
+}
+
 #define MY_METHODS \
     {"vec_snapshot", radarxs_vec_snapshot, METH_VARARGS, "Snapshot first radar env in a vector"}, \
     {"vec_restore", radarxs_vec_restore, METH_VARARGS, "Restore first radar env in a vector"}, \
     {"vec_restore_all", radarxs_vec_restore_all, METH_VARARGS, "Restore every radar env in a vector from one snapshot"}, \
+    {"vec_restore_n", radarxs_vec_restore_n, METH_VARARGS, "Restore the first N radar envs in a vector from one snapshot"}, \
     {"vec_aux", radarxs_vec_aux, METH_VARARGS, "Return sensor busy timers and target ranges for first radar env"}, \
     {"vec_aux_all", radarxs_vec_aux_all, METH_VARARGS, "Return sensor busy timers and target ranges for every radar env"}, \
-    {"vec_step_validated", radarxs_vec_step_validated, METH_VARARGS, "Step every env with Python-wrapper-compatible action validity"}
+    {"vec_step_validated", radarxs_vec_step_validated, METH_VARARGS, "Step every env with Python-wrapper-compatible action validity"}, \
+    {"vec_step_validated_into", radarxs_vec_step_validated_into, METH_VARARGS, "Step first N envs and write dt/executed into NumPy arrays"}
 
 #include "../env_binding.h"
 
