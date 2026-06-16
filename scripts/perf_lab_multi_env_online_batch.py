@@ -1210,9 +1210,10 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     root_raw_encodes = 0
     graph_replay_rounds = 0
     raw_rounds = 0
-    batch_env_step_available = bool(getattr(args, "batch_env_step", False)) and bool(getattr(args, "fast_env_step", False)) and hasattr(
-        radar_binding, "vec_step_selected_validated_into"
-    )
+    batch_env_step_fn = getattr(radar_binding, "vec_step_selected_known_valid_into", None)
+    if batch_env_step_fn is None:
+        batch_env_step_fn = getattr(radar_binding, "vec_step_selected_validated_into", None)
+    batch_env_step_available = bool(getattr(args, "batch_env_step", False)) and bool(getattr(args, "fast_env_step", False)) and batch_env_step_fn is not None
     env_vec = radar_binding.vec_view_firsts(*[eng.env for eng in envs]) if batch_env_step_available and envs else None
     env_index_buf = np.empty((len(envs),), dtype=np.int32)
     env_action_buf = np.empty((len(envs),), dtype=np.int32)
@@ -1431,7 +1432,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                     for local_idx, pos in enumerate(live_pos):
                         env_index_buf[local_idx] = int(root_env_ids[pos])
                         env_action_buf[local_idx] = int(actions[local_idx])
-                    radar_binding.vec_step_selected_validated_into(
+                    batch_env_step_fn(
                         env_vec,
                         env_index_buf,
                         env_action_buf,

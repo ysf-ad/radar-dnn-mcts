@@ -1997,7 +1997,7 @@ The smoke and 64-env runs preserved reward parity:
 64 envs x 20 windows: reward delta graph minus serial = 0.0
 ```
 
-The best measured command in this pass was:
+The best measured command before C env-step batching was:
 
 ```bash
 python scripts/perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --cached-action-table --gpu-action-template --gpu-valid-mask
@@ -2012,7 +2012,7 @@ reward delta:              0.0
 ```
 
 Precomputing the GPU validity-mask gather indices and search-action mask inside
-the action template gave the final measured result:
+the action template gave:
 
 ```text
 graph throughput:          ~955.9 env-windows/s
@@ -2020,9 +2020,9 @@ planning ms/env-action:    ~0.0305 ms
 reward delta:              0.0
 ```
 
-The existing `--batch-env-step` path was also tested with the same graph
-configuration. It was reward-equivalent and changed the graph path from 25600
-scalar env-step calls to 400 batch env-step calls, but it was slower overall:
+The original `--batch-env-step` path used the validated C batch function. It was
+reward-equivalent and changed the graph path from 25600 scalar env-step calls
+to 400 batch env-step calls, but it was slower overall:
 
 ```text
 --batch-env-step graph throughput:       ~926.4 env-windows/s
@@ -2030,7 +2030,27 @@ scalar env-step calls to 400 batch env-step calls, but it was slower overall:
 reward delta:                            0.0
 ```
 
-So `--batch-env-step` is not part of the recommended command on this stack.
+That exposed the mismatch: the scalar fast path was already operating on
+known-valid model-selected actions, while the batch path was repeating wrapper
+validation. A new `vec_step_selected_known_valid_into` C function now batches
+the same known-valid transition used by the scalar fast path.
+
+The new recommended command is:
+
+```bash
+python scripts/perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --cached-action-table --gpu-action-template --gpu-valid-mask --batch-env-step
+```
+
+Two clean 64-env, 20-window runs preserved reward parity:
+
+```text
+run 1 graph throughput:       ~1051.2 env-windows/s
+run 2 graph throughput:       ~1057.2 env-windows/s
+planning ms/env-action:       ~0.0309-0.0311 ms
+reward delta graph-serial:    0.0
+batch env-step calls:         400
+scalar env-step calls:        0
+```
 
 This is the strongest end-to-end result so far in the current clean repo. The
 synchronized profile is useful for bottleneck ranking, but it inserts many CUDA
@@ -2038,19 +2058,31 @@ synchronizations and should not be used as the headline latency number. On the
 64-env, 10-window profiled graph path, the largest per-decision stages were:
 
 ```text
-graph_score_replay:             ~1.72 ms mean
-graph_env_step_batch:           ~1.09 ms mean
-graph_root_pack_direct:         ~0.82 ms mean
-graph_root_tokenize_batch:      ~0.66 ms mean
-graph_action_template_h2d:      ~0.38 ms mean, once per root/window
-graph_physical_action_template: ~0.34 ms mean, once per root/window
-graph_action_tensor_prep_h2d:   ~0.13 ms mean
-graph_decision_select_device:   ~0.15 ms mean
+graph_score_replay:             ~1.84 ms mean
+graph_root_pack_direct:         ~1.38 ms mean
+graph_root_tokenize_batch:      ~1.18 ms mean
+graph_env_step_batch:           ~0.70 ms mean
+graph_action_template_h2d:      ~0.53 ms mean, once per root/window
+graph_root_slot_template:       ~0.51 ms mean, once per root/window
+graph_physical_action_template: ~0.50 ms mean, once per root/window
+graph_decision_select_device:   ~0.26 ms mean
+graph_action_tensor_prep_h2d:   ~0.20 ms mean
 ```
 
-The next high-value targets are model replay, environment stepping, and root
-packing/tokenization. The action-template and validity-mask optimizations mainly
-remove repeated tensor staging around selection.
+The next high-value targets are model replay and CPU root packing/tokenization.
+The action-template, validity-mask, and known-valid batch-step optimizations
+mainly remove repeated tensor staging and Python/C call overhead around
+selection and environment stepping.
+
+An internal scorer profile also tested `torch.compile --mode reduce-overhead`
+on the current AMP cached-score shape. It did not improve the full cached score:
+
+```text
+no compile full cached score: ~2.30 ms
+compile full cached score:    ~2.51 ms
+```
+
+So `torch.compile` is not part of the recommended path on this stack.
 
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
