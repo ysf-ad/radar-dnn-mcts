@@ -493,6 +493,70 @@ class ActionAttentionFactorizedNet(TwoRowFactorizedNet):
         return scores, q
 
 
+class CachedRootActionAttentionFactorizedNet(ActionAttentionFactorizedNet):
+    """Action-attention model whose root target embeddings are cacheable.
+
+    The deployment fast path updates the selected-target mask after the root
+    target transformer has run. This variant matches that formulation by
+    preventing the selected flag from changing the shared target encoder while
+    still using it to mask invalid repeated target actions downstream.
+    """
+
+    @staticmethod
+    def _encoder_tokens(tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.shape[-1] <= 8:
+            return tokens
+        enc_tokens = tokens.clone()
+        enc_tokens[:, :, 8] = 0.0
+        return enc_tokens
+
+    def forward_scores(self, tokens: torch.Tensor, slot: torch.Tensor):
+        selected = tokens[:, :, 8] > 0.5
+        cls_out, tok_out, _ignored_selected, token_active = self.backbone.encode_tokens(self._encoder_tokens(tokens))
+        slot_emb = self.backbone.slot_proj(slot)
+        bsz, rows, _d_model = tok_out.shape
+
+        sensor = self.sensor_embed[None, :, :].expand(bsz, -1, -1)
+        cls_s = cls_out[:, None, :].expand(-1, 2, -1)
+        slot_s = slot_emb[:, None, :].expand(-1, 2, -1)
+        sensor_state = self.sensor_state_proj(torch.cat([cls_s, slot_s, sensor], dim=-1))
+        coupled_sensor = self.sensor_coupler(sensor_state)
+        type_ctx = torch.cat([cls_s, slot_s, coupled_sensor], dim=-1)
+        type_logits = self.type_head(type_ctx)
+        type_q = self.type_q_head(type_ctx)
+
+        tok_st = tok_out[:, :, None, :].expand(-1, -1, 2, -1)
+        cls_st = cls_out[:, None, None, :].expand(-1, rows, 2, -1)
+        slot_st = slot_emb[:, None, None, :].expand(-1, rows, 2, -1)
+        sensor_st = coupled_sensor[:, None, :, :].expand(bsz, rows, -1, -1)
+        target_ctx = torch.cat([tok_st, cls_st, slot_st, sensor_st], dim=-1)
+        target_logits = self.target_head(target_ctx).squeeze(-1)
+        target_q = self.target_q_head(target_ctx).squeeze(-1)
+
+        base_scores = tokens.new_full((bsz, rows, 2), -1e9)
+        base_q = tokens.new_zeros((bsz, rows, 2))
+        base_scores[:, 0, :] = type_logits[:, :, 0]
+        base_q[:, 0, :] = type_q[:, :, 0]
+        track_mask = token_active & ~selected
+        track_mask[:, 0] = False
+        base_scores[:, 1:, :] = (type_logits[:, None, :, 1] + target_logits)[:, 1:, :]
+        base_q[:, 1:, :] = (type_q[:, None, :, 1] + target_q)[:, 1:, :]
+
+        row_is_search = torch.arange(rows, device=tokens.device)[None, :, None] == 0
+        valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
+        action_ctx = self.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
+        action_valid = valid.reshape(bsz, rows * 2)
+        action_ctx = self.action_coupler(action_ctx, src_key_padding_mask=~action_valid)
+        residual = self.action_policy_residual(action_ctx).reshape(bsz, rows, 2)
+        q_residual = self.action_q_residual(action_ctx).reshape(bsz, rows, 2)
+        scores = (base_scores + residual).masked_fill(~valid, -1e9)
+        q = (base_q + q_residual).masked_fill(~valid, 0.0)
+        return scores, q
+
+    def forward_value(self, tokens: torch.Tensor, slot: torch.Tensor):
+        return super().forward_value(self._encoder_tokens(tokens), slot)
+
+
 class AutoregressiveActionAttentionFactorizedNet(ActionAttentionFactorizedNet):
     """AlphaStar-style ordered action head: S action first, then X conditioned on S."""
 
@@ -1020,6 +1084,8 @@ def make_physical_model(variant: str, args):
         return CoupledTwoRowFactorizedNet(args.d_model, args.nhead, args.nlayers)
     if variant in {"two_row_action_attention", "two_row_action_attention_factored_loss", "two_row_action_attention_factor_only", "two_row_action_attention_qpolicy", "two_row_action_attention_qpolicy_factored_loss", "two_row_action_attention_branchfair_qpolicy"}:
         return ActionAttentionFactorizedNet(args.d_model, args.nhead, args.nlayers)
+    if variant == "cached_root_action_attention_qpolicy_factored_loss":
+        return CachedRootActionAttentionFactorizedNet(args.d_model, args.nhead, args.nlayers)
     if variant == "two_row_action_attention_autoregressive":
         return AutoregressiveActionAttentionFactorizedNet(args.d_model, args.nhead, args.nlayers)
     if variant == "alphastar_factorized":
@@ -1191,6 +1257,7 @@ def collect_targets(args, exact_args, out_path: Path, behavior_factory=None):
                         search_count = 0
                         track_count = 0
                         last = -1
+                        selected: set[int] = set()
                         while (
                             spent < 200.0
                             and not bool(eng.term_buf[0])
@@ -1203,7 +1270,11 @@ def collect_targets(args, exact_args, out_path: Path, behavior_factory=None):
                             obs = attach_env_obs(get_obs(eng, debt), env_cfg, True, True)
                             remaining = max(1.0, 200.0 - spent)
                             snapshot = binding.vec_snapshot(eng.env)
-                            cands = physical_candidates(obs, int(args.top_k))
+                            cands = [
+                                int(action)
+                                for action in physical_candidates(obs, int(args.top_k))
+                                if (lambda base: int(base) <= 0 or int(base) not in selected)(xs_decode_action(int(action), MAXT)[0])
+                            ]
                             vals = []
                             for action in cands:
                                 val = eval_candidate(
@@ -1250,7 +1321,7 @@ def collect_targets(args, exact_args, out_path: Path, behavior_factory=None):
                                         q_mask[int(base)] = 1.0
                                     sensor_q[int(base), sidx] = float(val)
                                     sensor_q_mask[int(base), sidx] = 1.0
-                                tok = tokenize(adapt, obs, selected=set(), search_count=search_count).astype(np.float32)
+                                tok = tokenize(adapt, obs, selected=selected, search_count=search_count).astype(np.float32)
                                 slot = slot_features(obs, spent, search_count, track_count, last, 200.0).astype(np.float32)
                                 root_value = float(max(v for _, v in vals))
                                 targets.append(
@@ -1289,6 +1360,7 @@ def collect_targets(args, exact_args, out_path: Path, behavior_factory=None):
                                 search_count += 1
                             elif int(base) > 0:
                                 track_count += 1
+                                selected.add(int(base))
                             last = int(base)
                         if len(targets) >= int(args.max_targets) or (
                             int(args.max_targets_per_cell) > 0
@@ -1627,6 +1699,7 @@ def train_head(variant: str, targets, args, device, model=None):
             "two_row_action_attention_qpolicy",
             "two_row_action_attention_qpolicy_factored_loss",
             "two_row_action_attention_branchfair_qpolicy",
+            "cached_root_action_attention_qpolicy_factored_loss",
             "two_row_action_attention_autoregressive",
             "alphastar_factorized",
             "two_row_calibrated_action_attention_qpolicy_factored_loss",
@@ -1660,6 +1733,7 @@ def train_head(variant: str, targets, args, device, model=None):
                 "two_row_action_attention_qpolicy",
                 "two_row_action_attention_qpolicy_factored_loss",
                 "two_row_action_attention_branchfair_qpolicy",
+                "cached_root_action_attention_qpolicy_factored_loss",
                 "two_row_action_attention_autoregressive",
                 "alphastar_factorized",
                 "two_row_calibrated_action_attention_qpolicy_factored_loss",
@@ -1690,6 +1764,7 @@ def train_head(variant: str, targets, args, device, model=None):
                 elif variant in {
                     "two_row_coupled_qpolicy_factored_loss",
                     "two_row_action_attention_qpolicy_factored_loss",
+                    "cached_root_action_attention_qpolicy_factored_loss",
                     "two_row_calibrated_action_attention_qpolicy_factored_loss",
                 } and qpol_loss is not None and qpol_target is not None:
                     policy_loss = 0.5 * qpol_loss + 0.5 * factorized_marginal_supervision_loss(scores, qpol_target)
@@ -1857,6 +1932,7 @@ class PhysicalHeadPlanner:
                 "two_row_action_attention_qpolicy",
                 "two_row_action_attention_qpolicy_factored_loss",
                 "two_row_action_attention_branchfair_qpolicy",
+                "cached_root_action_attention_qpolicy_factored_loss",
                 "two_row_action_attention_autoregressive",
                 "alphastar_factorized",
                 "two_row_calibrated_action_attention_qpolicy_factored_loss",
@@ -2846,6 +2922,7 @@ def selected_variants(text: str) -> list[str]:
         "two_row_action_attention_qpolicy",
         "two_row_action_attention_qpolicy_factored_loss",
         "two_row_action_attention_branchfair_qpolicy",
+        "cached_root_action_attention_qpolicy_factored_loss",
         "two_row_action_attention_autoregressive",
         "alphastar_factorized",
         "two_row_calibrated_action_attention_qpolicy_factored_loss",

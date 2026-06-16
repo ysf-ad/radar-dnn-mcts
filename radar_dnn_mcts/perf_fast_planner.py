@@ -370,6 +370,7 @@ class FastActionAttentionPlanner:
         use_manual_couplers: bool = False,
         use_manual_sensor_coupler: bool = False,
         use_manual_action_coupler: bool = False,
+        reencode_selected: bool = False,
     ):
         dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = model.eval().to(dev)
@@ -389,6 +390,7 @@ class FastActionAttentionPlanner:
         self.use_manual_couplers = bool(use_manual_couplers)
         self.use_manual_sensor_coupler = bool(use_manual_couplers or use_manual_sensor_coupler)
         self.use_manual_action_coupler = bool(use_manual_couplers or use_manual_action_coupler)
+        self.reencode_selected = bool(reencode_selected)
         self.adapt = adapter()
         self.stats = FastPlannerStats(True, str(dev), self.use_amp, self.use_compile)
         self._row_is_search_cache: dict[tuple[int, str, int | None], torch.Tensor] = {}
@@ -817,6 +819,16 @@ class FastActionAttentionPlanner:
         slot_cpu_t = torch.from_numpy(slot).unsqueeze(0)
         self._profile_end("slot_template", t0)
         while elapsed < float(budget_ms) and len(plan) < 64:
+            if self.reencode_selected and selected:
+                t0 = self._profile_start()
+                loop_tok = tokenize(self.adapt, obs, selected=selected, search_count=search_count).astype(np.float32)
+                loop_x = torch.from_numpy(loop_tok).to(self.device, dtype=torch.float32).unsqueeze(0)
+                with torch.inference_mode():
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
+                        cls_out, tok_out, selected_t, token_active = self.model.backbone.encode_tokens(loop_x)
+                selected_t = selected_t.clone()
+                graph_replay = None
+                self._profile_end("loop_reencode_selected", t0)
             t0 = self._profile_start()
             slot = self._update_slot_inplace(slot, slot_template, elapsed, search_count, track_count, last, float(budget_ms))
             self._profile_end("loop_slot_features_fast", t0)

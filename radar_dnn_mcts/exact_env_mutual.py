@@ -132,9 +132,19 @@ def xs_action_fractions(history: Sequence[int], max_trackers: int = MAXT) -> Dic
 
 def env_cfg_for(rate: float, args) -> Dict[str, float]:
     """Use the same reward/environment knobs as the clean mutual loop."""
-    env = configured_env(float(rate), args) if hasattr(args, "env_mode") else make_env(rate)
-    env["tracked_target_ms_reward_weight"] = float(getattr(args, "tracked_target_ms_reward_weight", 0.0))
-    env["discovered_target_reward"] = float(getattr(args, "discovered_target_reward", 0.0))
+    if hasattr(args, "env_mode"):
+        try:
+            env = configured_env(float(rate), args)
+        except ModuleNotFoundError:
+            env = make_env(rate)
+    else:
+        env = make_env(rate)
+    tracked_ms_weight = float(getattr(args, "tracked_target_ms_reward_weight", 0.0))
+    discovered_reward = float(getattr(args, "discovered_target_reward", 0.0))
+    if tracked_ms_weight != 0.0:
+        env["tracked_target_ms_reward_weight"] = tracked_ms_weight
+    if discovered_reward != 0.0:
+        env["discovered_target_reward"] = discovered_reward
     if hasattr(args, "enable_x_band") and args.enable_x_band:
         env["enable_x_band"] = 1
     if hasattr(args, "track_urgency_bonus_weight") and args.track_urgency_bonus_weight >= 0.0:
