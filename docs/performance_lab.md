@@ -1866,11 +1866,55 @@ come from reducing simulator/observation overhead and keeping more of the
 batched state representation resident, not from further scalar action-table
 micro-optimizations.
 
+### Fast Validated Env Step
+
+The generic `execute_first_valid_action` path is deliberately defensive: for
+each action it reads a full observation before execution, revalidates target and
+sensor constraints, steps the C environment, reads another full observation, and
+infers elapsed time from observation deltas. In the packed cached-root planner,
+that validation has already happened in the dense physical action table. The
+benchmark now has an opt-in `--fast-env-step` path:
+
+```text
+validated candidate action
+    -> one C environment step
+    -> elapsed time from search dwell or target dwell
+    -> no per-action before/after observation rereads
+```
+
+This is not a replacement for the general executor; it is valid for this
+benchmark path because invalid actions are masked before selection. A/B runs
+matched total reward and executed action count against the defensive executor.
+
+Measured result on CUDA with `64` envs, `60` initial targets, arrival rate `4`,
+and `3` windows:
+
+```text
+cached root, defensive env step: ~384.6 env-windows/s
+cached root, fast env step:      ~738.1 env-windows/s
+reward delta vs serial:          0.0
+```
+
+The synchronized 64-env profile shows the simulator/control stage is no longer
+dominant:
+
+```text
+env_step_batch:         ~4.26 ms -> ~0.85 ms
+decision_score_forward: now the largest stage, ~3.41 ms
+root_obs_attach:        ~1.85 ms
+root_h2d_encode:        ~1.85 ms
+```
+
+This changes the next optimization target back toward the neural score path and
+root observation/encoding residency. The high-batch planner is now mostly
+limited by batched action-attention inference and root-state refresh, not by
+per-action simulator bookkeeping.
+
 ## Next Work
 
 - Promote cached-root multi-environment batching from benchmark script to a reusable evaluator/training data path.
 - Revisit fixed-shape CUDA Graph replay only if graph capture can be amortized across repeated prepared root batches.
-- Vectorize `env_step_batch`, root observation attachment, and token/slot feature construction for multi-env runs.
+- Reduce root observation attachment and root encoding overhead for multi-env runs.
 - Replace list-of-dict observations with a packed batched observation structure for multi-env runs.
 - Expand `DenseRootSearchState` beyond the root into full batched tree tensors.
 - Replace Python node objects with dense tree tensors.

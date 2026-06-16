@@ -14,6 +14,8 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "radar_dnn_mcts"))
+_FAST_STEP_BINDING = None
+_FAST_STEP_SEARCH_DWELL_MS = None
 
 
 def sync(device: torch.device) -> None:
@@ -461,6 +463,36 @@ def physical_action_table_from_packed(packed: PackedRootObs, live_pos: list[int]
     return BatchedPhysicalActionTable(actions=actions, bases=bases, sensors=sensors, valid=valid)
 
 
+def execute_known_valid_action_fast(eng, action: int, base: int, dwell_ms: float, remaining_ms: float):
+    """Execute one already-validated physical action without observation rereads.
+
+    The benchmark's candidate table has already checked active/deadline/range
+    and sensor availability. The generic executor repeats that validation and
+    reads observations before/after each action only to infer elapsed time. This
+    fast path keeps the same C environment transition/reward and derives elapsed
+    time from the selected action type.
+    """
+    if eng.term_buf[0] or remaining_ms <= 0.0:
+        return 0.0, 0.0, None
+    global _FAST_STEP_BINDING, _FAST_STEP_SEARCH_DWELL_MS
+    if _FAST_STEP_BINDING is None:
+        from pufferlib.ocean.radarxs import binding as radar_binding
+        from repaired_campaign_tools import SEARCH_DWELL_MS
+
+        _FAST_STEP_BINDING = radar_binding
+        _FAST_STEP_SEARCH_DWELL_MS = float(SEARCH_DWELL_MS)
+
+    eng.act_buf[0] = int(action)
+    _FAST_STEP_BINDING.vec_step(eng.env)
+    if int(base) == 0:
+        dt = float(_FAST_STEP_SEARCH_DWELL_MS)
+    else:
+        dt = float(dwell_ms)
+    if not np.isfinite(dt) or dt <= 0.0:
+        return float(eng.rew_buf[0]), 0.0, None
+    return float(eng.rew_buf[0]), dt, int(action)
+
+
 def run_serial(planner, envs, args, device: torch.device) -> dict:
     from final_radar_campaign import get_obs
     from strict_window_report import execute_plan_until_budget
@@ -769,7 +801,13 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
                     if eng.term_buf[0] or elapsed[pos] >= float(args.window_ms):
                         continue
                     remaining = max(0.0, float(args.window_ms) - float(elapsed[pos]))
-                    reward, dt, executed_action = execute_first_valid_action(eng, [int(actions[local_idx])], remaining)
+                    action = int(actions[local_idx])
+                    base, _ = xs_decode_action(action, MAXT)
+                    if bool(getattr(args, "fast_env_step", False)):
+                        dwell = float(packed.dwell[pos, int(base) - 1]) if int(base) > 0 else 0.0
+                        reward, dt, executed_action = execute_known_valid_action_fast(eng, action, int(base), dwell, remaining)
+                    else:
+                        reward, dt, executed_action = execute_first_valid_action(eng, [action], remaining)
                     if executed_action is None or dt <= 0.0:
                         continue
                     logical_action, _sensor = decode_sensor_action(int(executed_action), eng.max_trackers)
@@ -954,7 +992,13 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                 if eng.term_buf[0] or elapsed[pos] >= float(args.window_ms):
                     continue
                 remaining = max(0.0, float(args.window_ms) - float(elapsed[pos]))
-                reward, dt, executed_action = execute_first_valid_action(eng, [int(actions[local_idx])], remaining)
+                action = int(actions[local_idx])
+                base, _ = xs_decode_action(action, MAXT)
+                if bool(getattr(args, "fast_env_step", False)):
+                    dwell = float(packed.dwell[pos, int(base) - 1]) if int(base) > 0 else 0.0
+                    reward, dt, executed_action = execute_known_valid_action_fast(eng, action, int(base), dwell, remaining)
+                else:
+                    reward, dt, executed_action = execute_first_valid_action(eng, [action], remaining)
                 if executed_action is None or dt <= 0.0:
                     continue
                 logical_action, _sensor = decode_sensor_action(int(executed_action), eng.max_trackers)
@@ -1029,6 +1073,7 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--skip-graph", action="store_true")
     parser.add_argument("--profile-stages", action="store_true")
+    parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
     parser.add_argument("--out", type=Path, default=Path("results/perf_lab_multi_env_online_batch.json"))
     args = parser.parse_args()
 
