@@ -93,6 +93,38 @@ def profile_summary(buckets: dict[str, list[float]]) -> dict[str, dict[str, floa
     return dict(sorted(rows, key=lambda item: item[1]["total_ms"], reverse=True))
 
 
+def int_distribution(values: list[int], full_size: int | None = None) -> dict[str, object]:
+    arr = np.asarray(values, dtype=np.int64)
+    if arr.size == 0:
+        return {
+            "count": 0,
+            "min": 0,
+            "max": 0,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p90": 0.0,
+            "full_count": 0,
+            "partial_count": 0,
+            "full_fraction": 0.0,
+            "histogram": {},
+        }
+    full = int(full_size) if full_size is not None else int(arr.max())
+    unique, counts = np.unique(arr, return_counts=True)
+    full_count = int(np.sum(arr == full))
+    return {
+        "count": int(arr.size),
+        "min": int(arr.min()),
+        "max": int(arr.max()),
+        "mean": float(arr.mean()),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "full_count": full_count,
+        "partial_count": int(arr.size - full_count),
+        "full_fraction": float(full_count / max(1, int(arr.size))),
+        "histogram": {str(int(k)): int(v) for k, v in zip(unique, counts)},
+    }
+
+
 def cprofile_top(profile: cProfile.Profile, limit: int) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for (filename, line, func), stat in pstats.Stats(profile).stats.items():
@@ -913,7 +945,9 @@ def run_batched(scorer, envs, args, device: torch.device) -> dict:
         "window_throughput_per_s": float(1000.0 * total_env_windows / max(wall_ms, 1e-12)),
         "neural_rounds": int(len(plan_round_times)),
         "mean_batch_size": float(np.mean(batch_sizes)) if batch_sizes else 0.0,
+        "batch_size_distribution": int_distribution(batch_sizes, full_size=len(envs)),
         "mean_depth": float(np.mean(depth_counts)) if depth_counts else 0.0,
+        "depth_distribution": int_distribution(depth_counts),
         "planning_round_stats": stats(plan_round_times),
         "planning_ms_per_env_action": float(sum(plan_round_times) / max(1, sum(batch_sizes))),
         "total_reward": float(sum(rewards)),
@@ -1130,7 +1164,9 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
         "encode_stats": stats(encode_times),
         "neural_rounds": int(len(plan_round_times)),
         "mean_batch_size": float(np.mean(batch_sizes)) if batch_sizes else 0.0,
+        "batch_size_distribution": int_distribution(batch_sizes, full_size=len(envs)),
         "mean_depth": float(np.mean(depth_counts)) if depth_counts else 0.0,
+        "depth_distribution": int_distribution(depth_counts),
         "planning_round_stats": stats(plan_round_times),
         "planning_ms_per_env_action": float(sum(plan_round_times) / max(1, sum(batch_sizes))),
         "total_reward": float(sum(rewards)),
@@ -1647,7 +1683,9 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         "scalar_env_step_calls": int(scalar_env_step_calls),
         "pinned_action_d2h": bool(pinned_action_cpu is not None),
         "mean_batch_size": float(np.mean(batch_sizes)) if batch_sizes else 0.0,
+        "batch_size_distribution": int_distribution(batch_sizes, full_size=len(envs)),
         "mean_depth": float(np.mean(depth_counts)) if depth_counts else 0.0,
+        "depth_distribution": int_distribution(depth_counts),
         "planning_round_stats": stats(plan_round_times),
         "planning_ms_per_env_action": float(sum(plan_round_times) / max(1, sum(batch_sizes))),
         "total_reward": float(sum(rewards)),

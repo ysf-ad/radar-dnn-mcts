@@ -2767,6 +2767,13 @@ dynamic scoring at about `7.18 ms/call`; padded full-batch graph replay handles
 those same rounds at about `1.68 ms/call`, even though it computes some inactive
 rows. The graph replay efficiency dominates the wasted-row cost here.
 
+The online benchmark report now includes `batch_size_distribution` and
+`depth_distribution` for each path. These expose full-vs-partial live batch
+counts and a compact histogram. In the small graph-only smoke, 30/40 neural
+rounds were full-batch and the remaining partial rounds ranged from 2 to 7
+active envs; this makes padded replay/adaptive replay decisions inspectable from
+one report instead of requiring separate log parsing.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only
