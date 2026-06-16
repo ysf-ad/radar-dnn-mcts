@@ -1035,6 +1035,55 @@ def _build_score_graph(planner, graph_cache: dict, cls_out, tok_out, selected_t,
         return None
 
 
+def _build_root_encode_graph(planner, graph_cache: dict, root_x: torch.Tensor):
+    if planner.device.type != "cuda":
+        return None
+    key = (tuple(root_x.shape), str(root_x.dtype), bool(planner.use_amp))
+    try:
+        cache = graph_cache.get(key)
+        if cache is None:
+            static_root = torch.empty_like(root_x)
+            static_root.copy_(root_x, non_blocking=False)
+
+            def encode_root():
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
+                    return planner.model.backbone.encode_tokens(static_root)
+
+            with torch.inference_mode():
+                for _ in range(3):
+                    _ = encode_root()
+                torch.cuda.synchronize(planner.device)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    static_cls, static_tok, static_selected, static_active = encode_root()
+            cache = {
+                "graph": graph,
+                "static_root": static_root,
+                "static_cls": static_cls,
+                "static_tok": static_tok,
+                "static_selected": static_selected,
+                "static_active": static_active,
+            }
+            graph_cache[key] = cache
+        else:
+            graph = cache["graph"]
+            static_root = cache["static_root"]
+            static_cls = cache["static_cls"]
+            static_tok = cache["static_tok"]
+            static_selected = cache["static_selected"]
+            static_active = cache["static_active"]
+            static_root.copy_(root_x, non_blocking=False)
+
+        def replay(next_root_x: torch.Tensor):
+            static_root.copy_(next_root_x, non_blocking=False)
+            graph.replay()
+            return static_cls, static_tok, static_selected, static_active
+
+        return replay
+    except Exception:
+        return None
+
+
 def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     from exact_env_mutual import attach_env_obs, xs_decode_action
     from final_radar_campaign import get_obs
@@ -1052,9 +1101,12 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     graph_build_times: list[float] = []
     batch_sizes: list[int] = []
     depth_counts: list[int] = []
+    root_graph_cache: dict = {}
     score_graph_cache: dict = {}
     stage_buckets: dict[str, list[float]] = {}
     profile_enabled = bool(getattr(args, "profile_stages", False))
+    root_graph_replays = 0
+    root_raw_encodes = 0
     graph_replay_rounds = 0
     raw_rounds = 0
     if envs and hasattr(planner, "warmup"):
@@ -1112,8 +1164,14 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         t0 = time.perf_counter()
         with torch.inference_mode():
             root_x = torch.from_numpy(root_tokens).to(device, dtype=torch.float32)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
-                cls_out, tok_out, selected_t_all, token_active = planner.model.backbone.encode_tokens(root_x)
+            root_encode_replay = _build_root_encode_graph(planner, root_graph_cache, root_x)
+            if root_encode_replay is not None:
+                cls_out, tok_out, selected_t_all, token_active = root_encode_replay(root_x)
+                root_graph_replays += 1
+            else:
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
+                    cls_out, tok_out, selected_t_all, token_active = planner.model.backbone.encode_tokens(root_x)
+                root_raw_encodes += 1
         sync(device)
         encode_times.append((time.perf_counter() - t0) * 1000.0)
 
@@ -1266,6 +1324,8 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         "encode_stats": stats(encode_times),
         "graph_build_stats": stats(graph_build_times),
         "neural_rounds": int(len(plan_round_times)),
+        "root_graph_replays": int(root_graph_replays),
+        "root_raw_encodes": int(root_raw_encodes),
         "graph_replay_rounds": int(graph_replay_rounds),
         "raw_rounds": int(raw_rounds),
         "mean_batch_size": float(np.mean(batch_sizes)) if batch_sizes else 0.0,

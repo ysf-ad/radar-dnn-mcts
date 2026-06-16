@@ -1813,6 +1813,35 @@ large win; the selector is around `0.14 ms` in the profiled graph path, while
 `graph_score_replay` remains much larger. A fused selection kernel can still be
 revisited later, but the next high-leverage target is model replay itself.
 
+The graph path now also has a reusable root-encoder graph. Root token tensors
+are copied into a static graph input and `backbone.encode_tokens(...)` is
+replayed by tensor shape. A direct equivalence check matched the raw encoder
+exactly:
+
+```text
+cls max_abs_diff: 0.0
+tok max_abs_diff: 0.0
+selected equal:   true
+active equal:     true
+```
+
+This is a short-run tradeoff because the first root graph capture is expensive.
+On the 64-env, 5-window profiled run, capture dominated the graph path and hurt
+wall time. On the longer 64-env, 20-window run, capture was amortized:
+
+```text
+root raw encode p50:        ~1.23 ms
+root graph encode p50:      ~0.77 ms
+cached root graph throughput: ~914.7 env-windows/s
+planning round:               ~1.92 ms
+planning ms per env-action:   ~0.0300 ms
+reward delta:                 0.0
+```
+
+The improvement over score-only graph replay is modest, but it keeps moving
+fixed-shape model work into reusable graph capture. For short smoke tests,
+`--skip-graph` or raw cached-root timing remains easier to interpret.
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer
