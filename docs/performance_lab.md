@@ -1718,6 +1718,54 @@ useful only if fixed-shape graph capture can be reused across many windows with
 static root buffers, or for offline rollouts where many repeated decision rounds
 share one prepared root batch.
 
+That reusable version is now implemented for the multi-env cached-root graph
+path. The graph cache is keyed by tensor shape and dtype; root encodings,
+selected masks, active masks, and slot tensors are copied into static graph
+buffers before replay. A direct score equivalence check matched the raw scorer
+exactly:
+
+```text
+max_abs_diff: 0.0
+allclose:     true
+```
+
+On short runs the first capture still hurts wall-clock throughput, but once the
+capture is amortized the graph path wins. With direct root packing and fast env
+stepping:
+
+```text
+64 envs, 60 targets, rate 4, 20 windows
+raw cached root:       ~680.1 env-windows/s
+reusable score graph:  ~870.8 env-windows/s
+reward delta:          0.0
+```
+
+Per-decision planning rounds improved at the same setting:
+
+```text
+raw cached root:       ~3.39 ms/round
+reusable score graph:  ~2.17 ms/round
+```
+
+This makes reusable CUDA Graph replay useful for longer batched eval/training
+runs. For very short smoke tests, `--skip-graph` remains useful because one graph
+capture can dominate only a few windows.
+
+Mixed precision was also tested on the current direct-pack/fast-step path and
+rejected on this Windows/CUDA/PyTorch stack:
+
+```text
+64 envs, 60 targets, rate 4, 3 windows
+fp32 cached root: ~757.2 env-windows/s
+AMP cached root:  ~544.1 env-windows/s
+
+profiled decision_score_forward:
+fp32: ~3.2 ms
+AMP:  ~5.5 ms
+```
+
+So the current default should stay fp32 unless the runtime/model changes.
+
 ### Cached Multi-Env Stage Profile
 
 `perf_lab_multi_env_online_batch.py --profile-stages --skip-graph` splits the

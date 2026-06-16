@@ -961,32 +961,70 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
     }
 
 
-def _build_score_graph(planner, cls_out, tok_out, selected_t, token_active, slot_t):
+def _build_score_graph(planner, graph_cache: dict, cls_out, tok_out, selected_t, token_active, slot_t):
     if planner.device.type != "cuda":
         return None
+    key = (
+        tuple(cls_out.shape),
+        tuple(tok_out.shape),
+        tuple(selected_t.shape),
+        tuple(token_active.shape),
+        tuple(slot_t.shape),
+        str(cls_out.dtype),
+        bool(planner.use_amp),
+    )
     try:
-        static_selected = torch.empty_like(selected_t)
-        static_slot = torch.empty_like(slot_t)
-        static_selected.copy_(selected_t, non_blocking=False)
-        static_slot.copy_(slot_t, non_blocking=False)
+        cache = graph_cache.get(key)
+        if cache is None:
+            static_cls = torch.empty_like(cls_out)
+            static_tok = torch.empty_like(tok_out)
+            static_selected = torch.empty_like(selected_t)
+            static_active = torch.empty_like(token_active)
+            static_slot = torch.empty_like(slot_t)
+            static_cls.copy_(cls_out, non_blocking=False)
+            static_tok.copy_(tok_out, non_blocking=False)
+            static_selected.copy_(selected_t, non_blocking=False)
+            static_active.copy_(token_active, non_blocking=False)
+            static_slot.copy_(slot_t, non_blocking=False)
 
-        def compute_score():
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
-                return planner.score_slots_from_encoded(
-                    cls_out,
-                    tok_out,
-                    static_selected,
-                    token_active,
-                    static_slot,
-                ).float()
+            def compute_score():
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
+                    return planner.score_slots_from_encoded(
+                        static_cls,
+                        static_tok,
+                        static_selected,
+                        static_active,
+                        static_slot,
+                    ).float()
 
-        with torch.inference_mode():
-            for _ in range(3):
-                _ = compute_score()
-            torch.cuda.synchronize(planner.device)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                static_score = compute_score()
+            with torch.inference_mode():
+                for _ in range(3):
+                    _ = compute_score()
+                torch.cuda.synchronize(planner.device)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    static_score = compute_score()
+            cache = {
+                "graph": graph,
+                "static_cls": static_cls,
+                "static_tok": static_tok,
+                "static_selected": static_selected,
+                "static_active": static_active,
+                "static_slot": static_slot,
+                "static_score": static_score,
+            }
+            graph_cache[key] = cache
+        else:
+            graph = cache["graph"]
+            static_cls = cache["static_cls"]
+            static_tok = cache["static_tok"]
+            static_selected = cache["static_selected"]
+            static_active = cache["static_active"]
+            static_slot = cache["static_slot"]
+            static_score = cache["static_score"]
+            static_cls.copy_(cls_out, non_blocking=False)
+            static_tok.copy_(tok_out, non_blocking=False)
+            static_active.copy_(token_active, non_blocking=False)
 
         def replay(next_selected_t, next_slot_t):
             static_selected.copy_(next_selected_t, non_blocking=False)
@@ -1016,6 +1054,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     graph_build_times: list[float] = []
     batch_sizes: list[int] = []
     depth_counts: list[int] = []
+    score_graph_cache: dict = {}
     graph_replay_rounds = 0
     raw_rounds = 0
     if envs and hasattr(planner, "warmup"):
@@ -1052,7 +1091,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         full_slot_t = torch.from_numpy(full_slots).to(device, dtype=torch.float32)
         sync(device)
         t0 = time.perf_counter()
-        graph_replay = _build_score_graph(planner, cls_out, tok_out, selected_t_all, token_active, full_slot_t)
+        graph_replay = _build_score_graph(planner, score_graph_cache, cls_out, tok_out, selected_t_all, token_active, full_slot_t)
         sync(device)
         graph_build_times.append((time.perf_counter() - t0) * 1000.0)
 
