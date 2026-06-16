@@ -503,13 +503,12 @@ class FastActionAttentionPlanner:
                 static_selected.copy_(root_selected, non_blocking=False)
                 static_active.copy_(token_active, non_blocking=False)
 
-            def replay(slot_np: np.ndarray, selected_tensor: torch.Tensor) -> torch.Tensor:
-                static_slot.copy_(torch.from_numpy(slot_np), non_blocking=False)
-                static_selected.copy_(selected_tensor, non_blocking=False)
+            def replay(slot_cpu_t: torch.Tensor) -> torch.Tensor:
+                static_slot.copy_(slot_cpu_t, non_blocking=False)
                 graph.replay()
                 return static_score
 
-            return replay
+            return replay, static_selected
         except Exception:
             return None
 
@@ -589,11 +588,16 @@ class FastActionAttentionPlanner:
             action_tensors = self._physical_action_tensors(obs)
             self._profile_end("candidate_h2d", t0)
             t0 = self._profile_start()
-        graph_replay = self._build_cuda_graph_score_replay(cls_out, tok_out, selected_t, token_active, slot_width)
+        graph_pack = self._build_cuda_graph_score_replay(cls_out, tok_out, selected_t, token_active, slot_width)
+        if graph_pack is not None:
+            graph_replay, selected_t = graph_pack
+        else:
+            graph_replay = None
         self._profile_end("cuda_graph_prepare", t0)
         t0 = self._profile_start()
         slot_template = self._slot_template(obs, float(budget_ms))
         slot = np.empty((SLOT_DIM,), dtype=np.float32)
+        slot_cpu_t = torch.from_numpy(slot).unsqueeze(0)
         self._profile_end("slot_template", t0)
         while elapsed < float(budget_ms) and len(plan) < 64:
             t0 = self._profile_start()
@@ -602,7 +606,7 @@ class FastActionAttentionPlanner:
             if graph_replay is not None:
                 with torch.inference_mode():
                     t0 = self._profile_start()
-                    graph_out = graph_replay(slot, selected_t)
+                    graph_out = graph_replay(slot_cpu_t)
                     self._profile_end("loop_score_graph_replay", t0)
                     score_t = graph_out
                     selected_action_t = None

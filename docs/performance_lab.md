@@ -1134,11 +1134,11 @@ script: scripts/perf_lab_cuda_graph_planner.py
 device=cuda, initial_targets=40, arrival_rate=3, seed=916,
 warmup=5, iterations=30
 
-regular fast planner:             46.393 ms / plan
-GPU-select fast planner:          44.978 ms / plan
-CUDA graph fast planner:          10.632 ms / plan
-CUDA graph + GPU-select planner:   9.024 ms / plan
-best speedup:                      5.14x
+regular fast planner:             48.067 ms / plan
+GPU-select fast planner:          45.662 ms / plan
+CUDA graph fast planner:          10.473 ms / plan
+CUDA graph + GPU-select planner:   8.621 ms / plan
+best speedup:                      5.58x
 plans match:                       true
 ```
 
@@ -1166,6 +1166,13 @@ candidate_score = score.reshape(-1)[flat_index]
 This avoids two-dimensional advanced indexing in the hot loop. The internal
 profile improved GPU-selection time from about `0.209 ms/decision` to
 `0.185 ms/decision`.
+
+The CUDA Graph replay path also reuses its static selected-mask input as the
+live selected-mask tensor for the planning loop. That removes a per-decision
+GPU mask copy before graph replay. The slot vector is likewise wrapped as a CPU
+tensor once per plan call and reused for all graph replays. Internal timing for
+the graph replay stage improved from about `0.345 ms/decision` to
+`0.326 ms/decision`.
 
 The fast planner also now builds a per-window slot-feature template. The
 observation-dependent slot terms are constant throughout a planning call, so the
