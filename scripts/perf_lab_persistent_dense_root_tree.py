@@ -43,6 +43,7 @@ def main() -> None:
     parser.add_argument("--rate", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=916)
     parser.add_argument("--capacity", type=int, default=512)
+    parser.add_argument("--proposal-mode", choices=["recompute", "cached"], default="recompute")
     parser.add_argument("--out", type=Path, default=Path("perf_lab_persistent_dense_root_tree.json"))
     args = parser.parse_args()
 
@@ -89,6 +90,7 @@ def main() -> None:
         "waves_per_iteration": int(args.waves),
         "top_k": int(args.top_k),
         "capacity": int(args.capacity),
+        "proposal_mode": str(args.proposal_mode),
         "one_time_setup_ms": float(setup_ms),
     }
 
@@ -116,15 +118,34 @@ def main() -> None:
             t_update_total = 0.0
             t_select_total = 0.0
             for _ in range(int(args.waves)):
-                sync(device)
-                t0 = time.perf_counter()
-                actions, scores = search.propose(int(args.top_k))
-                sync(device)
-                t_prop_total += (time.perf_counter() - t0) * 1000.0
+                if str(args.proposal_mode) == "cached":
+                    sync(device)
+                    t0 = time.perf_counter()
+                    actions, scores = search.propose_cached(int(args.top_k), exclude=set(tree._action_to_index))
+                    sync(device)
+                    t_prop_total += (time.perf_counter() - t0) * 1000.0
+                else:
+                    sync(device)
+                    t0 = time.perf_counter()
+                    actions, scores = search.propose(int(args.top_k))
+                    sync(device)
+                    t_prop_total += (time.perf_counter() - t0) * 1000.0
 
                 t1 = time.perf_counter()
-                sim = search.simulate(actions)
-                t_sim_total += (time.perf_counter() - t1) * 1000.0
+                if actions.size:
+                    sim = search.simulate(actions)
+                    t_sim_total += (time.perf_counter() - t1) * 1000.0
+                else:
+                    from batched_branch_sim import BranchStepResult
+
+                    sim = BranchStepResult(
+                        rewards=np.empty((0,), dtype=np.float32),
+                        dt_ms=np.empty((0,), dtype=np.float32),
+                        executed=np.empty((0,), dtype=np.int32),
+                        terminals=np.empty((0,), dtype=np.uint8),
+                        observations=[],
+                    )
+                    t_sim_total += (time.perf_counter() - t1) * 1000.0
 
                 t2 = time.perf_counter()
                 update = tree.update_from_wave(RootSearchWave(actions=actions, scores=scores, sim=sim))

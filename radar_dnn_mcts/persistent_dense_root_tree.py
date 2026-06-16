@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from batched_branch_sim import BranchStepResult
 from persistent_root_search import PersistentRootSearch, RootSearchWave
 
 
@@ -96,6 +97,21 @@ class PersistentDenseRootTree:
 
     def expand_root(self, top_k: int) -> DenseRootTreeUpdate:
         return self.update_from_wave(self.search.search_wave(top_k=int(top_k)))
+
+    def expand_root_cached(self, top_k: int, only_new: bool = True) -> DenseRootTreeUpdate:
+        exclude = set(self._action_to_index) if only_new else None
+        actions, scores = self.search.propose_cached(top_k=int(top_k), exclude=exclude)
+        if actions.size == 0:
+            empty_sim = BranchStepResult(
+                rewards=np.empty((0,), dtype=np.float32),
+                dt_ms=np.empty((0,), dtype=np.float32),
+                executed=np.empty((0,), dtype=np.int32),
+                terminals=np.empty((0,), dtype=np.uint8),
+                observations=[],
+            )
+            return self.update_from_wave(RootSearchWave(actions=actions, scores=scores, sim=empty_sim))
+        result = self.search.simulate(actions)
+        return self.update_from_wave(RootSearchWave(actions=actions, scores=scores, sim=result))
 
     def q_values(self) -> np.ndarray:
         q = np.full((self.capacity,), -np.inf, dtype=np.float32)

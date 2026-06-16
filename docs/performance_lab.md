@@ -13,10 +13,12 @@ python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
 python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast
 python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
 python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batches 1,4,8,16,32,64
+python scripts\profile_cached_action_attention_internals.py --device cuda --prefix-batches 1,4,8,16,32,64
 python scripts\perf_lab_batched_beam_planner.py --device cuda --beam-widths 1,4,8,16 --max-depth 24
 python scripts\perf_lab_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
 python scripts\perf_lab_persistent_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32
+python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached
 ```
 
 ## First Findings
@@ -379,6 +381,71 @@ amp combined iteration: ~111.4 ms
 ```
 
 So mixed precision should not be assumed helpful for this specific small-batch action-attention path.
+
+## Cached All-Action Root Proposals
+
+The root action-attention model already scores every valid root action in one dense tensor pass. Repeated root expansion waves should not recompute that same root proposal table. `PersistentRootSearch.root_action_table()` now caches the sorted root action table:
+
+```text
+fixed root observation
+    -> one cached action-attention score table over all valid root actions
+    -> repeated root waves draw unsimulated actions from the sorted table
+    -> exact C branch simulation evaluates those unique actions
+```
+
+This is a direct speed optimization of the same proposal model. It does not add a new heuristic or change the model scores.
+
+Measured CUDA A/B for 8 waves of 32 root actions:
+
+```text
+recompute neural proposal every wave:
+    combined iteration:        ~65.5 ms
+    neural proposal total:     ~43.7 ms
+    exact branch sim total:    ~19.5 ms
+    total visits:              256 duplicate wave visits
+
+cached all-action root table:
+    combined iteration:         ~6.3 ms
+    proposal lookup total:      ~0.24 ms
+    exact branch sim total:     ~4.5 ms
+    total visits:                58 unique valid root actions
+```
+
+This is about a 10x reduction for repeated root-wave evaluation. The important architectural conclusion is that root search should be:
+
+```text
+score all root actions once -> cache sorted proposal table -> exact-sim unique candidates
+```
+
+not:
+
+```text
+rerun action attention for every root wave
+```
+
+The remaining latency after this change is mostly exact branch simulation plus small PUCT/select overhead. For deeper MCTS, the analogous optimization is to cache action tables per expanded node and batch only genuinely new node/action evaluations.
+
+## Cached Action-Attention Internals
+
+`profile_cached_action_attention_internals.py` splits the cached action-attention scoring path into stage timings. On CUDA, the full cached score pass stays around 4.2-4.5 ms across prefix batches from 1 to 64, so throughput improves primarily by batching more prefixes per call:
+
+```text
+prefixes=1:   ~241 cached score batches/sec
+prefixes=32: ~7626 cached score batches/sec
+prefixes=64: ~14568 cached score batches/sec
+```
+
+Typical per-call stage costs at this model size:
+
+```text
+sensor coupling:       ~0.85-0.90 ms
+action self-attention: ~0.75-1.04 ms
+target/type/residual heads combined: ~1.5 ms
+score/mask assembly:   ~0.3-0.6 ms
+CPU transfer:          ~0.08-0.14 ms
+```
+
+`torch.compile` did not improve this profile on the tested Windows/CUDA setup; it was slightly slower. This points toward algorithmic batching/cache reuse before custom kernels.
 
 ## MCTX Takeaway
 
