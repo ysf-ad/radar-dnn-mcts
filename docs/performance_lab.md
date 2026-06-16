@@ -2190,6 +2190,29 @@ The padded branch also reuses a fixed GPU slot buffer and caches live-position
 tensors for repeated active-set patterns. With this change, the recommended
 multi-env graph benchmark includes `--padded-live-graph`.
 
+The follow-up GPU-valid-mask change extends the cached action template to
+partial live batches too. Instead of rebuilding the physical action table on CPU
+after roots finish, the graph path indexes the full GPU action/gather template
+down to live rows and computes validity from `selected_t_all` on GPU:
+
+```text
+actions/flat/gather template [root, action]
+    -> live row index_select
+    -> selected-target gather
+    -> valid action mask
+```
+
+This keeps partial live decisions on the device for both scoring and action
+masking. Same trained-checkpoint 64-env, 20-window run:
+
+```text
+padded live graph before partial GPU validity: ~731.6 env-windows/s
+padded live graph with partial GPU validity:   ~898.0 env-windows/s
+raw score rounds:                              0
+reward delta:                                  0.0
+executed actions delta:                        0
+```
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer

@@ -1363,7 +1363,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                 stage_buckets,
                 "graph_physical_action_table",
                 lambda: None
-                if gpu_action_template is not None and bool(getattr(args, "gpu_valid_mask", False)) and len(live_pos) == len(root_env_ids)
+                if gpu_action_template is not None and bool(getattr(args, "gpu_valid_mask", False))
                 else physical_action_table_from_template(physical_template, live_pos, selected)
                 if physical_template is not None
                 else physical_action_table_from_packed(packed, live_pos, selected, MAXT),
@@ -1429,6 +1429,22 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                         selected_by_action = torch.gather(selected_t_all, 1, gather_t)
                         valid_t.copy_(template_valid_t & (search_action_t | ~selected_by_action), non_blocking=False)
                         return actions_t, flat_t, valid_t
+                    if gpu_action_template is not None and bool(getattr(args, "gpu_valid_mask", False)):
+                        actions_t, flat_t, gather_t, search_action_t, template_valid_t, _valid_t = gpu_action_template
+                        key = tuple(live_pos)
+                        pos_t = live_pos_tensor_cache.get(key)
+                        if pos_t is None:
+                            pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
+                            live_pos_tensor_cache[key] = pos_t
+                        actions_live = actions_t.index_select(0, pos_t)
+                        flat_live = flat_t.index_select(0, pos_t)
+                        gather_live = gather_t.index_select(0, pos_t)
+                        search_live = search_action_t.index_select(0, pos_t)
+                        template_valid_live = template_valid_t.index_select(0, pos_t)
+                        selected_live = selected_t_all.index_select(0, pos_t)
+                        selected_by_action = torch.gather(selected_live, 1, gather_live)
+                        valid_live = template_valid_live & (search_live | ~selected_by_action)
+                        return actions_live, flat_live, valid_live
                     if gpu_action_template is not None and len(live_pos) == len(root_env_ids):
                         actions_t, flat_t, _gather_t, _search_action_t, _template_valid_t, valid_t = gpu_action_template
                         valid_t.copy_(torch.from_numpy(physical.valid), non_blocking=False)
