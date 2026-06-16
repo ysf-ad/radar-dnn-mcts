@@ -102,3 +102,10 @@ Run the 9-cell evaluation entry point:
 ```powershell
 python scripts\eval_9cell.py --checkpoint path\to\model.pt
 ```
+
+Run the action-attention performance lab:
+
+```powershell
+python scripts\perf_lab_action_attention.py --device cuda --forward-batches 1,8,32,128
+python scripts\profile_action_attention_steps.py --device cuda
+```

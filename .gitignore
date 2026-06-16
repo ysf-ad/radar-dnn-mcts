@@ -25,6 +25,8 @@ results/
 *.npy
 *.npz
 *.csv
+perf_lab_*.json
+profile_*.json
 *.png
 *.pdf
 *.log
