@@ -865,6 +865,39 @@ This shifts the root-search bottleneck away from branch stepping; PUCT
 selection and dense tree update are now visible fractions of the remaining
 sub-millisecond root expansion path.
 
+## Cached Dense-Tree Selection State
+
+After OpenMP branch stepping, PUCT selection became a visible part of the bulk
+root path. `PersistentDenseRootTree` now maintains:
+
+```text
+_total_visits:       updated incrementally instead of summing visits
+_prior_live_cache:   softmax over live prior scores, invalidated on tree update
+_q_live_cache:       live Q values, updated when visits/rewards change
+```
+
+This avoids recomputing total visits, prior softmax, and `value_sum / visits`
+inside every selection call.
+
+Measured on the same `waves=8, top_k=32, cached_cursor_bulk` root expansion:
+
+```text
+OpenMP branch stepping, uncached selector:
+    combined iteration: ~0.28 ms
+    PUCT selection:     ~0.089 ms
+
+cached prior only:
+    combined iteration: ~0.24 ms
+    PUCT selection:     ~0.073 ms
+
+cached prior + Q:
+    combined iteration: ~0.19 ms
+    PUCT selection:     ~0.046 ms
+```
+
+The selected action, unique action count, visit count, and reward sum matched
+the uncached selector runs.
+
 ## Cached Action-Attention Internals
 
 `profile_cached_action_attention_internals.py` splits the cached action-attention scoring path into stage timings. After the combined policy/Q scoring path, a full cached score pass is roughly 2.2-2.6 ms on CUDA across prefix batches from 1 to 64:

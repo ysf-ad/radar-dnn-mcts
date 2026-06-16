@@ -43,13 +43,18 @@ class PersistentDenseRootTree:
         self.elapsed_ms = np.zeros((self.capacity,), dtype=np.float32)
         self.executed = np.full((self.capacity,), -1, dtype=np.int32)
         self.valid = np.zeros((self.capacity,), dtype=bool)
+        self._q_live_cache = np.zeros((self.capacity,), dtype=np.float32)
         self._action_to_index: dict[int, int] = {}
         self._root_action_cursor = 0
+        self._total_visits = 0
+        self._prior_dirty = True
+        self._prior_live_cache = np.empty((0,), dtype=np.float32)
+        self._prior_live_size = 0
         self.size = 0
 
     @property
     def total_visits(self) -> int:
-        return int(np.sum(self.visits[: self.size]))
+        return int(self._total_visits)
 
     def update_from_wave(self, wave: RootSearchWave) -> DenseRootTreeUpdate:
         actions = np.asarray(wave.actions, dtype=np.int32)
@@ -79,10 +84,16 @@ class PersistentDenseRootTree:
                 updated += 1
 
             indices[row] = idx
-            self.prior_scores[idx] = max(float(self.prior_scores[idx]), float(prior_scores[row]))
+            old_prior = float(self.prior_scores[idx])
+            new_prior = max(old_prior, float(prior_scores[row]))
+            if new_prior != old_prior:
+                self.prior_scores[idx] = new_prior
+                self._prior_dirty = True
             self.visits[idx] += 1
+            self._total_visits += 1
             self.value_sums[idx] += float(rewards[row])
             self.reward_sums[idx] += float(rewards[row])
+            self._q_live_cache[idx] = self.value_sums[idx] / max(int(self.visits[idx]), 1)
             self.elapsed_ms[idx] = float(dt_ms[row])
             self.executed[idx] = int(executed[row])
 
@@ -128,8 +139,10 @@ class PersistentDenseRootTree:
         self.actions[start:stop] = actions[:take]
         self.prior_scores[start:stop] = prior_scores[:take]
         self.visits[start:stop] = 1
+        self._total_visits += int(take)
         self.value_sums[start:stop] = rewards[:take]
         self.reward_sums[start:stop] = rewards[:take]
+        self._q_live_cache[start:stop] = rewards[:take]
         self.elapsed_ms[start:stop] = dt_ms[:take]
         self.executed[start:stop] = executed[:take]
         self.valid[start:stop] = True
@@ -137,6 +150,7 @@ class PersistentDenseRootTree:
         for action, action_idx in zip(actions[:take].tolist(), idx.tolist()):
             self._action_to_index[int(action)] = int(action_idx)
         self.size = stop
+        self._prior_dirty = True
         return DenseRootTreeUpdate(
             actions=actions,
             prior_scores=prior_scores,
@@ -208,21 +222,15 @@ class PersistentDenseRootTree:
 
     def q_values(self) -> np.ndarray:
         q = np.full((self.capacity,), -np.inf, dtype=np.float32)
-        q[self.valid] = self.value_sums[self.valid] / np.maximum(self.visits[self.valid], 1)
+        q[: self.size] = self._q_live_cache[: self.size]
         return q
 
     def prior_probabilities(self) -> np.ndarray:
         probs = np.zeros((self.capacity,), dtype=np.float32)
-        valid_scores = self.prior_scores[self.valid]
-        if valid_scores.size == 0:
+        prior_live = self._live_prior()
+        if prior_live.size == 0:
             return probs
-        centered = valid_scores - np.max(valid_scores)
-        exp_scores = np.exp(centered, dtype=np.float32)
-        denom = float(np.sum(exp_scores))
-        if denom <= 0.0 or not np.isfinite(denom):
-            probs[self.valid] = 1.0 / float(valid_scores.size)
-        else:
-            probs[self.valid] = exp_scores / denom
+        probs[: self.size] = prior_live
         return probs
 
     def puct_scores(self, c_puct: float = 1.25) -> np.ndarray:
@@ -253,11 +261,14 @@ class PersistentDenseRootTree:
         self.search.close()
 
     def _live_q_prior(self) -> tuple[np.ndarray, np.ndarray]:
-        visits = np.maximum(self.visits[: self.size], 1)
-        q = self.value_sums[: self.size] / visits
+        return self._q_live_cache[: self.size], self._live_prior()
+
+    def _live_prior(self) -> np.ndarray:
+        if self.size <= 0:
+            return np.empty((0,), dtype=np.float32)
+        if not self._prior_dirty and self._prior_live_size == self.size:
+            return self._prior_live_cache[: self.size]
         prior_scores = self.prior_scores[: self.size]
-        if prior_scores.size == 0:
-            return q.astype(np.float32), np.empty((0,), dtype=np.float32)
         centered = prior_scores - np.max(prior_scores)
         exp_scores = np.exp(centered, dtype=np.float32)
         denom = float(np.sum(exp_scores))
@@ -265,4 +276,7 @@ class PersistentDenseRootTree:
             prior = np.full_like(exp_scores, 1.0 / float(exp_scores.size), dtype=np.float32)
         else:
             prior = exp_scores / denom
-        return q.astype(np.float32), prior.astype(np.float32)
+        self._prior_live_cache = prior.astype(np.float32, copy=False)
+        self._prior_live_size = int(self.size)
+        self._prior_dirty = False
+        return self._prior_live_cache[: self.size]
