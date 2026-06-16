@@ -1161,6 +1161,31 @@ batch 128:
     sequential speedup:       ~24.9x mean
 ```
 
+The prepared path also has an optional fixed-shape CUDA Graph replay:
+
+```text
+script: scripts/perf_lab_batched_roots.py --cuda-graph
+device=cuda, initial_targets=40, arrival_rate=3, seed=916,
+warmup=8, iterations=30
+
+batch 32:
+    prepared GPU-select:      ~3.63 ms,  ~8,813 states/sec
+    prepared CUDA graph:      ~1.71 ms, ~18,686 states/sec
+    sequential speedup:       ~66.1x
+    selected actions match:   true
+
+batch 128:
+    prepared GPU-select:      ~17.85 ms mean, ~9.02 ms p50
+    prepared CUDA graph:      ~16.61 ms mean, ~8.50 ms p50
+    sequential speedup:       ~27.6x mean
+    selected actions match:   true
+```
+
+The graph path captures model forward plus GPU gather/argmax. It still copies
+the prepared token, slot, action-index, and validity arrays into static GPU
+buffers before replay. That is why batch 32 benefits strongly from lower launch
+overhead, while batch 128 is closer: larger transfer/model work dominates.
+
 The staged profiler makes the bottleneck explicit. For batch 128, the full path
 spent about `5.8 ms` in tokenization and `3.6-4.0 ms` in slot-feature
 construction before the GPU model forward. The prepared path removes that

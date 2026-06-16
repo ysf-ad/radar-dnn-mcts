@@ -729,6 +729,7 @@ class BatchedActionAttentionScorer:
         device: str | torch.device | None = None,
         use_amp: bool = False,
         use_compile: bool = False,
+        use_cuda_graph: bool = False,
     ):
         dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = model.eval().to(dev)
@@ -740,8 +741,10 @@ class BatchedActionAttentionScorer:
         self.search_score_bias = float(search_score_bias)
         self.device = dev
         self.use_amp = bool(use_amp and dev.type == "cuda")
+        self.use_cuda_graph = bool(use_cuda_graph and dev.type == "cuda")
         self.adapt = adapter()
         self._row_is_search_cache: dict[tuple[int, str, int | None], torch.Tensor] = {}
+        self._prepared_graph_cache: dict[tuple, dict[str, object]] = {}
 
     def _row_is_search(self, rows: int, device: torch.device) -> torch.Tensor:
         dev = torch.device(device)
@@ -985,6 +988,91 @@ class BatchedActionAttentionScorer:
             has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
             best = torch.where(has_valid, best, torch.full_like(best, -1))
             return best.cpu().numpy().astype(np.int64, copy=False)
+
+    def _build_prepared_graph_replay(self, prepared: PreparedBatchedRootBatch):
+        if not self.use_cuda_graph or self.device.type != "cuda":
+            return None
+        n = int(prepared.count)
+        key = (
+            tuple(prepared.tokens.shape),
+            tuple(prepared.slots.shape),
+            tuple(prepared.actions.shape),
+            tuple(prepared.flat_indices.shape),
+            tuple(prepared.valid.shape),
+            str(prepared.tokens.dtype),
+            str(prepared.slots.dtype),
+            bool(self.use_amp),
+        )
+        try:
+            cache = self._prepared_graph_cache.get(key)
+            if cache is None:
+                static_tokens = torch.empty(tuple(prepared.tokens.shape), device=self.device, dtype=torch.float32)
+                static_slots = torch.empty(tuple(prepared.slots.shape), device=self.device, dtype=torch.float32)
+                static_actions = torch.empty(tuple(prepared.actions.shape), device=self.device, dtype=torch.long)
+                static_flat = torch.empty(tuple(prepared.flat_indices.shape), device=self.device, dtype=torch.long)
+                static_valid = torch.empty(tuple(prepared.valid.shape), device=self.device, dtype=torch.bool)
+
+                def load_inputs() -> None:
+                    static_tokens.copy_(torch.from_numpy(np.ascontiguousarray(prepared.tokens)), non_blocking=False)
+                    static_slots.copy_(torch.from_numpy(np.ascontiguousarray(prepared.slots)), non_blocking=False)
+                    static_actions.copy_(torch.from_numpy(np.ascontiguousarray(prepared.actions)), non_blocking=False)
+                    static_flat.copy_(torch.from_numpy(np.ascontiguousarray(prepared.flat_indices)), non_blocking=False)
+                    static_valid.copy_(torch.from_numpy(np.ascontiguousarray(prepared.valid)), non_blocking=False)
+
+                def compute_best() -> torch.Tensor:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
+                        score_t = self._combined_scores_from_tokens(static_tokens, static_slots).float()
+                    score_t[:, 0, :] += self.search_score_bias
+                    flat_scores = score_t.reshape(n, -1)
+                    candidate_scores = torch.gather(flat_scores, 1, static_flat)
+                    candidate_scores = candidate_scores.masked_fill(~(static_valid & torch.isfinite(candidate_scores)), -torch.inf)
+                    idx = torch.argmax(candidate_scores, dim=1)
+                    best = torch.gather(static_actions, 1, idx[:, None]).squeeze(1)
+                    has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
+                    return torch.where(has_valid, best, torch.full_like(best, -1))
+
+                load_inputs()
+                with torch.inference_mode():
+                    for _ in range(3):
+                        _ = compute_best()
+                    torch.cuda.synchronize(self.device)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        static_best = compute_best()
+                cache = {
+                    "graph": graph,
+                    "static_tokens": static_tokens,
+                    "static_slots": static_slots,
+                    "static_actions": static_actions,
+                    "static_flat": static_flat,
+                    "static_valid": static_valid,
+                    "static_best": static_best,
+                }
+                self._prepared_graph_cache[key] = cache
+            return cache
+        except Exception:
+            return None
+
+    def best_actions_prepared_graph(self, prepared: PreparedBatchedRootBatch) -> np.ndarray:
+        """Score a prepared root batch through a fixed-shape CUDA Graph replay."""
+        n = int(prepared.count)
+        if n <= 0:
+            return np.empty((0,), dtype=np.int64)
+        cache = self._build_prepared_graph_replay(prepared)
+        if cache is None:
+            return self.best_actions_prepared_torch(prepared)
+        static_tokens = cache["static_tokens"]
+        static_slots = cache["static_slots"]
+        static_actions = cache["static_actions"]
+        static_flat = cache["static_flat"]
+        static_valid = cache["static_valid"]
+        static_tokens.copy_(torch.from_numpy(np.ascontiguousarray(prepared.tokens)), non_blocking=False)
+        static_slots.copy_(torch.from_numpy(np.ascontiguousarray(prepared.slots)), non_blocking=False)
+        static_actions.copy_(torch.from_numpy(np.ascontiguousarray(prepared.actions)), non_blocking=False)
+        static_flat.copy_(torch.from_numpy(np.ascontiguousarray(prepared.flat_indices)), non_blocking=False)
+        static_valid.copy_(torch.from_numpy(np.ascontiguousarray(prepared.valid)), non_blocking=False)
+        cache["graph"].replay()
+        return cache["static_best"].cpu().numpy().astype(np.int64, copy=False)
 
     def topk_root_proposals(self, observations: list[dict], k: int = 8, **kwargs) -> BatchedRootProposals:
         result = self.score_batch(observations, **kwargs)
