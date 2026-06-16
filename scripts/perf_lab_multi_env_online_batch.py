@@ -1398,7 +1398,6 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         graph_replay = _build_score_graph(planner, score_graph_cache, cls_out, tok_out, selected_t_all, token_active, full_slot_t)
         sync(device)
         graph_build_times.append((time.perf_counter() - t0) * 1000.0)
-
         live_pos = list(range(len(root_env_ids)))
         table_width = 2 + 2 * int(MAXT)
         prealloc_action_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.long)
@@ -1447,12 +1446,12 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                     graph_replay_rounds += 1
                 elif graph_replay is not None and bool(getattr(args, "padded_live_graph", False)):
                     def padded_graph_score_path():
-                        prealloc_full_slot_t.copy_(torch.from_numpy(current_slots), non_blocking=False)
                         key = tuple(live_pos)
                         pos_t = live_pos_tensor_cache.get(key)
                         if pos_t is None:
                             pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
                             live_pos_tensor_cache[key] = pos_t
+                        prealloc_full_slot_t.copy_(torch.from_numpy(current_slots), non_blocking=False)
                         full_score_t = graph_replay(selected_t_all, prealloc_full_slot_t)
                         return full_score_t.index_select(0, pos_t)
 

@@ -2634,6 +2634,13 @@ But the online smoke run changed decisions/reward. It is therefore not an exact
 runtime optimization for the current trained policy; keep it as an experimental
 speed/accuracy knob only.
 
+A no-copy CUDA Graph state prototype was also tested. The idea was to let the
+captured score graph own the mutable selected-target and slot tensors, then
+replay without copying full selected/slot state into static graph inputs every
+round. The 16-env/5-window smoke run diverged from cached-root reward/actions,
+so this path was rejected and not kept. Any future version needs a stronger
+state-synchronization proof before promotion.
+
 Current synchronized 64-env/10-window graph-stage profile:
 
 ```text
