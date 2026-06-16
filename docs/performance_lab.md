@@ -2735,6 +2735,24 @@ python scripts\perf_lab_multi_env_online_batch.py --paths graph --device cuda `
 When a baseline path is omitted, the corresponding speedup and reward-delta
 fields are reported as `null` rather than forcing unrelated benchmark work.
 
+Stage profiles now include `calls`, `total_ms`, and `pct_profiled_ms`, and are
+sorted by total profiled time rather than mean call time. This makes the next
+optimization target clearer: on the 64-env/20-window graph-only run, the stable
+online path reaches about `719 env-windows/s` and `0.0389 ms/env-action`.
+The dominant repeated work is score replay:
+
+```text
+stage                       mean/call   calls
+graph_padded_score_replay   1.678 ms    221
+graph_score_replay          1.635 ms    179
+graph_env_step_batch        0.921 ms    400
+graph_decision_select       0.205 ms    400
+```
+
+So the next meaningful wins need to come from reducing model replay work,
+batching/fusing selection, or moving more simulator stepping out of the Python
+boundary; root/template setup is now secondary for large batches.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only

@@ -70,6 +70,8 @@ def sdp_backend(name: str):
 def stats(values: list[float]) -> dict[str, float]:
     arr = np.asarray(values, dtype=np.float64)
     return {
+        "calls": int(arr.size),
+        "total_ms": float(arr.sum()) if arr.size else 0.0,
         "mean_ms": float(arr.mean()) if arr.size else 0.0,
         "p50_ms": float(np.percentile(arr, 50)) if arr.size else 0.0,
         "p90_ms": float(np.percentile(arr, 90)) if arr.size else 0.0,
@@ -82,7 +84,13 @@ def add_profile_stage(buckets: dict[str, list[float]], name: str, value_ms: floa
 
 
 def profile_summary(buckets: dict[str, list[float]]) -> dict[str, dict[str, float]]:
-    return dict(sorted(((name, stats(values)) for name, values in buckets.items()), key=lambda item: item[1]["mean_ms"], reverse=True))
+    total_profiled_ms = sum(float(np.asarray(values, dtype=np.float64).sum()) for values in buckets.values())
+    rows = []
+    for name, values in buckets.items():
+        row = stats(values)
+        row["pct_profiled_ms"] = float(100.0 * row["total_ms"] / max(total_profiled_ms, 1e-12))
+        rows.append((name, row))
+    return dict(sorted(rows, key=lambda item: item[1]["total_ms"], reverse=True))
 
 
 def cprofile_top(profile: cProfile.Profile, limit: int) -> list[dict[str, object]]:
