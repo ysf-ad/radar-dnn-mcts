@@ -8,6 +8,7 @@ from typing import Iterable
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from exact_env_mutual import attach_env_obs, xs_decode_action, xs_s_search_action, xs_x_search_action
 from exact_env_mutual import xs_s_track_action, xs_x_track_action
@@ -87,7 +88,13 @@ def _paired_mlp_outputs(
     x: torch.Tensor,
     cache: dict[tuple, tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Evaluate two same-shape LayerNorm/Linear/GELU/Linear MLP heads together."""
+    """Evaluate two same-shape LayerNorm/Linear/GELU/Linear MLP heads with low overhead.
+
+    The previous implementation packed both MLPs into block-diagonal dense
+    matrices. That reduces Python module dispatch, but it also asks cuBLAS to
+    multiply through the zeros in the block diagonal. The functional path keeps
+    the exact module math while avoiding the block-diagonal work.
+    """
     if (
         isinstance(left, nn.Sequential)
         and isinstance(right, nn.Sequential)
@@ -106,35 +113,14 @@ def _paired_mlp_outputs(
         and left[3].in_features == right[3].in_features
         and left[3].out_features == right[3].out_features
     ):
-        key = (
-            id(left),
-            id(right),
-            x.device.type,
-            x.device.index,
-            x.dtype,
-            left[1].weight._version,
-            right[1].weight._version,
-            left[3].weight._version,
-            right[3].weight._version,
+        x_left = F.layer_norm(x, left[0].normalized_shape, left[0].weight, left[0].bias, left[0].eps)
+        x_right = F.layer_norm(x, right[0].normalized_shape, right[0].weight, right[0].bias, right[0].eps)
+        left_h = left[2](F.linear(x_left, left[1].weight, left[1].bias))
+        right_h = right[2](F.linear(x_right, right[1].weight, right[1].bias))
+        return (
+            F.linear(left_h, left[3].weight, left[3].bias),
+            F.linear(right_h, right[3].weight, right[3].bias),
         )
-        packed = cache.get(key) if cache is not None else None
-        if packed is None:
-            w1 = torch.block_diag(left[1].weight.detach(), right[1].weight.detach())
-            b1 = torch.cat([left[1].bias.detach(), right[1].bias.detach()], dim=0) if left[1].bias is not None and right[1].bias is not None else None
-            w2 = torch.block_diag(left[3].weight.detach(), right[3].weight.detach())
-            b2 = torch.cat([left[3].bias.detach(), right[3].bias.detach()], dim=0) if left[3].bias is not None and right[3].bias is not None else None
-            packed = (w1, b1, w2, b2)
-            if cache is not None:
-                cache[key] = packed
-        w1, b1, w2, b2 = packed
-        x_left = left[0](x)
-        x_right = right[0](x)
-        hidden = torch.nn.functional.linear(torch.cat([x_left, x_right], dim=-1), w1, b1)
-        left_h, right_h = hidden.split(left[1].out_features, dim=-1)
-        left_h = left[2](left_h)
-        right_h = right[2](right_h)
-        out = torch.nn.functional.linear(torch.cat([left_h, right_h], dim=-1), w2, b2)
-        return out.split(left[3].out_features, dim=-1)
     return left(x), right(x)
 
 

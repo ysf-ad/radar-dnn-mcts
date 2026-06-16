@@ -1041,7 +1041,10 @@ current cached score, prefixes=32:      ~2.18 ms
 paired-head cached score, prefixes=32:  ~2.37 ms
 ```
 
-Conclusion: do not fuse these heads in the current PyTorch runtime. The microbenchmark benefit does not survive the full action-attention scorer. The larger optimization remains batching the search/tree work so each neural call handles more prefixes.
+Conclusion: do not make paired heads the default in the current PyTorch
+runtime. The microbenchmark benefit does not consistently survive the full
+action-attention scorer. The larger optimization remains batching the
+search/tree work so each neural call handles more prefixes.
 
 ## MCTX Takeaway
 
@@ -1917,8 +1920,9 @@ score replay and Python/tensor staging enough that the OpenMP selected-step
 call does not obviously improve end-to-end throughput.
 
 An inference-only paired policy/Q head path was also tested behind
-`--paired-heads`. It packs same-architecture policy and Q MLP pairs into cached
-block-diagonal projections for type, target, and action-residual heads.
+`--paired-heads`. The first version packed same-architecture policy and Q MLP
+pairs into cached block-diagonal projections for type, target, and
+action-residual heads.
 
 Important correction: the first paired-head and direct-coupler benchmark only
 affected the older `_scores_from_encoded` helper. The online graph path calls
@@ -1931,8 +1935,26 @@ direct couplers: max_abs_diff 0.0, allclose true
 paired heads:    max_abs_diff 0.00048828125, allclose false under fp16 AMP
 ```
 
-Because paired heads are not bit-close under the strict AMP check, they remain
-an experimental path rather than a recommended speed path.
+The paired-head helper was later changed from block-diagonal packing to direct
+functional execution of each LayerNorm/Linear/GELU/Linear pair. That removed the
+block-diagonal dense multiply and made the opt-in path exact again on a real
+AMP observation probe:
+
+```text
+functional paired heads: max_abs_diff 0.0, argmax_equal true
+```
+
+The full graph path still did not prefer it in a same-state 64-env/10-window
+A/B:
+
+```text
+separate heads:          0.04055 ms/env-action
+functional paired heads: 0.04344 ms/env-action
+reward/actions:          identical
+```
+
+So paired heads remain an experimental path rather than a recommended speed
+path.
 
 The corrected direct-coupler path is exact but did not improve the full
 64-env, 20-window graph benchmark:
@@ -2590,11 +2612,11 @@ Two score-body alternatives were profiled but not promoted:
 
 ```text
 direct/manual coupler calls: exact, but not faster than the current graph path
-paired-head execution: faster in places, but changed decisions/reward
+paired-head execution: exact after functional rewrite, but not faster online
 ```
 
-Paired-head execution therefore remains an experimental approximation, not an
-online replacement for the exact policy/Q head path.
+Paired-head execution therefore remains an experimental option, not an online
+replacement for the default policy/Q head path.
 
 The attention backend lab now accepts the trained checkpoint and AMP settings,
 and the online multi-env benchmark has a matching `--sdp-backend` switch. On
