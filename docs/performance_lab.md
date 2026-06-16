@@ -2573,6 +2573,29 @@ It is small, but it removes an avoidable GPU add kernel from the default
 configuration and keeps benchmark, reusable fast planner, branch expansion, and
 profiling helpers consistent.
 
+The GPU action-template upload also avoids a duplicated valid-mask transfer in
+the default benchmark path. The template valid mask is uploaded once and the
+mutable per-decision valid buffer is allocated with `empty_like` on device:
+
+```text
+template_valid_t = H2D(valid_mask)
+valid_t = empty_like(template_valid_t)
+```
+
+A 64-env/20-window run with this cleanup matched cached-root reward/action
+counts exactly and measured `~887.9 env-windows/s`, within the same run-to-run
+band as the previous `~892.4 env-windows/s` run.
+
+Two score-body alternatives were profiled but not promoted:
+
+```text
+direct/manual coupler calls: exact, but not faster than the current graph path
+paired-head execution: faster in places, but changed decisions/reward
+```
+
+Paired-head execution therefore remains an experimental approximation, not an
+online replacement for the exact policy/Q head path.
+
 Current synchronized 64-env/10-window graph-stage profile:
 
 ```text

@@ -1323,7 +1323,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                 gather_t = bases_t.clamp_min(0).clamp_max(MAXT)
                 search_action_t = bases_t == 0
                 template_valid_t = torch.from_numpy(physical_template.valid).to(device, dtype=torch.bool)
-                valid_t = torch.empty_like(torch.from_numpy(physical_template.valid).to(device, dtype=torch.bool))
+                valid_t = torch.empty_like(template_valid_t)
                 return actions_t, flat_t, gather_t, search_action_t, template_valid_t, valid_t
 
             gpu_action_template = time_stage(
