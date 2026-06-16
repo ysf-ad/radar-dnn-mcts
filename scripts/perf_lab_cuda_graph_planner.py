@@ -74,13 +74,35 @@ def main() -> None:
     obs = get_obs(eng, 0.0)
 
     model = ActionAttentionFactorizedNet(48, 4, 2).eval()
+    gpu_select_model = ActionAttentionFactorizedNet(48, 4, 2).eval()
     graph_model = ActionAttentionFactorizedNet(48, 4, 2).eval()
+    graph_gpu_select_model = ActionAttentionFactorizedNet(48, 4, 2).eval()
+    gpu_select_model.load_state_dict(model.state_dict())
     graph_model.load_state_dict(model.state_dict())
+    graph_gpu_select_model.load_state_dict(model.state_dict())
     base = FastActionAttentionPlanner(model, env_cfg, device=device, use_amp=bool(args.amp), use_cuda_graph=False)
+    gpu_select = FastActionAttentionPlanner(
+        gpu_select_model,
+        env_cfg,
+        device=device,
+        use_amp=bool(args.amp),
+        use_cuda_graph=False,
+        use_gpu_select=True,
+    )
     graph = FastActionAttentionPlanner(graph_model, env_cfg, device=device, use_amp=bool(args.amp), use_cuda_graph=True)
+    graph_gpu_select = FastActionAttentionPlanner(
+        graph_gpu_select_model,
+        env_cfg,
+        device=device,
+        use_amp=bool(args.amp),
+        use_cuda_graph=True,
+        use_gpu_select=True,
+    )
 
     base_plan, base_timing = bench(base, obs, device, int(args.iters), int(args.warmup))
+    gpu_select_plan, gpu_select_timing = bench(gpu_select, obs, device, int(args.iters), int(args.warmup))
     graph_plan, graph_timing = bench(graph, obs, device, int(args.iters), int(args.warmup))
+    graph_gpu_select_plan, graph_gpu_select_timing = bench(graph_gpu_select, obs, device, int(args.iters), int(args.warmup))
     report = {
         "device": str(device),
         "cuda_available": bool(torch.cuda.is_available()),
@@ -91,11 +113,21 @@ def main() -> None:
         "iters": int(args.iters),
         "warmup": int(args.warmup),
         "base_plan": base_plan,
+        "gpu_select_plan": gpu_select_plan,
         "cuda_graph_plan": graph_plan,
-        "plans_match": base_plan == graph_plan,
+        "cuda_graph_gpu_select_plan": graph_gpu_select_plan,
+        "plans_match": {
+            "gpu_select": base_plan == gpu_select_plan,
+            "cuda_graph": base_plan == graph_plan,
+            "cuda_graph_gpu_select": base_plan == graph_gpu_select_plan,
+        },
         "base_fast_planner": base_timing,
+        "gpu_select_fast_planner": gpu_select_timing,
         "cuda_graph_fast_planner": graph_timing,
+        "cuda_graph_gpu_select_fast_planner": graph_gpu_select_timing,
+        "gpu_select_speedup_mean": float(base_timing["mean_ms"] / max(gpu_select_timing["mean_ms"], 1e-12)),
         "speedup_mean": float(base_timing["mean_ms"] / max(graph_timing["mean_ms"], 1e-12)),
+        "cuda_graph_gpu_select_speedup_mean": float(base_timing["mean_ms"] / max(graph_gpu_select_timing["mean_ms"], 1e-12)),
     }
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -203,6 +203,13 @@ def main() -> None:
             device=device,
             use_cuda_graph=True,
         ),
+        "fast_graph_gpu_select": lambda: FastActionAttentionPlanner(
+            fast_model,
+            env_cfg,
+            device=device,
+            use_cuda_graph=True,
+            use_gpu_select=True,
+        ),
     }
     requested = [name.strip().lower() for name in str(args.planners).split(",") if name.strip()]
     unknown = sorted(set(requested) - set(planner_factories))

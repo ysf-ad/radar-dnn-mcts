@@ -248,6 +248,7 @@ class FastActionAttentionPlanner:
         use_amp: bool = False,
         use_compile: bool = False,
         use_cuda_graph: bool = False,
+        use_gpu_select: bool = False,
     ):
         dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = model.eval().to(dev)
@@ -261,6 +262,7 @@ class FastActionAttentionPlanner:
         self.use_amp = bool(use_amp and dev.type == "cuda")
         self.use_compile = bool(use_compile)
         self.use_cuda_graph = bool(use_cuda_graph and dev.type == "cuda")
+        self.use_gpu_select = bool(use_gpu_select)
         self.adapt = adapter()
         self.stats = FastPlannerStats(True, str(dev), self.use_amp, self.use_compile)
         self._row_is_search_cache: dict[tuple[int, str, int | None], torch.Tensor] = {}
@@ -504,6 +506,29 @@ class FastActionAttentionPlanner:
         except Exception:
             return None
 
+    def _physical_action_tensors(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        actions, bases, sensors = physical_action_arrays(obs, selected=None, max_trackers=MAXT)
+        return (
+            torch.from_numpy(actions.astype(np.int64, copy=False)).to(self.device),
+            torch.from_numpy(bases.astype(np.int64, copy=False)).to(self.device),
+            torch.from_numpy(sensors.astype(np.int64, copy=False)).to(self.device),
+        )
+
+    def _select_best_action_torch(
+        self,
+        score_t: torch.Tensor,
+        actions_t: torch.Tensor,
+        bases_t: torch.Tensor,
+        sensors_t: torch.Tensor,
+    ) -> int | None:
+        if actions_t.numel() <= 0:
+            return None
+        vals = score_t[bases_t, sensors_t]
+        if self.search_score_bias != 0.0:
+            vals = vals + (bases_t == 0).to(vals.dtype) * float(self.search_score_bias)
+        action = int(actions_t[torch.argmax(vals)].item())
+        return action if action >= 0 else None
+
     def plan(self, obs, budget_ms=200):
         t_plan = self._profile_start()
         t0 = self._profile_start()
@@ -532,6 +557,11 @@ class FastActionAttentionPlanner:
         t0 = self._profile_start()
         graph_replay = self._build_cuda_graph_score_replay(cls_out, tok_out, selected_t, token_active, slot_width)
         self._profile_end("cuda_graph_prepare", t0)
+        action_tensors = None
+        if self.use_gpu_select:
+            t0 = self._profile_start()
+            action_tensors = self._physical_action_tensors(obs)
+            self._profile_end("candidate_h2d", t0)
         while elapsed < float(budget_ms) and len(plan) < 64:
             t0 = self._profile_start()
             slot = slot_features(obs, elapsed, search_count, track_count, last, float(budget_ms)).astype(np.float32)
@@ -541,9 +571,12 @@ class FastActionAttentionPlanner:
                     t0 = self._profile_start()
                     score_t = graph_replay(slot, selected_t)
                     self._profile_end("loop_score_graph_replay", t0)
-                    t0 = self._profile_start()
-                    score = score_t.cpu().numpy()
-                    self._profile_end("loop_score_d2h", t0)
+                    if self.use_gpu_select and action_tensors is not None:
+                        score = None
+                    else:
+                        t0 = self._profile_start()
+                        score = score_t.cpu().numpy()
+                        self._profile_end("loop_score_d2h", t0)
             else:
                 with torch.inference_mode():
                     t0 = self._profile_start()
@@ -553,16 +586,24 @@ class FastActionAttentionPlanner:
                     with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
                         score_t = self._combined_scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t).squeeze(0).float()
                     self._profile_end("loop_score_forward", t0)
-                    t0 = self._profile_start()
-                    score = score_t.cpu().numpy()
-                    self._profile_end("loop_score_d2h", t0)
-            t0 = self._profile_start()
-            score = np.asarray(score, dtype=np.float32).copy()
-            score[0, :] += self.search_score_bias
-            self._profile_end("loop_score_postprocess", t0)
-            t0 = self._profile_start()
-            best_action = select_best_action(score, obs, selected=selected, max_trackers=MAXT)
-            self._profile_end("loop_select_best_action", t0)
+                    if self.use_gpu_select and action_tensors is not None:
+                        score = None
+                    else:
+                        t0 = self._profile_start()
+                        score = score_t.cpu().numpy()
+                        self._profile_end("loop_score_d2h", t0)
+            if self.use_gpu_select and action_tensors is not None:
+                t0 = self._profile_start()
+                best_action = self._select_best_action_torch(score_t, *action_tensors)
+                self._profile_end("loop_select_best_action_gpu", t0)
+            else:
+                t0 = self._profile_start()
+                score = np.asarray(score, dtype=np.float32).copy()
+                score[0, :] += self.search_score_bias
+                self._profile_end("loop_score_postprocess", t0)
+                t0 = self._profile_start()
+                best_action = select_best_action(score, obs, selected=selected, max_trackers=MAXT)
+                self._profile_end("loop_select_best_action", t0)
             if best_action is None:
                 break
             t0 = self._profile_start()

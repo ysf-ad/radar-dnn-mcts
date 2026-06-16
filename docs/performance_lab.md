@@ -1134,10 +1134,12 @@ script: scripts/perf_lab_cuda_graph_planner.py
 device=cuda, initial_targets=40, arrival_rate=3, seed=916,
 warmup=5, iterations=30
 
-regular fast planner:      50.984 ms / plan
-CUDA graph fast planner:   12.403 ms / plan
-speedup:                    4.11x
-plans match:                true
+regular fast planner:             50.257 ms / plan
+GPU-select fast planner:          49.905 ms / plan
+CUDA graph fast planner:          12.274 ms / plan
+CUDA graph + GPU-select planner:  10.959 ms / plan
+best speedup:                      4.59x
+plans match:                       true
 ```
 
 The internal online profiler shows why this helps:
@@ -1146,6 +1148,13 @@ The internal online profiler shows why this helps:
 regular per-decision score forward: ~2.5-2.6 ms
 CUDA graph replay score forward:    ~0.38-0.39 ms
 ```
+
+GPU-select is a smaller complementary optimization. Instead of copying the
+full `[target_rows, sensors]` score table back to CPU and running NumPy
+selection, the planner gathers valid physical actions and runs `argmax` on the
+GPU, transferring only the selected action id. On its own it is neutral because
+the uncaptured model forward dominates latency, but after CUDA Graph replay it
+removes enough CPU/D2H work to improve the graph path by another ~11%.
 
 The graph path is optional because capture has a one-time cost and depends on
 CUDA availability. It is most useful for repeated fixed-shape online planning,
