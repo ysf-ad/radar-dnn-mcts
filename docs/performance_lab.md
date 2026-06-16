@@ -15,6 +15,7 @@ python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,3
 python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batches 1,4,8,16,32,64
 python scripts\perf_lab_batched_beam_planner.py --device cuda --beam-widths 1,4,8,16 --max-depth 24
 python scripts\perf_lab_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
+python scripts\perf_lab_persistent_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
 ```
 
 ## First Findings
@@ -295,6 +296,36 @@ wave=32:  combined ~15.5 ms, exact sim ~15.7%
 ```
 
 For one-step root waves, exact C branch simulation is no longer the dominant cost. The bottleneck is still neural setup plus expansion, especially repeated root encoding/scorer construction. The next major implementation target is a persistent dense tree/search state that reuses encoded root state across multiple expansion waves and batches deeper expansions.
+
+## Persistent Root Wave
+
+`perf_lab_persistent_neural_exact_wave.py` measures the same neural proposal plus exact branch simulation path after constructing the root scorer once:
+
+```text
+one-time root encode/scorer setup
+then repeated:
+    neural top-K proposal from persistent scorer
+    exact batched C branch simulation
+```
+
+This isolates steady-state search-wave cost after root encoding is cached. Measured CUDA steady-state:
+
+```text
+wave=1:   combined ~5.4 ms, exact sim ~3.2%
+wave=4:   combined ~5.2 ms, exact sim ~7.3%
+wave=8:   combined ~6.0 ms, exact sim ~12.6%
+wave=16:  combined ~6.3 ms, exact sim ~19.5%
+wave=32:  combined ~7.7 ms, exact sim ~31.5%
+```
+
+Compared with rebuilding the scorer every wave, persistent root state roughly halves the 32-action combined wave time:
+
+```text
+rebuild scorer every wave, wave=32: ~15.5 ms
+persistent scorer, wave=32:         ~7.7 ms
+```
+
+This confirms that caching encoded root/search state is not optional for a fast planner. After caching, exact C branch simulation becomes a meaningful share of large waves, so the next optimization should combine persistent dense tree state with batched C branch stepping rather than repeatedly constructing Python scorer objects.
 
 ## MCTX Takeaway
 
