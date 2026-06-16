@@ -9,6 +9,7 @@ python scripts\perf_lab_action_attention.py --device cpu
 python scripts\perf_lab_action_attention.py --device cuda --forward-batches 1,8,32,128
 python scripts\profile_action_attention_steps.py --device cuda
 python scripts\perf_lab_batched_roots.py --device cuda --batch-sizes 1,8,32,128
+python scripts\perf_lab_batched_root_tables.py --device cuda --batch-sizes 1,8,32,128
 python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
 python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast
 python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
@@ -72,6 +73,36 @@ batch=128: ~6.4x
 ```
 
 Root action choices matched the old per-state scorer in these tests.
+
+## Batched Root Action Tables
+
+Root search needs more than the single best action: it needs a sorted table of
+valid root actions and scores that can be consumed by the cached cursor search.
+`BatchedActionAttentionScorer.all_root_action_tables` now builds those tables
+for many root observations in one model pass:
+
+```text
+observations[]
+    -> batched token/slot tensors
+    -> one action-attention policy/Q pass
+    -> per-root valid physical action gather
+    -> sorted padded action tables
+```
+
+This is the multi-root counterpart to the single-root cached action table.
+Measured CUDA fp32 speedups against looping over roots one at a time:
+
+```text
+batch=1:    ~1.0x, ~130 root tables/sec
+batch=8:    ~4.7x, ~618 root tables/sec
+batch=32:   ~7.6x, ~970 root tables/sec
+batch=128:  ~6.5x, ~935 root tables/sec
+```
+
+The batched fp32 tables matched the per-root action order and scores in the
+benchmark. AMP was slower and changed some action rankings, so root action table
+construction should stay fp32 unless a tolerance-aware/ranking-stable mixed
+precision path is added later.
 
 ## Current Optimization
 

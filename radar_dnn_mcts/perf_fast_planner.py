@@ -38,6 +38,16 @@ class BatchedRootProposals:
     valid: np.ndarray
 
 
+@dataclass
+class BatchedRootActionTables:
+    actions: np.ndarray
+    scores: np.ndarray
+    bases: np.ndarray
+    sensors: np.ndarray
+    valid: np.ndarray
+    counts: np.ndarray
+
+
 def physical_action_arrays(obs: dict, selected: Iterable[int] | None = None, max_trackers: int = MAXT):
     """Return candidate action ids and score-table indices as NumPy arrays.
 
@@ -393,3 +403,59 @@ class BatchedActionAttentionScorer:
             sensors[i, :take] = row_sensors[order]
             valid[i, :take] = True
         return BatchedRootProposals(actions=actions, scores=scores, bases=bases, sensors=sensors, valid=valid)
+
+    def all_root_action_tables(self, observations: list[dict], max_actions: int | None = None, **kwargs) -> BatchedRootActionTables:
+        """Return sorted valid root action tables for many observations.
+
+        The policy/Q model emits dense `[rows, sensors]` score tables. This
+        helper gathers the physically valid action ids for each root state,
+        sorts them by model score, and pads them into dense arrays suitable for
+        cached root search.
+        """
+        result = self.score_batch(observations, **kwargs)
+        n = len(observations)
+        counts = np.zeros((n,), dtype=np.int32)
+        sorted_rows: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        width = 0
+        for i in range(n):
+            vals = result.scores[i, result.bases[i], result.sensors[i]]
+            finite = np.isfinite(vals)
+            row_actions = result.actions[i][finite].astype(np.int64, copy=False)
+            row_bases = result.bases[i][finite].astype(np.int64, copy=False)
+            row_sensors = result.sensors[i][finite].astype(np.int64, copy=False)
+            row_vals = vals[finite].astype(np.float32, copy=False)
+            if row_vals.size:
+                order = np.argsort(-row_vals)
+                row_actions = row_actions[order]
+                row_bases = row_bases[order]
+                row_sensors = row_sensors[order]
+                row_vals = row_vals[order]
+            counts[i] = int(row_vals.size)
+            width = max(width, int(row_vals.size))
+            sorted_rows.append((row_actions, row_vals, row_bases, row_sensors))
+
+        if max_actions is not None:
+            width = min(width, int(max_actions))
+        width = max(width, 0)
+        actions = np.full((n, width), -1, dtype=np.int64)
+        scores = np.full((n, width), -np.inf, dtype=np.float32)
+        bases = np.full((n, width), -1, dtype=np.int64)
+        sensors = np.full((n, width), -1, dtype=np.int64)
+        valid = np.zeros((n, width), dtype=bool)
+        for i, (row_actions, row_vals, row_bases, row_sensors) in enumerate(sorted_rows):
+            take = min(width, int(row_vals.size))
+            if take <= 0:
+                continue
+            actions[i, :take] = row_actions[:take]
+            scores[i, :take] = row_vals[:take]
+            bases[i, :take] = row_bases[:take]
+            sensors[i, :take] = row_sensors[:take]
+            valid[i, :take] = True
+        return BatchedRootActionTables(
+            actions=actions,
+            scores=scores,
+            bases=bases,
+            sensors=sensors,
+            valid=valid,
+            counts=counts,
+        )
