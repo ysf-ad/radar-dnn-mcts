@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "radar_dnn_mcts"))
 _FAST_STEP_BINDING = None
 _FAST_STEP_SEARCH_DWELL_MS = None
+_CUDA_EVENT_STAGE_BUCKETS: dict[str, list[float]] | None = None
 
 
 def sync(device: torch.device) -> None:
@@ -166,12 +167,24 @@ def load_model_checkpoint(model, checkpoint: str | Path | None):
 
 
 def time_stage(device: torch.device, enabled: bool, buckets: dict[str, list[float]], name: str, fn):
+    global _CUDA_EVENT_STAGE_BUCKETS
     if not enabled:
         return fn()
     sync(device)
+    start_event = None
+    end_event = None
+    if _CUDA_EVENT_STAGE_BUCKETS is not None and device.type == "cuda":
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
     t0 = time.perf_counter()
     out = fn()
-    sync(device)
+    if start_event is not None and end_event is not None:
+        end_event.record()
+        end_event.synchronize()
+        add_profile_stage(_CUDA_EVENT_STAGE_BUCKETS, name, float(start_event.elapsed_time(end_event)))
+    else:
+        sync(device)
     add_profile_stage(buckets, name, (time.perf_counter() - t0) * 1000.0)
     return out
 
@@ -1882,6 +1895,7 @@ def build_envs(args, env_cfg):
 
 
 def main() -> None:
+    global _CUDA_EVENT_STAGE_BUCKETS
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--envs", type=int, default=16)
@@ -1902,6 +1916,7 @@ def main() -> None:
     parser.add_argument("--padded-live-graph", action="store_true", help="Replay the full-batch score graph for partial live batches and gather live rows.")
     parser.add_argument("--full-select-graph", action="store_true", help="Use a CUDA graph that captures score replay plus action selection for full-live graph rounds.")
     parser.add_argument("--profile-stages", action="store_true")
+    parser.add_argument("--profile-cuda-events", action="store_true", help="Also record CUDA-event elapsed time for profiled stages.")
     parser.add_argument("--profile-cpu-top", type=int, default=0, help="Record top cumulative cProfile functions for each benchmark path.")
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
     parser.add_argument("--batch-env-step", action="store_true", help="Use the selected-index C batch step in the cached-root graph path.")
@@ -1927,6 +1942,8 @@ def main() -> None:
     )
     parser.add_argument("--out", type=Path, default=Path("results/perf_lab_multi_env_online_batch.json"))
     args = parser.parse_args()
+    if bool(args.profile_cuda_events):
+        args.profile_stages = True
 
     from perf_fast_planner import BatchedActionAttentionScorer, FastActionAttentionPlanner
     from repaired_campaign_tools import env_preset_cfg
@@ -1938,6 +1955,7 @@ def main() -> None:
     if str(args.matmul_precision):
         torch.set_float32_matmul_precision(str(args.matmul_precision))
     device = torch.device(args.device)
+    _CUDA_EVENT_STAGE_BUCKETS = {} if bool(args.profile_cuda_events) and device.type == "cuda" else None
     env_cfg = env_preset_cfg("repaired_stress")
     env_cfg["poisson_rate_per_second"] = float(args.rate)
     env_cfg["enable_x_band"] = 1
@@ -2062,6 +2080,9 @@ def main() -> None:
         if batched_report and serial_report
         else None,
         "cpu_profile_top": cpu_profiles if int(args.profile_cpu_top) > 0 else {},
+        "cuda_stage_profile": profile_summary(_CUDA_EVENT_STAGE_BUCKETS)
+        if _CUDA_EVENT_STAGE_BUCKETS is not None
+        else {},
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")

@@ -2753,6 +2753,25 @@ So the next meaningful wins need to come from reducing model replay work,
 batching/fusing selection, or moving more simulator stepping out of the Python
 boundary; root/template setup is now secondary for large batches.
 
+For GPU-specific profiling, the same benchmark accepts `--profile-cuda-events`.
+This implies `--profile-stages` and records a second `cuda_stage_profile`
+section using CUDA events around each named stage. The normal `stage_profile`
+remains the synchronized wall-clock view; `cuda_stage_profile` is the stream
+elapsed view and is better for separating GPU work from Python/control overhead.
+A small 8-env/2-window graph smoke run showed the top CUDA-event stages as:
+
+```text
+graph_score_replay:            ~17.86 ms total over 30 calls
+graph_action_tensor_prep_h2d:  ~11.18 ms total over 40 calls
+graph_decision_select_device:  ~10.99 ms total over 40 calls
+graph_env_step_batch:           ~9.69 ms total over 40 calls
+graph_padded_score_replay:      ~7.27 ms total over 10 calls
+```
+
+That confirms the current optimization targets from the wall-clock profiles:
+score replay and score/selection data movement dominate; simulator stepping is
+still material, but no longer the only large cost.
+
 `--padded-live-graph` was rechecked against raw partial-batch scoring using the
 graph-only 64-env/20-window profile. It should stay enabled for this workload:
 
