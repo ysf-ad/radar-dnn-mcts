@@ -132,6 +132,101 @@ def pack_root_observations(observations: list[dict], max_trackers: int) -> Packe
     )
 
 
+def pack_root_envs_direct(envs, root_env_ids: list[int], search_debt: list[float], env_cfg: dict, max_trackers: int) -> PackedRootObs:
+    from pufferlib.ocean.radarxs import binding
+    from pufferlib.ocean.radarxs.engine import FEATURES_PER_TRACKER, GRID_SIZE, NO_TARGET
+
+    n = len(root_env_ids)
+    if n <= 0:
+        return PackedRootObs(
+            observations=[],
+            t_desired=np.zeros((0, max_trackers), dtype=np.float32),
+            deadline=np.zeros((0, max_trackers), dtype=np.float32),
+            dwell=np.zeros((0, max_trackers), dtype=np.float32),
+            active=np.zeros((0, max_trackers), dtype=bool),
+            tracked=np.zeros((0, max_trackers), dtype=bool),
+            priority=np.zeros((0, max_trackers), dtype=np.float32),
+            ranges=np.zeros((0, max_trackers), dtype=np.float32),
+            grids=np.zeros((0, GRID_SIZE), dtype=np.float32),
+            az_bin=np.zeros((0, max_trackers), dtype=np.float32),
+            el_bin=np.zeros((0, max_trackers), dtype=np.float32),
+            search_debt_ms=np.zeros((0,), dtype=np.float32),
+            s_busy_ms=np.zeros((0,), dtype=np.float32),
+            x_busy_ms=np.zeros((0,), dtype=np.float32),
+            enable_x_band=np.zeros((0,), dtype=np.float32),
+            sensor_id=np.zeros((0,), dtype=np.float32),
+            use_grid_feature=np.zeros((0,), dtype=np.float32),
+            use_arrival_feature=np.zeros((0,), dtype=np.float32),
+            arrival_rate=np.zeros((0,), dtype=np.float32),
+        )
+
+    obs_mat = np.stack([np.asarray(envs[i].obs_buf[0], dtype=np.float32) for i in root_env_ids], axis=0)
+    grids = obs_mat[:, :GRID_SIZE]
+    inferred = int((obs_mat.shape[1] - GRID_SIZE - 1) / max_trackers)
+    features_per_tracker = inferred if inferred in (4, 6) else FEATURES_PER_TRACKER
+    end_idx = GRID_SIZE + int(max_trackers) * int(features_per_tracker)
+    trackers = obs_mat[:, GRID_SIZE:end_idx].reshape(n, int(max_trackers), int(features_per_tracker))
+    t_desired = np.where(np.isfinite(trackers[:, :, 0]), trackers[:, :, 0], float(NO_TARGET)).astype(np.float32, copy=False)
+    deadline = np.where(np.isfinite(trackers[:, :, 1]), trackers[:, :, 1], float(NO_TARGET)).astype(np.float32, copy=False)
+    dwell = np.where(np.isfinite(trackers[:, :, 2]), trackers[:, :, 2], 10.0).astype(np.float32, copy=False)
+    dwell = np.clip(dwell, 1.0, 2000.0)
+    priority = np.where(np.isfinite(trackers[:, :, 3]), trackers[:, :, 3], 0.0).astype(np.float32, copy=False)
+    if features_per_tracker >= 6:
+        az_bin = np.where(np.isfinite(trackers[:, :, 4]), trackers[:, :, 4], 0.0).astype(np.float32, copy=False)
+        el_bin = np.where(np.isfinite(trackers[:, :, 5]), trackers[:, :, 5], 0.0).astype(np.float32, copy=False)
+        az_bin = np.clip(az_bin, 0.0, 1.0)
+        el_bin = np.clip(el_bin, 0.0, 1.0)
+    else:
+        az_bin = np.zeros((n, max_trackers), dtype=np.float32)
+        el_bin = np.zeros((n, max_trackers), dtype=np.float32)
+    active = np.isfinite(t_desired) & (t_desired != float(NO_TARGET))
+    tracked = active & (deadline > 0.0)
+    sensor_id = np.zeros((n,), dtype=np.float32)
+    if end_idx < obs_mat.shape[1]:
+        raw_sensor = obs_mat[:, end_idx]
+        sensor_id = np.where(np.isfinite(raw_sensor), raw_sensor, 0.0).astype(np.float32, copy=False)
+
+    ranges = np.zeros((n, max_trackers), dtype=np.float32)
+    s_busy_ms = np.zeros((n,), dtype=np.float32)
+    x_busy_ms = np.zeros((n,), dtype=np.float32)
+    enable_x_band = np.zeros((n,), dtype=np.float32)
+    if hasattr(binding, "vec_aux"):
+        for row, env_idx in enumerate(root_env_ids):
+            try:
+                aux = binding.vec_aux(envs[env_idx].env)
+            except Exception:
+                continue
+            s_busy_ms[row] = float(aux.get("s_band_busy_ms", 0.0))
+            x_busy_ms[row] = float(aux.get("x_band_busy_ms", 0.0))
+            enable_x_band[row] = float(aux.get("enable_x_band", 0.0))
+            aux_ranges = np.asarray(aux.get("target_range", []), dtype=np.float32)
+            if aux_ranges.size:
+                ranges[row, : min(max_trackers, aux_ranges.size)] = aux_ranges[:max_trackers]
+
+    observations = [None] * n
+    return PackedRootObs(
+        observations=observations,
+        t_desired=t_desired,
+        deadline=deadline,
+        dwell=dwell,
+        active=active,
+        tracked=tracked,
+        priority=priority,
+        ranges=ranges,
+        grids=grids,
+        az_bin=az_bin,
+        el_bin=el_bin,
+        search_debt_ms=np.asarray([float(search_debt[i]) for i in root_env_ids], dtype=np.float32),
+        s_busy_ms=s_busy_ms,
+        x_busy_ms=x_busy_ms,
+        enable_x_band=enable_x_band,
+        sensor_id=sensor_id,
+        use_grid_feature=np.ones((n,), dtype=np.float32),
+        use_arrival_feature=np.ones((n,), dtype=np.float32),
+        arrival_rate=np.full((n,), float(env_cfg.get("arrival_rate", env_cfg.get("poisson_rate_per_second", 0.0))), dtype=np.float32),
+    )
+
+
 def slot_template_from_packed(packed: PackedRootObs, budget_ms: float) -> np.ndarray:
     tracked = packed.active & (packed.deadline >= 0.0)
     workload = np.sum(np.where(tracked, packed.dwell, 0.0), axis=1) / max(1.0, float(budget_ms))
@@ -675,20 +770,29 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
         root_env_ids = [i for i, eng in enumerate(envs) if not eng.term_buf[0]]
         if not root_env_ids:
             break
-        obs2 = time_stage(
-            device,
-            profile_enabled,
-            stage_buckets,
-            "root_obs_attach",
-            lambda: [attach_env_obs(get_obs(envs[i], search_debt[i]), planner.env_cfg, True, True) for i in root_env_ids],
-        )
-        packed = time_stage(
-            device,
-            profile_enabled,
-            stage_buckets,
-            "root_pack_observations",
-            lambda: pack_root_observations(obs2, MAXT),
-        )
+        if bool(getattr(args, "direct_root_pack", False)):
+            packed = time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "root_pack_direct",
+                lambda: pack_root_envs_direct(envs, root_env_ids, search_debt, planner.env_cfg, MAXT),
+            )
+        else:
+            obs2 = time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "root_obs_attach",
+                lambda: [attach_env_obs(get_obs(envs[i], search_debt[i]), planner.env_cfg, True, True) for i in root_env_ids],
+            )
+            packed = time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "root_pack_observations",
+                lambda: pack_root_observations(obs2, MAXT),
+            )
         selected = [set() for _ in root_env_ids]
         elapsed = [0.0 for _ in root_env_ids]
         search_count = [0 for _ in root_env_ids]
@@ -923,8 +1027,11 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         root_env_ids = [i for i, eng in enumerate(envs) if not eng.term_buf[0]]
         if not root_env_ids:
             break
-        obs2 = [attach_env_obs(get_obs(envs[i], search_debt[i]), planner.env_cfg, True, True) for i in root_env_ids]
-        packed = pack_root_observations(obs2, MAXT)
+        if bool(getattr(args, "direct_root_pack", False)):
+            packed = pack_root_envs_direct(envs, root_env_ids, search_debt, planner.env_cfg, MAXT)
+        else:
+            obs2 = [attach_env_obs(get_obs(envs[i], search_debt[i]), planner.env_cfg, True, True) for i in root_env_ids]
+            packed = pack_root_observations(obs2, MAXT)
         selected = [set() for _ in root_env_ids]
         elapsed = [0.0 for _ in root_env_ids]
         search_count = [0 for _ in root_env_ids]
@@ -1074,6 +1181,7 @@ def main() -> None:
     parser.add_argument("--skip-graph", action="store_true")
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
+    parser.add_argument("--direct-root-pack", action="store_true", help="Pack cached-root observations directly from C engine buffers.")
     parser.add_argument("--out", type=Path, default=Path("results/perf_lab_multi_env_online_batch.json"))
     args = parser.parse_args()
 

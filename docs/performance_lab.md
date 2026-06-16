@@ -1910,6 +1910,54 @@ root observation/encoding residency. The high-batch planner is now mostly
 limited by batched action-attention inference and root-state refresh, not by
 per-action simulator bookkeeping.
 
+### Direct Root Packing
+
+The cached-root path also has an opt-in `--direct-root-pack` mode. Instead of:
+
+```text
+C obs buffer -> get_obs_from_buf dict -> attach_env_obs dict -> PackedRootObs arrays
+```
+
+it parses the C observation buffers directly into `PackedRootObs`:
+
+```text
+C obs buffers [env, raw_obs]
+    -> grid tensor
+    -> tracker tensor [env, target, desired/deadline/dwell/priority/az/el]
+    -> aux busy/range arrays
+    -> PackedRootObs
+```
+
+Equivalence checks matched the dictionary path exactly for:
+
+```text
+packed arrays
+token tensors
+slot templates
+physical action ids/base ids/sensor ids/valid masks
+```
+
+Measured with `--fast-env-step`, CUDA, `64` envs, `60` initial targets, arrival
+rate `4`, and `3` windows:
+
+```text
+fast env step + dictionary root pack: ~738.1 env-windows/s
+fast env step + direct root pack:     ~757.2 env-windows/s
+reward delta vs serial:               0.0
+```
+
+The stage profile now has a single root packing stage:
+
+```text
+root_obs_attach + root_pack_observations: removed
+root_pack_direct:                         ~0.61 ms
+```
+
+This confirms the packed state representation is the right direction, but the
+remaining large costs have moved back to neural scoring and root encoding. The
+next high-leverage step is to reduce `decision_score_forward` or avoid
+re-encoding unchanged root state across repeated eval/training batches.
+
 ## Next Work
 
 - Promote cached-root multi-environment batching from benchmark script to a reusable evaluator/training data path.
