@@ -1694,10 +1694,34 @@ root transformer encode every depth. The cached-root path is the correct
 parallelization: encode target/context tokens once per environment window, then
 parallelize policy/Q scoring for all active environments at each decision depth.
 
+### Cached Multi-Env CUDA Graph Attempt
+
+`perf_lab_multi_env_online_batch.py` also includes
+`batched_multi_env_cached_root_graph`, which captures the score-only part of a
+cached-root multi-env decision round. The graph deliberately does not include
+`gather/argmax` action selection because PyTorch's selection path fails CUDA
+Graph capture on this stack.
+
+The graph path improves the inner score/replay round but loses end-to-end due
+per-window graph capture:
+
+```text
+envs  cached round ms  graph round ms  graph build ms/window  cached env-w/s  graph env-w/s
+4       2.73             0.96            72.35                  56.97          37.13
+16      4.10             1.66            76.88                 126.79         104.93
+64      3.62             2.47            78.05                 295.34         236.00
+```
+
+So the conclusion is precise: CUDA Graph replay helps the batched score kernel,
+but rebuilding a graph for every root window is too expensive. It would become
+useful only if fixed-shape graph capture can be reused across many windows with
+static root buffers, or for offline rollouts where many repeated decision rounds
+share one prepared root batch.
+
 ## Next Work
 
 - Promote cached-root multi-environment batching from benchmark script to a reusable evaluator/training data path.
-- Add fixed-shape CUDA Graph replay for cached-root multi-env decision rounds where batch size is stable.
+- Revisit fixed-shape CUDA Graph replay only if graph capture can be amortized across repeated prepared root batches.
 - Expand `DenseRootSearchState` beyond the root into full batched tree tensors.
 - Replace Python node objects with dense tree tensors.
 - Use `BatchedRootBranchSimulator` for exact one-step branch expansion.
