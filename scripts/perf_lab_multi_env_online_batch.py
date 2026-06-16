@@ -404,6 +404,63 @@ def tokenize_packed_root_fast(adapt, packed: PackedRootObs, max_trackers: int, t
     return x
 
 
+def physical_action_table_from_packed(packed: PackedRootObs, live_pos: list[int], selected: list[set[int]], max_trackers: int):
+    from exact_env_mutual import xs_s_search_action, xs_s_track_action, xs_x_search_action, xs_x_track_action
+    from perf_fast_planner import BatchedPhysicalActionTable
+
+    n = len(live_pos)
+    width = 2 + 2 * int(max_trackers)
+    actions = np.full((n, width), -1, dtype=np.int64)
+    bases = np.zeros((n, width), dtype=np.int64)
+    sensors = np.zeros((n, width), dtype=np.int64)
+    valid = np.zeros((n, width), dtype=bool)
+    if n <= 0:
+        return BatchedPhysicalActionTable(actions=actions, bases=bases, sensors=sensors, valid=valid)
+
+    idx = np.asarray(live_pos, dtype=np.int64)
+    active = packed.active[idx]
+    deadline = packed.deadline[idx]
+    ranges = packed.ranges[idx]
+    selected_mask = np.zeros((n, max_trackers), dtype=bool)
+    for row, pos in enumerate(live_pos):
+        for base in selected[pos]:
+            target_idx = int(base) - 1
+            if 0 <= target_idx < max_trackers:
+                selected_mask[row, target_idx] = True
+
+    s_free = packed.s_busy_ms[idx] <= 0.0
+    x_free = (packed.enable_x_band[idx].astype(np.int32) != 0) & (packed.x_busy_ms[idx] <= 0.0)
+    valid_target = active & np.isfinite(deadline) & (deadline >= 0.0) & ~selected_mask
+    sort_key = np.where(valid_target, deadline, np.inf)
+    target_order = np.argsort(sort_key, axis=1, kind="stable")
+    row_idx = np.arange(n)[:, None]
+    ordered_ranges = ranges[row_idx, target_order]
+    ordered_valid = valid_target[row_idx, target_order]
+    ordered_bases = target_order + 1
+
+    s_track_by_target = np.asarray([xs_s_track_action(i + 1, max_trackers) for i in range(max_trackers)], dtype=np.int64)
+    x_track_by_target = np.asarray([xs_x_track_action(i + 1, max_trackers) for i in range(max_trackers)], dtype=np.int64)
+    actions[:, 0] = xs_s_search_action(max_trackers)
+    bases[:, 0] = 0
+    sensors[:, 0] = 0
+    valid[:, 0] = True
+    actions[:, 1] = xs_x_search_action(max_trackers)
+    bases[:, 1] = 0
+    sensors[:, 1] = 1
+    valid[:, 1] = x_free
+    s_cols = slice(2, 2 + max_trackers)
+    x_cols = slice(2 + max_trackers, 2 + 2 * max_trackers)
+    actions[:, s_cols] = s_track_by_target[target_order]
+    bases[:, s_cols] = ordered_bases
+    sensors[:, s_cols] = 0
+    valid[:, s_cols] = ordered_valid & s_free[:, None] & (ordered_ranges > 10_000_000.0) & (ordered_ranges < 184_000_000.0)
+    actions[:, x_cols] = x_track_by_target[target_order]
+    bases[:, x_cols] = ordered_bases
+    sensors[:, x_cols] = 1
+    valid[:, x_cols] = ordered_valid & x_free[:, None] & (ordered_ranges > 5_000_000.0) & (ordered_ranges < 100_000_000.0)
+    return BatchedPhysicalActionTable(actions=actions, bases=bases, sensors=sensors, valid=valid)
+
+
 def run_serial(planner, envs, args, device: torch.device) -> dict:
     from final_radar_campaign import get_obs
     from strict_window_report import execute_plan_until_budget
@@ -562,8 +619,7 @@ def run_batched(scorer, envs, args, device: torch.device) -> dict:
 def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
     from exact_env_mutual import attach_env_obs, xs_decode_action
     from final_radar_campaign import get_obs
-    from mutual_features import TOKEN_DIM, slot_features_batch
-    from perf_fast_planner import physical_action_table_batch
+    from mutual_features import TOKEN_DIM
     from realistic_reward_retrain import adapter
     from repaired_campaign_tools import decode_sensor_action, execute_first_valid_action
     from two_sensor_physical_head_eval import MAXT
@@ -640,8 +696,6 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
         live_pos = list(range(len(root_env_ids)))
         depth = 0
         while live_pos and depth < int(args.max_depth):
-            live_obs = [obs2[p] for p in live_pos]
-            live_selected = [selected[p] for p in live_pos]
             slots = time_stage(
                 device,
                 profile_enabled,
@@ -654,7 +708,7 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
                 profile_enabled,
                 stage_buckets,
                 "physical_action_table_batch",
-                lambda: physical_action_table_batch(live_obs, selected=live_selected, max_trackers=MAXT),
+                lambda: physical_action_table_from_packed(packed, live_pos, selected, MAXT),
             )
             sync(device)
             t0 = time.perf_counter()
@@ -806,8 +860,7 @@ def _build_score_graph(planner, cls_out, tok_out, selected_t, token_active, slot
 def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     from exact_env_mutual import attach_env_obs, xs_decode_action
     from final_radar_campaign import get_obs
-    from mutual_features import TOKEN_DIM, slot_features_batch
-    from perf_fast_planner import physical_action_table_batch
+    from mutual_features import TOKEN_DIM
     from realistic_reward_retrain import adapter
     from repaired_campaign_tools import decode_sensor_action, execute_first_valid_action
     from two_sensor_physical_head_eval import MAXT
@@ -861,10 +914,8 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         live_pos = list(range(len(root_env_ids)))
         depth = 0
         while live_pos and depth < int(args.max_depth):
-            live_obs = [obs2[p] for p in live_pos]
-            live_selected = [selected[p] for p in live_pos]
             slots = make_live_slots(slot_template, live_pos, elapsed, search_count, track_count, last, float(args.window_ms))
-            physical = physical_action_table_batch(live_obs, selected=live_selected, max_trackers=MAXT)
+            physical = physical_action_table_from_packed(packed, live_pos, selected, MAXT)
             sync(device)
             t0 = time.perf_counter()
             with torch.inference_mode():

@@ -1836,6 +1836,36 @@ Clean 64-env cached throughput is now about `381 env-windows/s`, versus roughly
 `368 env-windows/s` after slot-template caching alone and `305 env-windows/s`
 before the cached feature work. Reward remains identical to serial execution.
 
+The physical action table now also consumes the same packed root arrays instead
+of rebuilding active/deadline/range/free-sensor stacks from observation
+dictionaries at every decision depth. Direct equivalence checks matched the
+legacy `physical_action_table_batch` output for action ids, target base ids,
+sensor ids, and validity masks.
+
+64-env profiled result after the packed physical table:
+
+```text
+physical_action_table_batch: 0.46 ms -> 0.31 ms
+clean cached throughput:    ~384.6 env-windows/s
+reward delta vs serial:     0.0
+```
+
+The improvement is real but modest. The current high-batch bottlenecks are now:
+
+```text
+env_step_batch:         ~4.26 ms
+decision_score_forward: ~3.11 ms
+root_obs_attach:        ~1.90 ms
+root_h2d_encode:        ~1.54 ms
+```
+
+An additional `cProfile` run confirms the same hot areas after import overhead:
+GPU action selection, tensor transfers, transformer/linear layers, and
+observation extraction dominate runtime. The next larger wins should therefore
+come from reducing simulator/observation overhead and keeping more of the
+batched state representation resident, not from further scalar action-table
+micro-optimizations.
+
 ## Next Work
 
 - Promote cached-root multi-environment batching from benchmark script to a reusable evaluator/training data path.
