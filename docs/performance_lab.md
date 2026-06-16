@@ -14,6 +14,7 @@ python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners e
 python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
 python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batches 1,4,8,16,32,64
 python scripts\perf_lab_batched_beam_planner.py --device cuda --beam-widths 1,4,8,16 --max-depth 24
+python scripts\perf_lab_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
 ```
 
 ## First Findings
@@ -262,6 +263,38 @@ beam=16, top_k=2:           ~239.9 ms/window  (~2.48x fast latency)
 ```
 
 This is not a replacement for the greedy fast planner when no extra search is needed. Its purpose is different: it provides a concrete batched-search path where additional beam/MCTS work is grouped into expansion waves instead of serial model calls. The remaining optimization target is to reduce Python prefix/candidate overhead and connect these expansion waves to exact branch simulation.
+
+## Neural + Exact Root Wave
+
+`perf_lab_neural_exact_wave.py` connects the batched neural root expansion to exact C branch simulation:
+
+```text
+root observation
+    -> encode root / build expansion scorer
+    -> neural top-K root action proposals
+    -> vec_restore_all(root snapshot)
+    -> vec_step_validated(one action per env)
+```
+
+This is the first combined P/Q proposal plus exact simulator branch-evaluation benchmark. It times the three components separately:
+
+```text
+root encode/setup
+neural expansion
+exact C branch simulation
+```
+
+Measured CUDA split:
+
+```text
+wave=1:   combined ~13.6 ms, exact sim ~1.5%
+wave=4:   combined ~12.8 ms, exact sim ~3.1%
+wave=8:   combined ~13.9 ms, exact sim ~5.1%
+wave=16:  combined ~14.7 ms, exact sim ~8.7%
+wave=32:  combined ~15.5 ms, exact sim ~15.7%
+```
+
+For one-step root waves, exact C branch simulation is no longer the dominant cost. The bottleneck is still neural setup plus expansion, especially repeated root encoding/scorer construction. The next major implementation target is a persistent dense tree/search state that reuses encoded root state across multiple expansion waves and batches deeper expansions.
 
 ## MCTX Takeaway
 

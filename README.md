@@ -114,4 +114,5 @@ python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners e
 python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
 python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batches 1,4,8,16,32,64
 python scripts\perf_lab_batched_beam_planner.py --device cuda --beam-widths 1,4,8,16 --max-depth 24
+python scripts\perf_lab_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
 ```
