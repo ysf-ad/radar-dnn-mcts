@@ -838,6 +838,20 @@ This confirms the split strategy:
 
 `summarize_perf_profiles.py` converts the online, root-table, and cached-internals JSON files into a compact Markdown report for slide/debug use.
 
+## Cached Search-Row Mask
+
+The score builders need a fixed mask identifying row 0 as the search action. Rebuilding that mask with `torch.arange(rows) == 0` inside every score call creates a small repeated CUDA allocation. `FastActionAttentionPlanner` and `BatchedActionAttentionScorer` now cache that mask per `(rows, device)`.
+
+A same-process A/B on one cached root score call showed exact equality and a small latency improvement:
+
+```text
+fresh mask allocation:  mean ~2.263 ms, p90 ~2.755 ms
+cached mask tensor:     mean ~2.247 ms, p90 ~2.568 ms
+max abs diff:           0.0
+```
+
+This is a marginal scalar-path optimization, not the main performance lever. It is kept because it removes fixed allocation overhead without changing model semantics.
+
 ## Paired Policy/Q Head Experiment
 
 `perf_lab_paired_heads.py` benchmarks whether the policy and Q MLP heads should be evaluated as paired functional calls instead of separate `nn.Sequential` modules. The experiment checks three paths:

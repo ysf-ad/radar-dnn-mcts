@@ -259,6 +259,16 @@ class FastActionAttentionPlanner:
         self.use_compile = bool(use_compile)
         self.adapt = adapter()
         self.stats = FastPlannerStats(True, str(dev), self.use_amp, self.use_compile)
+        self._row_is_search_cache: dict[tuple[int, str, int | None], torch.Tensor] = {}
+
+    def _row_is_search(self, rows: int, device: torch.device) -> torch.Tensor:
+        dev = torch.device(device)
+        key = (int(rows), dev.type, dev.index)
+        cached = self._row_is_search_cache.get(key)
+        if cached is None:
+            cached = (torch.arange(int(rows), device=dev)[None, :, None] == 0)
+            self._row_is_search_cache[key] = cached
+        return cached
 
     def _scores_from_encoded(self, cls_out, tok_out, selected_t, token_active, slot_t):
         model = self.model
@@ -291,7 +301,7 @@ class FastActionAttentionPlanner:
         base_scores[:, 1:, :] = (type_logits[:, None, :, 1] + target_logits)[:, 1:, :]
         base_q[:, 1:, :] = (type_q[:, None, :, 1] + target_q)[:, 1:, :]
 
-        row_is_search = torch.arange(rows, device=slot_t.device)[None, :, None] == 0
+        row_is_search = self._row_is_search(rows, slot_t.device)
         valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
         action_ctx = model.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
         action_ctx = model.action_coupler(action_ctx, src_key_padding_mask=~valid.reshape(bsz, rows * 2))
@@ -331,7 +341,7 @@ class FastActionAttentionPlanner:
 
         track_mask = token_active & ~selected_t
         track_mask[:, 0] = False
-        row_is_search = torch.arange(rows, device=slot_t.device)[None, :, None] == 0
+        row_is_search = self._row_is_search(rows, slot_t.device)
         valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
         action_ctx = model.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
         action_ctx = model.action_coupler(action_ctx, src_key_padding_mask=~valid.reshape(bsz, rows * 2))
@@ -444,6 +454,16 @@ class BatchedActionAttentionScorer:
         self.device = dev
         self.use_amp = bool(use_amp and dev.type == "cuda")
         self.adapt = adapter()
+        self._row_is_search_cache: dict[tuple[int, str, int | None], torch.Tensor] = {}
+
+    def _row_is_search(self, rows: int, device: torch.device) -> torch.Tensor:
+        dev = torch.device(device)
+        key = (int(rows), dev.type, dev.index)
+        cached = self._row_is_search_cache.get(key)
+        if cached is None:
+            cached = (torch.arange(int(rows), device=dev)[None, :, None] == 0)
+            self._row_is_search_cache[key] = cached
+        return cached
 
     def _combined_scores_from_tokens(self, tokens: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
         model = self.model
@@ -470,7 +490,7 @@ class BatchedActionAttentionScorer:
 
         track_mask = token_active & ~selected
         track_mask[:, 0] = False
-        row_is_search = torch.arange(rows, device=tokens.device)[None, :, None] == 0
+        row_is_search = self._row_is_search(rows, tokens.device)
         valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
         action_ctx = model.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
         action_ctx = model.action_coupler(action_ctx, src_key_padding_mask=~valid.reshape(bsz, rows * 2))
