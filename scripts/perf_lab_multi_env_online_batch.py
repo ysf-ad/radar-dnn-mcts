@@ -1563,6 +1563,7 @@ def main() -> None:
     parser.add_argument("--skip-graph", action="store_true")
     parser.add_argument("--paired-heads", action="store_true", help="Use inference-only paired policy/Q MLP head execution.")
     parser.add_argument("--direct-couplers", action="store_true", help="Call one-layer TransformerEncoder couplers through their layer directly.")
+    parser.add_argument("--manual-couplers", action="store_true", help="Use a manual exact single-layer TransformerEncoder path for couplers.")
     parser.add_argument("--cached-action-table", action="store_true", help="Cache per-window physical action ordering/layout in the graph path.")
     parser.add_argument("--gpu-action-template", action="store_true", help="Keep cached action IDs and score indices resident on GPU.")
     parser.add_argument("--gpu-valid-mask", action="store_true", help="Derive per-decision action validity from cached GPU bases and selected masks.")
@@ -1599,6 +1600,7 @@ def main() -> None:
         use_gpu_select=True,
         use_paired_heads=bool(args.paired_heads),
         use_direct_couplers=bool(args.direct_couplers),
+        use_manual_couplers=bool(args.manual_couplers),
     )
     batched = BatchedActionAttentionScorer(
         batch_model,

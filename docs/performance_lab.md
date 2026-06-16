@@ -2118,6 +2118,29 @@ was slower overall because many distinct live-batch shapes triggered graph
 capture and produced high p99 stalls. The optimization was rejected; partial
 live batches continue to use the eager raw scoring path.
 
+`perf_lab_coupler_variants.py` isolates the one-layer sensor/action couplers.
+For the action coupler shape used by the main model (`64 x 202 x 48`), a manual
+single-layer path that calls the layer's `self_attn`, norms, and feed-forward
+modules directly was exact against `TransformerEncoder`:
+
+```bash
+python scripts/perf_lab_coupler_variants.py --device cuda --amp --prefixes 64 --checkpoint ../CreateValid1/results/critic_bootstrap_medium_eval_two_row_action_attention_qpolicy_factored_loss.pt
+```
+
+Measured action-coupler-only timings on the trained checkpoint:
+
+```text
+TransformerEncoder: ~1.43 ms
+direct layer:       ~1.35 ms
+manual layer:       ~1.32 ms
+max abs diff:       0.0
+```
+
+The online benchmark exposes this as `--manual-couplers`. It is exact in the
+full combined scorer, but the end-to-end gain is small and noisy because CUDA
+graph build/replay, environment stepping, and root packing also contribute. It
+is kept as an opt-in lab switch rather than replacing the recommended command.
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer

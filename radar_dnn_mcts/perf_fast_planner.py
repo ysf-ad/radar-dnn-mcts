@@ -146,6 +146,44 @@ def _maybe_direct_encoder(module: nn.Module, x: torch.Tensor, src_key_padding_ma
     return module(x, src_key_padding_mask=src_key_padding_mask)
 
 
+def _manual_encoder_layer(layer: nn.TransformerEncoderLayer, x: torch.Tensor, src_key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+    if layer.norm_first:
+        y = layer.norm1(x)
+        attn = layer.self_attn(
+            y,
+            y,
+            y,
+            attn_mask=None,
+            key_padding_mask=src_key_padding_mask,
+            need_weights=False,
+            is_causal=False,
+        )[0]
+        x = x + layer.dropout1(attn)
+        y = layer.norm2(x)
+        y = layer.linear2(layer.dropout(layer.activation(layer.linear1(y))))
+        return x + layer.dropout2(y)
+    attn = layer.self_attn(
+        x,
+        x,
+        x,
+        attn_mask=None,
+        key_padding_mask=src_key_padding_mask,
+        need_weights=False,
+        is_causal=False,
+    )[0]
+    x = layer.norm1(x + layer.dropout1(attn))
+    y = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
+    return layer.norm2(x + layer.dropout2(y))
+
+
+def _maybe_manual_encoder(module: nn.Module, x: torch.Tensor, src_key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+    if isinstance(module, nn.TransformerEncoder) and len(module.layers) == 1 and module.norm is None:
+        return _manual_encoder_layer(module.layers[0], x, src_key_padding_mask=src_key_padding_mask)
+    if src_key_padding_mask is None:
+        return module(x)
+    return module(x, src_key_padding_mask=src_key_padding_mask)
+
+
 def physical_action_arrays(obs: dict, selected: Iterable[int] | None = None, max_trackers: int = MAXT):
     """Return candidate action ids and score-table indices as NumPy arrays.
 
@@ -339,6 +377,7 @@ class FastActionAttentionPlanner:
         use_gpu_select: bool = False,
         use_paired_heads: bool = False,
         use_direct_couplers: bool = False,
+        use_manual_couplers: bool = False,
     ):
         dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = model.eval().to(dev)
@@ -355,6 +394,7 @@ class FastActionAttentionPlanner:
         self.use_gpu_select = bool(use_gpu_select)
         self.use_paired_heads = bool(use_paired_heads)
         self.use_direct_couplers = bool(use_direct_couplers)
+        self.use_manual_couplers = bool(use_manual_couplers)
         self.adapt = adapter()
         self.stats = FastPlannerStats(True, str(dev), self.use_amp, self.use_compile)
         self._row_is_search_cache: dict[tuple[int, str, int | None], torch.Tensor] = {}
@@ -420,7 +460,12 @@ class FastActionAttentionPlanner:
         cls_s = cls_out[:, None, :].expand(-1, 2, -1)
         slot_s = slot_emb[:, None, :].expand(-1, 2, -1)
         sensor_state = model.sensor_state_proj(torch.cat([cls_s, slot_s, sensor], dim=-1))
-        coupled_sensor = _maybe_direct_encoder(model.sensor_coupler, sensor_state) if self.use_direct_couplers else model.sensor_coupler(sensor_state)
+        if self.use_manual_couplers:
+            coupled_sensor = _maybe_manual_encoder(model.sensor_coupler, sensor_state)
+        elif self.use_direct_couplers:
+            coupled_sensor = _maybe_direct_encoder(model.sensor_coupler, sensor_state)
+        else:
+            coupled_sensor = model.sensor_coupler(sensor_state)
         type_ctx = torch.cat([cls_s, slot_s, coupled_sensor], dim=-1)
         if self.use_paired_heads:
             type_logits, type_q = _paired_mlp_outputs(model.type_head, model.type_q_head, type_ctx, self._paired_head_cache)
@@ -454,11 +499,12 @@ class FastActionAttentionPlanner:
         valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
         action_ctx = model.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
         action_mask = ~valid.reshape(bsz, rows * 2)
-        action_ctx = (
-            _maybe_direct_encoder(model.action_coupler, action_ctx, src_key_padding_mask=action_mask)
-            if self.use_direct_couplers
-            else model.action_coupler(action_ctx, src_key_padding_mask=action_mask)
-        )
+        if self.use_manual_couplers:
+            action_ctx = _maybe_manual_encoder(model.action_coupler, action_ctx, src_key_padding_mask=action_mask)
+        elif self.use_direct_couplers:
+            action_ctx = _maybe_direct_encoder(model.action_coupler, action_ctx, src_key_padding_mask=action_mask)
+        else:
+            action_ctx = model.action_coupler(action_ctx, src_key_padding_mask=action_mask)
         if self.use_paired_heads:
             residual_raw, q_residual_raw = _paired_mlp_outputs(
                 model.action_policy_residual,
@@ -490,7 +536,12 @@ class FastActionAttentionPlanner:
         cls_s = cls_out[:, None, :].expand(-1, 2, -1)
         slot_s = slot_emb[:, None, :].expand(-1, 2, -1)
         sensor_state = model.sensor_state_proj(torch.cat([cls_s, slot_s, sensor], dim=-1))
-        coupled_sensor = _maybe_direct_encoder(model.sensor_coupler, sensor_state) if self.use_direct_couplers else model.sensor_coupler(sensor_state)
+        if self.use_manual_couplers:
+            coupled_sensor = _maybe_manual_encoder(model.sensor_coupler, sensor_state)
+        elif self.use_direct_couplers:
+            coupled_sensor = _maybe_direct_encoder(model.sensor_coupler, sensor_state)
+        else:
+            coupled_sensor = model.sensor_coupler(sensor_state)
         type_ctx = torch.cat([cls_s, slot_s, coupled_sensor], dim=-1)
         if self.use_paired_heads:
             type_logits, type_q = _paired_mlp_outputs(model.type_head, model.type_q_head, type_ctx, self._paired_head_cache)
@@ -517,11 +568,12 @@ class FastActionAttentionPlanner:
         valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
         action_ctx = model.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
         action_mask = ~valid.reshape(bsz, rows * 2)
-        action_ctx = (
-            _maybe_direct_encoder(model.action_coupler, action_ctx, src_key_padding_mask=action_mask)
-            if self.use_direct_couplers
-            else model.action_coupler(action_ctx, src_key_padding_mask=action_mask)
-        )
+        if self.use_manual_couplers:
+            action_ctx = _maybe_manual_encoder(model.action_coupler, action_ctx, src_key_padding_mask=action_mask)
+        elif self.use_direct_couplers:
+            action_ctx = _maybe_direct_encoder(model.action_coupler, action_ctx, src_key_padding_mask=action_mask)
+        else:
+            action_ctx = model.action_coupler(action_ctx, src_key_padding_mask=action_mask)
         if self.use_paired_heads:
             residual_raw, q_residual_raw = _paired_mlp_outputs(
                 model.action_policy_residual,
