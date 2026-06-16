@@ -2645,6 +2645,24 @@ mix of real action self-attention work, many small MLP/LayerNorm launches, and
 autocast conversion kernels. A custom fused inference module would need to
 attack those groups directly.
 
+`perf_lab_cuda_env_check.py` records whether this machine can actually build or
+generate fused GPU code. Current result:
+
+```text
+GPU:             NVIDIA GeForce RTX 3080 Ti
+PyTorch:         2.7.1+cu118
+torch CUDA:      11.8
+NVCC:            12.9 available
+MSVC cl.exe:     not on PATH
+Triton:          not installed
+```
+
+So there are two practical blockers for deeper fusion on this workstation:
+`torch.compile`/Inductor GPU fusion cannot run without Triton, and custom
+PyTorch CUDA extensions on Windows generally need MSVC `cl.exe` plus a tested
+CUDA-toolkit/PyTorch ABI combination. The current repo therefore keeps custom
+kernel work behind environment validation rather than adding unbuildable code.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only
