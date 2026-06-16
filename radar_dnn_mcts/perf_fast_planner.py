@@ -58,6 +58,16 @@ class BatchedPhysicalActionTable:
     valid: np.ndarray
 
 
+@dataclass
+class PreparedBatchedRootBatch:
+    tokens: np.ndarray
+    slots: np.ndarray
+    actions: np.ndarray
+    flat_indices: np.ndarray
+    valid: np.ndarray
+    count: int
+
+
 def physical_action_arrays(obs: dict, selected: Iterable[int] | None = None, max_trackers: int = MAXT):
     """Return candidate action ids and score-table indices as NumPy arrays.
 
@@ -911,6 +921,70 @@ class BatchedActionAttentionScorer:
         has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
         best = torch.where(has_valid, best, torch.full_like(best, -1))
         return best.cpu().numpy().astype(np.int64, copy=False)
+
+    def prepare_root_batch(
+        self,
+        observations: list[dict],
+        selected: list[Iterable[int]] | None = None,
+        elapsed: Iterable[float] | None = None,
+        search_count: Iterable[int] | None = None,
+        track_count: Iterable[int] | None = None,
+        last: Iterable[int] | None = None,
+        budget_ms: float = 200.0,
+    ) -> PreparedBatchedRootBatch:
+        """Precompute CPU-side batch inputs for repeated root scoring."""
+        n = len(observations)
+        selected_sets = [set() for _ in range(n)] if selected is None else [set(x) for x in selected]
+        elapsed = [0.0] * n if elapsed is None else list(elapsed)
+        search_count = [0] * n if search_count is None else list(search_count)
+        track_count = [0] * n if track_count is None else list(track_count)
+        last = [-1] * n if last is None else list(last)
+        obs2 = [attach_env_obs(obs, self.env_cfg, True, True) for obs in observations]
+        tokens = tokenize_batch(self.adapt, obs2, selected=selected_sets, search_count=search_count)
+        slots = slot_features_batch(
+            obs2,
+            elapsed=elapsed,
+            search_count=search_count,
+            track_count=track_count,
+            last_action=last,
+            budget_ms=float(budget_ms),
+        )
+        physical = physical_action_table_batch(obs2, selected=selected_sets, max_trackers=MAXT)
+        flat_indices = (physical.bases.astype(np.int64, copy=False) * 2 + physical.sensors.astype(np.int64, copy=False)).astype(
+            np.int64,
+            copy=False,
+        )
+        return PreparedBatchedRootBatch(
+            tokens=tokens,
+            slots=slots,
+            actions=physical.actions.astype(np.int64, copy=False),
+            flat_indices=flat_indices,
+            valid=physical.valid.astype(bool, copy=False),
+            count=int(n),
+        )
+
+    def best_actions_prepared_torch(self, prepared: PreparedBatchedRootBatch) -> np.ndarray:
+        """Score a prepared root batch with GPU gather/argmax selection."""
+        n = int(prepared.count)
+        if n <= 0:
+            return np.empty((0,), dtype=np.int64)
+        with torch.inference_mode():
+            x = torch.from_numpy(prepared.tokens).to(self.device, dtype=torch.float32)
+            s = torch.from_numpy(prepared.slots).to(self.device, dtype=torch.float32)
+            actions_t = torch.as_tensor(prepared.actions, device=self.device, dtype=torch.long)
+            flat_t = torch.as_tensor(prepared.flat_indices, device=self.device, dtype=torch.long)
+            valid_t = torch.as_tensor(prepared.valid, device=self.device, dtype=torch.bool)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
+                score_t = self._combined_scores_from_tokens(x, s).float()
+            score_t[:, 0, :] += self.search_score_bias
+            flat_scores = score_t.reshape(n, -1)
+            candidate_scores = torch.gather(flat_scores, 1, flat_t)
+            candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
+            idx = torch.argmax(candidate_scores, dim=1)
+            best = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
+            has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
+            best = torch.where(has_valid, best, torch.full_like(best, -1))
+            return best.cpu().numpy().astype(np.int64, copy=False)
 
     def topk_root_proposals(self, observations: list[dict], k: int = 8, **kwargs) -> BatchedRootProposals:
         result = self.score_batch(observations, **kwargs)

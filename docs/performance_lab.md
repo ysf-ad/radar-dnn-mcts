@@ -1130,6 +1130,43 @@ tokenization, model launch, and action-table construction. This is the path to
 using the GPU for evaluation sweeps, batched root expansion, and MCTS rollout
 frontiers.
 
+`BatchedActionAttentionScorer.prepare_root_batch(...)` caches the CPU-side
+inputs for repeated scoring of the same root batch:
+
+```text
+attached observations
+token tensor
+slot/context tensor
+physical action ids
+flat action indices
+valid action mask
+```
+
+`best_actions_prepared_torch(...)` then only transfers the prepared arrays,
+runs the model, gathers candidate scores, and returns best action ids. This is
+useful when the same root/frontier batch is scored repeatedly, as in benchmark
+sweeps, cached root expansion, or repeated rollout-frontier evaluation.
+
+Prepared-path timing:
+
+```text
+batch 32:
+    full batched GPU-select:  ~7.08 ms,  ~4,520 states/sec
+    prepared GPU-select:      ~3.56 ms,  ~8,995 states/sec
+    sequential speedup:       ~30.8x
+
+batch 128:
+    full batched GPU-select:  ~27.82 ms mean, ~19.93 ms p50
+    prepared GPU-select:      ~17.96 ms mean,  ~8.57 ms p50
+    sequential speedup:       ~24.9x mean
+```
+
+The staged profiler makes the bottleneck explicit. For batch 128, the full path
+spent about `5.8 ms` in tokenization and `3.6-4.0 ms` in slot-feature
+construction before the GPU model forward. The prepared path removes that
+repeated CPU work; staged prepared scoring was about `5.7 ms` per call after a
+one-time `~10.3 ms` prepare step.
+
 ## CUDA Graph Planner Replay
 
 The online fast planner still had a different bottleneck from root expansion:
