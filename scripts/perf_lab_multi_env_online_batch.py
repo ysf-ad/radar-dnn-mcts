@@ -6,6 +6,7 @@ import json
 import pstats
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,47 @@ _FAST_STEP_SEARCH_DWELL_MS = None
 def sync(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _get_sdp_state() -> dict[str, bool]:
+    cuda = torch.backends.cuda
+    return {
+        "flash": bool(cuda.flash_sdp_enabled()),
+        "mem_efficient": bool(cuda.mem_efficient_sdp_enabled()),
+        "math": bool(cuda.math_sdp_enabled()),
+        "cudnn": bool(cuda.cudnn_sdp_enabled()) if hasattr(cuda, "cudnn_sdp_enabled") else False,
+    }
+
+
+def _set_sdp_state(state: dict[str, bool]) -> None:
+    cuda = torch.backends.cuda
+    cuda.enable_flash_sdp(bool(state.get("flash", False)))
+    cuda.enable_mem_efficient_sdp(bool(state.get("mem_efficient", False)))
+    cuda.enable_math_sdp(bool(state.get("math", False)))
+    if hasattr(cuda, "enable_cudnn_sdp"):
+        cuda.enable_cudnn_sdp(bool(state.get("cudnn", False)))
+
+
+@contextmanager
+def sdp_backend(name: str):
+    old = _get_sdp_state()
+    variants = {
+        "default": old,
+        "math_only": {"flash": False, "mem_efficient": False, "math": True, "cudnn": False},
+        "flash_only": {"flash": True, "mem_efficient": False, "math": False, "cudnn": False},
+        "mem_efficient_only": {"flash": False, "mem_efficient": True, "math": False, "cudnn": False},
+        "cudnn_only": {"flash": False, "mem_efficient": False, "math": False, "cudnn": True},
+        "flash_math": {"flash": True, "mem_efficient": False, "math": True, "cudnn": False},
+        "all_no_cudnn": {"flash": True, "mem_efficient": True, "math": True, "cudnn": False},
+    }
+    if name not in variants:
+        raise ValueError(f"unknown SDP backend variant: {name}")
+    if name != "default":
+        _set_sdp_state(variants[name])
+    try:
+        yield _get_sdp_state()
+    finally:
+        _set_sdp_state(old)
 
 
 def stats(values: list[float]) -> dict[str, float]:
@@ -1628,6 +1670,12 @@ def main() -> None:
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
     parser.add_argument("--batch-env-step", action="store_true", help="Use the selected-index C batch step in the cached-root graph path.")
     parser.add_argument("--direct-root-pack", action="store_true", help="Pack cached-root observations directly from C engine buffers.")
+    parser.add_argument(
+        "--sdp-backend",
+        default="default",
+        choices=["default", "math_only", "flash_only", "mem_efficient_only", "cudnn_only", "flash_math", "all_no_cudnn"],
+        help="Torch scaled-dot-product attention backend selection for score-body experiments.",
+    )
     parser.add_argument("--checkpoint", type=Path, default=None, help="Optional ActionAttentionFactorizedNet state dict to benchmark.")
     parser.add_argument("--out", type=Path, default=Path("results/perf_lab_multi_env_online_batch.json"))
     args = parser.parse_args()
@@ -1670,31 +1718,33 @@ def main() -> None:
     cached_envs = build_envs(args, env_cfg)
     graph_envs = build_envs(args, env_cfg) if not bool(args.skip_graph) else []
     cpu_profiles: dict[str, list[dict[str, object]]] = {}
+    active_sdp_state: dict[str, bool] = {}
     try:
-        serial_report, cpu_profiles["serial_fast_graph_gpu_select"] = run_maybe_profiled(
-            "serial_fast_graph_gpu_select",
-            lambda: run_serial(serial, serial_envs, args, device),
-            int(args.profile_cpu_top),
-        )
-        batched_report, cpu_profiles["batched_multi_env_reencode"] = run_maybe_profiled(
-            "batched_multi_env_reencode",
-            lambda: run_batched(batched, batch_envs, args, device),
-            int(args.profile_cpu_top),
-        )
-        cached_report, cpu_profiles["batched_multi_env_cached_root"] = run_maybe_profiled(
-            "batched_multi_env_cached_root",
-            lambda: run_batched_cached(serial, cached_envs, args, device),
-            int(args.profile_cpu_top),
-        )
-        if graph_envs:
-            graph_report, cpu_profiles["batched_multi_env_cached_root_graph"] = run_maybe_profiled(
-                "batched_multi_env_cached_root_graph",
-                lambda: run_batched_cached_graph(serial, graph_envs, args, device),
+        with sdp_backend(str(args.sdp_backend)) as active_sdp_state:
+            serial_report, cpu_profiles["serial_fast_graph_gpu_select"] = run_maybe_profiled(
+                "serial_fast_graph_gpu_select",
+                lambda: run_serial(serial, serial_envs, args, device),
                 int(args.profile_cpu_top),
             )
-        else:
-            graph_report = {}
-            cpu_profiles["batched_multi_env_cached_root_graph"] = []
+            batched_report, cpu_profiles["batched_multi_env_reencode"] = run_maybe_profiled(
+                "batched_multi_env_reencode",
+                lambda: run_batched(batched, batch_envs, args, device),
+                int(args.profile_cpu_top),
+            )
+            cached_report, cpu_profiles["batched_multi_env_cached_root"] = run_maybe_profiled(
+                "batched_multi_env_cached_root",
+                lambda: run_batched_cached(serial, cached_envs, args, device),
+                int(args.profile_cpu_top),
+            )
+            if graph_envs:
+                graph_report, cpu_profiles["batched_multi_env_cached_root_graph"] = run_maybe_profiled(
+                    "batched_multi_env_cached_root_graph",
+                    lambda: run_batched_cached_graph(serial, graph_envs, args, device),
+                    int(args.profile_cpu_top),
+                )
+            else:
+                graph_report = {}
+                cpu_profiles["batched_multi_env_cached_root_graph"] = []
     finally:
         for eng in [*serial_envs, *batch_envs, *cached_envs, *graph_envs]:
             eng.close()
@@ -1703,6 +1753,8 @@ def main() -> None:
         "device": str(device),
         "cuda_available": bool(torch.cuda.is_available()),
         "amp": bool(args.amp),
+        "sdp_backend": str(args.sdp_backend),
+        "active_sdp_state": active_sdp_state,
         "envs": int(args.envs),
         "windows": int(args.windows),
         "window_ms": int(args.window_ms),

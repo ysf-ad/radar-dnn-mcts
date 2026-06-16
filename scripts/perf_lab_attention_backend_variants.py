@@ -31,6 +31,18 @@ def stats(values: list[float]) -> dict[str, float]:
     }
 
 
+def load_model_checkpoint(model, checkpoint: str | Path | None):
+    if checkpoint is None or str(checkpoint).strip() == "":
+        return model
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
+        state = state["model"]
+    model.load_state_dict(state, strict=True)
+    return model
+
+
 def _get_sdp_state() -> dict[str, bool]:
     cuda = torch.backends.cuda
     return {
@@ -78,6 +90,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--envs", type=int, default=64)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--iters", type=int, default=120)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--initial-targets", type=int, default=60)
@@ -109,12 +123,13 @@ def main() -> None:
     root_tokens = tokenize_packed_root_fast(adapter(), packed, MAXT, TOKEN_DIM)
     slots = slot_template_from_packed(packed, 200.0)
 
-    model = ActionAttentionFactorizedNet(48, 4, 2).eval()
-    planner = FastActionAttentionPlanner(model, env_cfg, device=device, use_amp=False)
+    model = load_model_checkpoint(ActionAttentionFactorizedNet(48, 4, 2).eval(), args.checkpoint)
+    planner = FastActionAttentionPlanner(model, env_cfg, device=device, use_amp=bool(args.amp))
     with torch.inference_mode():
         root_t = torch.from_numpy(root_tokens).to(device, dtype=torch.float32)
         slot_t = torch.from_numpy(slots).to(device, dtype=torch.float32)
-        cls, tok, selected, active = planner.model.backbone.encode_tokens(root_t)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=bool(args.amp) and device.type == "cuda"):
+            cls, tok, selected, active = planner.model.backbone.encode_tokens(root_t)
 
     variants = {
         "default": _get_sdp_state(),
@@ -151,6 +166,8 @@ def main() -> None:
         "device": str(device),
         "cuda_available": bool(torch.cuda.is_available()),
         "torch_version": str(torch.__version__),
+        "amp": bool(args.amp),
+        "checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
         "envs": int(args.envs),
         "initial_targets": int(args.initial_targets),
         "rate": float(args.rate),

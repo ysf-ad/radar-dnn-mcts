@@ -2596,6 +2596,20 @@ paired-head execution: faster in places, but changed decisions/reward
 Paired-head execution therefore remains an experimental approximation, not an
 online replacement for the exact policy/Q head path.
 
+The attention backend lab now accepts the trained checkpoint and AMP settings,
+and the online multi-env benchmark has a matching `--sdp-backend` switch. On
+the isolated score-body microbenchmark, disabling cuDNN SDP was slightly faster:
+
+```text
+default SDP:      ~2.394 ms/score batch
+all_no_cudnn SDP: ~2.349 ms/score batch
+```
+
+However, the full online graph smoke run with `--sdp-backend all_no_cudnn`
+was slower than the default while preserving reward/actions. This means SDP
+backend tuning should stay an explicit benchmark knob for now; the default
+runtime path should keep PyTorch's default backend selection.
+
 Current synchronized 64-env/10-window graph-stage profile:
 
 ```text
