@@ -94,6 +94,10 @@ def run_profiled_episode(planner, planner_name: str, args, env_cfg: dict) -> dic
     from two_sensor_physical_head_eval import MAXT
 
     timer = StageTimer()
+    if hasattr(planner, "reset_profile"):
+        planner.reset_profile()
+    if hasattr(planner, "set_profile_enabled"):
+        planner.set_profile_enabled(True)
     profiled = ProfiledPlanner(planner, timer, planner_name)
     with timer.time("env_build_reset"):
         eng = build_env(profiled, int(args.initial_targets), MAXT, int(args.seed), int(args.window_ms), env_cfg)
@@ -139,6 +143,8 @@ def run_profiled_episode(planner, planner_name: str, args, env_cfg: dict) -> dic
     finally:
         with timer.time("env_close"):
             eng.close()
+        if hasattr(planner, "set_profile_enabled"):
+            planner.set_profile_enabled(False)
 
     stage = timer.summary()
     return {
@@ -148,6 +154,7 @@ def run_profiled_episode(planner, planner_name: str, args, env_cfg: dict) -> dic
         "mean_spent_ms_per_window": float(spent_total / max(1, windows)),
         "total_reward": float(cumulative_reward),
         "stage_timing": stage,
+        "planner_internal_profile": planner.profile_summary() if hasattr(planner, "profile_summary") else {},
         "cprofile_top_cumulative": _pstats_top(cprof, int(args.profile_top)),
     }
 
@@ -190,6 +197,12 @@ def main() -> None:
             env_cfg,
         ),
         "fast": lambda: FastActionAttentionPlanner(fast_model, env_cfg, device=device),
+        "fast_graph": lambda: FastActionAttentionPlanner(
+            fast_model,
+            env_cfg,
+            device=device,
+            use_cuda_graph=True,
+        ),
     }
     requested = [name.strip().lower() for name in str(args.planners).split(",") if name.strip()]
     unknown = sorted(set(requested) - set(planner_factories))

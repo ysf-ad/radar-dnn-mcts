@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -245,6 +247,7 @@ class FastActionAttentionPlanner:
         device: str | torch.device | None = None,
         use_amp: bool = False,
         use_compile: bool = False,
+        use_cuda_graph: bool = False,
     ):
         dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = model.eval().to(dev)
@@ -257,9 +260,51 @@ class FastActionAttentionPlanner:
         self.device = dev
         self.use_amp = bool(use_amp and dev.type == "cuda")
         self.use_compile = bool(use_compile)
+        self.use_cuda_graph = bool(use_cuda_graph and dev.type == "cuda")
         self.adapt = adapter()
         self.stats = FastPlannerStats(True, str(dev), self.use_amp, self.use_compile)
         self._row_is_search_cache: dict[tuple[int, str, int | None], torch.Tensor] = {}
+        self._cuda_graph_score_cache: dict[tuple, dict[str, object]] = {}
+        self.profile_enabled = False
+        self._profile_values: dict[str, list[float]] = defaultdict(list)
+
+    def set_profile_enabled(self, enabled: bool = True) -> None:
+        self.profile_enabled = bool(enabled)
+
+    def reset_profile(self) -> None:
+        self._profile_values.clear()
+
+    def profile_summary(self) -> dict[str, dict[str, float]]:
+        out: dict[str, dict[str, float]] = {}
+        for name, values in self._profile_values.items():
+            arr = np.asarray(values, dtype=np.float64)
+            if arr.size == 0:
+                continue
+            out[name] = {
+                "calls": int(arr.size),
+                "total_ms": float(arr.sum()),
+                "mean_ms": float(arr.mean()),
+                "p50_ms": float(np.percentile(arr, 50)),
+                "p90_ms": float(np.percentile(arr, 90)),
+                "p99_ms": float(np.percentile(arr, 99)),
+            }
+        return dict(sorted(out.items(), key=lambda kv: kv[1]["total_ms"], reverse=True))
+
+    def _profile_sync(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _profile_start(self) -> float:
+        if not self.profile_enabled:
+            return 0.0
+        self._profile_sync()
+        return time.perf_counter()
+
+    def _profile_end(self, name: str, start: float) -> None:
+        if not self.profile_enabled:
+            return
+        self._profile_sync()
+        self._profile_values[name].append((time.perf_counter() - start) * 1000.0)
 
     def _row_is_search(self, rows: int, device: torch.device) -> torch.Tensor:
         dev = torch.device(device)
@@ -380,13 +425,101 @@ class FastActionAttentionPlanner:
             tok_out = tok_out.expand(batch, -1, -1)
         return self._combined_scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t)
 
+    def _build_cuda_graph_score_replay(self, cls_out, tok_out, root_selected, token_active, slot_width: int):
+        if not self.use_cuda_graph or self.device.type != "cuda":
+            return None
+        key = (
+            tuple(cls_out.shape),
+            tuple(tok_out.shape),
+            tuple(root_selected.shape),
+            tuple(token_active.shape),
+            int(slot_width),
+            str(cls_out.dtype),
+            bool(self.use_amp),
+        )
+        try:
+            cache = self._cuda_graph_score_cache.get(key)
+            if cache is None:
+                static_cls = torch.empty_like(cls_out)
+                static_tok = torch.empty_like(tok_out)
+                static_selected = torch.empty_like(root_selected)
+                static_active = torch.empty_like(token_active)
+                static_slot = torch.empty((1, int(slot_width)), device=self.device, dtype=torch.float32)
+                static_cls.copy_(cls_out, non_blocking=False)
+                static_tok.copy_(tok_out, non_blocking=False)
+                static_selected.copy_(root_selected, non_blocking=False)
+                static_active.copy_(token_active, non_blocking=False)
+
+                with torch.inference_mode():
+                    for _ in range(3):
+                        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
+                            _ = self._combined_scores_from_encoded(
+                                static_cls,
+                                static_tok,
+                                static_selected,
+                                static_active,
+                                static_slot,
+                            ).squeeze(0).float()
+                    torch.cuda.synchronize(self.device)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
+                            static_score = self._combined_scores_from_encoded(
+                                static_cls,
+                                static_tok,
+                                static_selected,
+                                static_active,
+                                static_slot,
+                            ).squeeze(0).float()
+                cache = {
+                    "graph": graph,
+                    "static_cls": static_cls,
+                    "static_tok": static_tok,
+                    "static_selected": static_selected,
+                    "static_active": static_active,
+                    "static_slot": static_slot,
+                    "static_score": static_score,
+                }
+                self._cuda_graph_score_cache[key] = cache
+            else:
+                static_cls = cache["static_cls"]
+                static_tok = cache["static_tok"]
+                static_selected = cache["static_selected"]
+                static_active = cache["static_active"]
+                static_slot = cache["static_slot"]
+                static_score = cache["static_score"]
+                graph = cache["graph"]
+                static_cls.copy_(cls_out, non_blocking=False)
+                static_tok.copy_(tok_out, non_blocking=False)
+                static_selected.copy_(root_selected, non_blocking=False)
+                static_active.copy_(token_active, non_blocking=False)
+
+            def replay(slot_np: np.ndarray, selected_tensor: torch.Tensor) -> torch.Tensor:
+                static_slot.copy_(torch.from_numpy(slot_np), non_blocking=False)
+                static_selected.copy_(selected_tensor, non_blocking=False)
+                graph.replay()
+                return static_score
+
+            return replay
+        except Exception:
+            return None
+
     def plan(self, obs, budget_ms=200):
+        t_plan = self._profile_start()
+        t0 = self._profile_start()
         obs = attach_env_obs(obs, self.env_cfg, True, True)
+        self._profile_end("attach_env_obs", t0)
+        t0 = self._profile_start()
         root_tok = tokenize(self.adapt, obs, selected=set(), search_count=0).astype(np.float32)
+        self._profile_end("root_tokenize", t0)
         with torch.inference_mode():
+            t0 = self._profile_start()
             root_x = torch.from_numpy(root_tok).to(self.device, dtype=torch.float32).unsqueeze(0)
+            self._profile_end("root_h2d", t0)
+            t0 = self._profile_start()
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
                 cls_out, tok_out, root_selected, token_active = self.model.backbone.encode_tokens(root_x)
+            self._profile_end("root_encode", t0)
 
         selected: set[int] = set()
         plan: list[int] = []
@@ -395,18 +528,44 @@ class FastActionAttentionPlanner:
         track_count = 0
         last = -1
         selected_t = root_selected.clone()
+        slot_width = int(self.model.backbone.slot_proj[0].normalized_shape[0])
+        t0 = self._profile_start()
+        graph_replay = self._build_cuda_graph_score_replay(cls_out, tok_out, selected_t, token_active, slot_width)
+        self._profile_end("cuda_graph_prepare", t0)
         while elapsed < float(budget_ms) and len(plan) < 64:
+            t0 = self._profile_start()
             slot = slot_features(obs, elapsed, search_count, track_count, last, float(budget_ms)).astype(np.float32)
-            with torch.inference_mode():
-                slot_t = torch.from_numpy(slot).to(self.device, dtype=torch.float32).unsqueeze(0)
-                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
-                    score_t = self._combined_scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t).squeeze(0).float()
-                score = score_t.cpu().numpy()
+            self._profile_end("loop_slot_features", t0)
+            if graph_replay is not None:
+                with torch.inference_mode():
+                    t0 = self._profile_start()
+                    score_t = graph_replay(slot, selected_t)
+                    self._profile_end("loop_score_graph_replay", t0)
+                    t0 = self._profile_start()
+                    score = score_t.cpu().numpy()
+                    self._profile_end("loop_score_d2h", t0)
+            else:
+                with torch.inference_mode():
+                    t0 = self._profile_start()
+                    slot_t = torch.from_numpy(slot).to(self.device, dtype=torch.float32).unsqueeze(0)
+                    self._profile_end("loop_slot_h2d", t0)
+                    t0 = self._profile_start()
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
+                        score_t = self._combined_scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t).squeeze(0).float()
+                    self._profile_end("loop_score_forward", t0)
+                    t0 = self._profile_start()
+                    score = score_t.cpu().numpy()
+                    self._profile_end("loop_score_d2h", t0)
+            t0 = self._profile_start()
             score = np.asarray(score, dtype=np.float32).copy()
             score[0, :] += self.search_score_bias
+            self._profile_end("loop_score_postprocess", t0)
+            t0 = self._profile_start()
             best_action = select_best_action(score, obs, selected=selected, max_trackers=MAXT)
+            self._profile_end("loop_select_best_action", t0)
             if best_action is None:
                 break
+            t0 = self._profile_start()
             plan.append(best_action)
             base, _sensor = xs_decode_action(best_action, MAXT)
             if int(base) == 0:
@@ -421,7 +580,10 @@ class FastActionAttentionPlanner:
                 dt = float(dwell[int(base) - 1]) if int(base) - 1 < len(dwell) else 10.0
             elapsed += max(1.0, float(dt))
             last = int(base)
-        return plan if plan else [xs_s_search_action(MAXT)]
+            self._profile_end("loop_bookkeeping", t0)
+        out = plan if plan else [xs_s_search_action(MAXT)]
+        self._profile_end("plan_total", t_plan)
+        return out
 
 
 class BatchedActionAttentionScorer:

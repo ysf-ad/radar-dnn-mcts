@@ -1103,6 +1103,54 @@ the Python action-to-index map because the cursor walks a sorted cached root
 action table exactly once, so duplicates are impossible in that benchmarked
 path. Duplicate-aware modes still keep the map.
 
+## CUDA Graph Planner Replay
+
+The online fast planner still had a different bottleneck from root expansion:
+one 200 ms scheduling window makes many small sequential score calls. Each call
+scores all candidate actions in parallel, but the calls are tiny GPU workloads,
+so CUDA launch overhead is a major cost.
+
+`FastActionAttentionPlanner(..., use_cuda_graph=True)` now captures the
+fixed-shape per-decision score graph once per tensor shape and replays it inside
+the sequential planning loop. The captured graph has static inputs for:
+
+```text
+encoded CLS/state tensor
+encoded target tokens
+selected-target mask
+active-token mask
+slot/window context vector
+```
+
+Each window copies the newly encoded state into those static buffers; each
+decision copies the current slot vector and selected mask, then replays the
+captured action-attention policy/Q scorer. The model math and selected action
+are unchanged.
+
+Clean A/B on the same root observation:
+
+```text
+script: scripts/perf_lab_cuda_graph_planner.py
+device=cuda, initial_targets=40, arrival_rate=3, seed=916,
+warmup=5, iterations=30
+
+regular fast planner:      50.984 ms / plan
+CUDA graph fast planner:   12.403 ms / plan
+speedup:                    4.11x
+plans match:                true
+```
+
+The internal online profiler shows why this helps:
+
+```text
+regular per-decision score forward: ~2.5-2.6 ms
+CUDA graph replay score forward:    ~0.38-0.39 ms
+```
+
+The graph path is optional because capture has a one-time cost and depends on
+CUDA availability. It is most useful for repeated fixed-shape online planning,
+where the graph cache is reused across windows.
+
 ## Next Work
 
 - Batch multiple environment windows during evaluation.
