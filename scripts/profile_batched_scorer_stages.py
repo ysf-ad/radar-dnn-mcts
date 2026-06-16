@@ -118,7 +118,7 @@ def profile_batch(batcher, observations: list[dict], iters: int, warmup: int, bu
         def select_gpu():
             flat_scores = score_t.reshape(n, -1)
             candidate_scores = torch.gather(flat_scores, 1, flat_t)
-            candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
+            candidate_scores.masked_fill_(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
             idx = torch.argmax(candidate_scores, dim=1)
             best = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
             has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)

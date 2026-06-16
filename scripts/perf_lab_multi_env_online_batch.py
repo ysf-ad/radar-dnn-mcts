@@ -1051,7 +1051,7 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
 
                 def select_actions():
                     candidate_scores = torch.gather(score_t.reshape(len(live_pos), -1), 1, flat_t)
-                    candidate_scores = candidate_scores.masked_fill(~valid_t, -torch.inf)
+                    candidate_scores.masked_fill_(~valid_t, -torch.inf)
                     idx = torch.argmax(candidate_scores, dim=1)
                     return torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
 
@@ -1519,7 +1519,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
 
                 def select_actions():
                     candidate_scores = torch.gather(score_t.reshape(len(live_pos), -1), 1, flat_t)
-                    candidate_scores = candidate_scores.masked_fill(~valid_t, -torch.inf)
+                    candidate_scores.masked_fill_(~valid_t, -torch.inf)
                     idx = torch.argmax(candidate_scores, dim=1)
                     return torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
 

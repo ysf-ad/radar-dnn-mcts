@@ -2698,6 +2698,13 @@ This is intentionally a small opt-in optimization. It does not change reward or
 executed action count in the paired run; it just removes repeated CPU transfer
 allocation and stabilizes the GPU-to-simulator boundary.
 
+The device selection path also now masks invalid gathered action scores
+in-place before `argmax`. This preserves the same selected actions because the
+gathered candidate-score tensor is throwaway. In the 32-env cached-root graph
+path, the measured `graph_decision_select_device` stage dropped from about
+`0.232 ms` to `0.188 ms`; reward and executed action count remained
+`-531.6933881170116` and `4916`.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only

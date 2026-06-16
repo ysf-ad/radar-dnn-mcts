@@ -1106,7 +1106,7 @@ class BatchedActionAttentionScorer:
         valid_t = torch.as_tensor(physical.valid, device=device, dtype=torch.bool)
         flat_scores = score_t.reshape(n, -1)
         candidate_scores = torch.gather(flat_scores, 1, flat_t)
-        candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
+        candidate_scores.masked_fill_(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
         idx = torch.argmax(candidate_scores, dim=1)
         best = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
         has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
@@ -1171,7 +1171,7 @@ class BatchedActionAttentionScorer:
                 score_t[:, 0, :] += self.search_score_bias
             flat_scores = score_t.reshape(n, -1)
             candidate_scores = torch.gather(flat_scores, 1, flat_t)
-            candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
+            candidate_scores.masked_fill_(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
             idx = torch.argmax(candidate_scores, dim=1)
             best = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
             has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
@@ -1215,7 +1215,7 @@ class BatchedActionAttentionScorer:
                         score_t[:, 0, :] += self.search_score_bias
                     flat_scores = score_t.reshape(n, -1)
                     candidate_scores = torch.gather(flat_scores, 1, static_flat)
-                    candidate_scores = candidate_scores.masked_fill(~(static_valid & torch.isfinite(candidate_scores)), -torch.inf)
+                    candidate_scores.masked_fill_(~(static_valid & torch.isfinite(candidate_scores)), -torch.inf)
                     idx = torch.argmax(candidate_scores, dim=1)
                     best = torch.gather(static_actions, 1, idx[:, None]).squeeze(1)
                     has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
@@ -1287,7 +1287,7 @@ class BatchedActionAttentionScorer:
             score_t[:, 0, :] += self.search_score_bias
         flat_scores = score_t.reshape(n, -1)
         candidate_scores = torch.gather(flat_scores, 1, prepared.flat_indices)
-        candidate_scores = candidate_scores.masked_fill(~(prepared.valid & torch.isfinite(candidate_scores)), -torch.inf)
+        candidate_scores.masked_fill_(~(prepared.valid & torch.isfinite(candidate_scores)), -torch.inf)
         idx = torch.argmax(candidate_scores, dim=1)
         best = torch.gather(prepared.actions, 1, idx[:, None]).squeeze(1)
         has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
@@ -1498,7 +1498,7 @@ class BatchedActionAttentionScorer:
         valid_t = torch.as_tensor(physical.valid, device=device, dtype=torch.bool)
         row_ids = torch.arange(n, device=device, dtype=torch.long)[:, None]
         candidate_scores = score_t[row_ids, bases_t, sensors_t]
-        candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
+        candidate_scores.masked_fill_(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
         counts_t = torch.sum(torch.isfinite(candidate_scores), dim=1).to(torch.int32)
         width = int(counts_t.max().item()) if n else 0
         if max_actions is not None:
