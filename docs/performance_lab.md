@@ -1809,6 +1809,33 @@ the grid, and filling the token tensor. The next tokenization speedup should
 therefore come from a broader packed observation representation rather than more
 root-only branches.
 
+### Packed Root Observations
+
+The cached-root benchmark now builds a compact `PackedRootObs` once per
+environment-window batch and derives both root tokens and slot templates from
+that packed array structure. This keeps exact equivalence with the general
+list-of-dict feature path while avoiding repeated dictionary lookups and array
+stacking in separate token/slot functions.
+
+Validation on an 8-env root batch:
+
+```text
+token_max_abs_diff: 0.0  allclose=True
+slot_max_abs_diff:  0.0  allclose=True
+```
+
+64-env profiled stage changes:
+
+```text
+root_tokenize_batch: 2.89 ms -> 0.54 ms
+root_slot_template:  1.96 ms -> 0.22 ms
+root_pack_observations:          0.61 ms
+```
+
+Clean 64-env cached throughput is now about `381 env-windows/s`, versus roughly
+`368 env-windows/s` after slot-template caching alone and `305 env-windows/s`
+before the cached feature work. Reward remains identical to serial execution.
+
 ## Next Work
 
 - Promote cached-root multi-environment batching from benchmark script to a reusable evaluator/training data path.

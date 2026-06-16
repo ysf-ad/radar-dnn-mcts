@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -62,6 +63,101 @@ def make_live_slots(slot_template: np.ndarray, live_pos: list[int], elapsed, sea
     slots[:, 2] = track_arr / 100.0
     slots[:, 3] = (last_arr == 0).astype(np.float32)
     return slots
+
+
+@dataclass
+class PackedRootObs:
+    observations: list[dict]
+    t_desired: np.ndarray
+    deadline: np.ndarray
+    dwell: np.ndarray
+    active: np.ndarray
+    tracked: np.ndarray
+    priority: np.ndarray
+    ranges: np.ndarray
+    grids: np.ndarray
+    az_bin: np.ndarray
+    el_bin: np.ndarray
+    search_debt_ms: np.ndarray
+    s_busy_ms: np.ndarray
+    x_busy_ms: np.ndarray
+    enable_x_band: np.ndarray
+    sensor_id: np.ndarray
+    use_grid_feature: np.ndarray
+    use_arrival_feature: np.ndarray
+    arrival_rate: np.ndarray
+
+
+def pack_root_observations(observations: list[dict], max_trackers: int) -> PackedRootObs:
+    n = len(observations)
+    zeros_t = np.zeros(max_trackers, dtype=np.float32)
+    zeros_g = np.zeros(300, dtype=np.float32)
+    t_desired = np.stack([np.asarray(obs["t_desired"], dtype=np.float32)[:max_trackers] for obs in observations], axis=0)
+    deadline = np.stack([np.asarray(obs["t_deadline"], dtype=np.float32)[:max_trackers] for obs in observations], axis=0)
+    dwell = np.stack([np.asarray(obs["t_dwell"], dtype=np.float32)[:max_trackers] for obs in observations], axis=0)
+    active = np.stack([np.asarray(obs["active_mask"], dtype=bool)[:max_trackers] for obs in observations], axis=0)
+    tracked = np.stack(
+        [
+            np.asarray(obs.get("tracked_mask", np.asarray(obs["active_mask"], dtype=bool) & (np.asarray(obs["t_deadline"]) > 0)), dtype=bool)[
+                :max_trackers
+            ]
+            for obs in observations
+        ],
+        axis=0,
+    )
+    return PackedRootObs(
+        observations=observations,
+        t_desired=t_desired,
+        deadline=deadline,
+        dwell=dwell,
+        active=active,
+        tracked=tracked,
+        priority=np.stack([np.asarray(obs.get("priority", zeros_t), dtype=np.float32)[:max_trackers] for obs in observations], axis=0),
+        ranges=np.stack([np.asarray(obs.get("target_range", zeros_t), dtype=np.float32)[:max_trackers] for obs in observations], axis=0),
+        grids=np.stack([np.asarray(obs.get("grid", zeros_g), dtype=np.float32)[:300] for obs in observations], axis=0)
+        if n
+        else np.zeros((0, 300), dtype=np.float32),
+        az_bin=np.stack([np.asarray(obs.get("az_bin", zeros_t), dtype=np.float32)[:max_trackers] for obs in observations], axis=0),
+        el_bin=np.stack([np.asarray(obs.get("el_bin", zeros_t), dtype=np.float32)[:max_trackers] for obs in observations], axis=0),
+        search_debt_ms=np.asarray([float(obs.get("search_debt_ms", 0.0)) for obs in observations], dtype=np.float32),
+        s_busy_ms=np.asarray([float(obs.get("s_band_busy_ms", 0.0)) for obs in observations], dtype=np.float32),
+        x_busy_ms=np.asarray([float(obs.get("x_band_busy_ms", 0.0)) for obs in observations], dtype=np.float32),
+        enable_x_band=np.asarray([float(obs.get("enable_x_band", 0.0)) for obs in observations], dtype=np.float32),
+        sensor_id=np.asarray([float(obs.get("sensor_id", 0.0)) for obs in observations], dtype=np.float32),
+        use_grid_feature=np.asarray([float(obs.get("use_grid_feature", 0.0)) for obs in observations], dtype=np.float32),
+        use_arrival_feature=np.asarray([float(obs.get("use_arrival_feature", 0.0)) for obs in observations], dtype=np.float32),
+        arrival_rate=np.asarray([float(obs.get("arrival_rate", 0.0)) for obs in observations], dtype=np.float32),
+    )
+
+
+def slot_template_from_packed(packed: PackedRootObs, budget_ms: float) -> np.ndarray:
+    tracked = packed.active & (packed.deadline >= 0.0)
+    workload = np.sum(np.where(tracked, packed.dwell, 0.0), axis=1) / max(1.0, float(budget_ms))
+    positive_deadline = tracked & (packed.deadline > 0.0)
+    min_deadline_arr = np.where(positive_deadline, packed.deadline, np.inf).min(axis=1)
+    min_deadline_arr = np.where(np.isfinite(min_deadline_arr), min_deadline_arr, 0.0)
+    arrival_feature = packed.enable_x_band.copy()
+    use_arrival = packed.use_arrival_feature > 0.5
+    arrival_feature = np.where(use_arrival, arrival_feature + np.clip(packed.arrival_rate / 10.0, 0.0, 2.0), arrival_feature)
+    feat = np.empty((len(packed.observations), 11), dtype=np.float32)
+    feat[:, 0] = 0.0
+    feat[:, 1] = 0.0
+    feat[:, 2] = 0.0
+    feat[:, 3] = 0.0
+    feat[:, 4] = np.sum(packed.active, axis=1).astype(np.float32) / 100.0
+    feat[:, 5] = np.sum(tracked, axis=1).astype(np.float32) / 100.0
+    feat[:, 6] = np.minimum(workload / 20.0, 2.0)
+    feat[:, 7] = min_deadline_arr / 3000.0
+    feat[:, 8] = np.clip(packed.s_busy_ms / 200.0, 0.0, 5.0)
+    feat[:, 9] = np.clip(packed.x_busy_ms / 200.0, 0.0, 5.0)
+    feat[:, 10] = arrival_feature
+    if np.any(packed.use_grid_feature > 0.5):
+        age = 3000.0 - packed.grids
+        overdue = np.maximum(0.0, age - 3000.0) / 3000.0
+        feat[:, 8] = np.where(packed.use_grid_feature > 0.5, np.clip(np.mean(overdue, axis=1), 0.0, 5.0), feat[:, 8])
+        feat[:, 9] = np.where(packed.use_grid_feature > 0.5, np.clip(np.mean(age > 4500.0, axis=1), 0.0, 1.0), feat[:, 9])
+        feat[:, 10] = np.where(packed.use_grid_feature > 0.5, np.clip(np.max(age, axis=1) / 4500.0, 0.0, 5.0), feat[:, 10])
+    return feat
 
 
 def tokenize_root_batch_fast(adapt, observations, max_trackers: int, token_dim: int) -> np.ndarray:
@@ -200,6 +296,111 @@ def tokenize_root_batch_fast(adapt, observations, max_trackers: int, token_dim: 
             x[i, 0, 9] = mean_overdue
             x[i, 0, 10] = drop_frac
             x[i, 0, 11] = max_age
+    return x
+
+
+def tokenize_packed_root_fast(adapt, packed: PackedRootObs, max_trackers: int, token_dim: int) -> np.ndarray:
+    n = len(packed.observations)
+    x = np.zeros((n, int(max_trackers) + 1, int(token_dim)), dtype=np.float32)
+    if n <= 0:
+        return x
+
+    t_desired = packed.t_desired
+    deadline = packed.deadline
+    dwell = packed.dwell
+    active = packed.active
+    tracked = packed.tracked
+    priority = packed.priority
+    ranges = packed.ranges
+    grids = packed.grids
+    pure = adapt.pure_mcts
+    if float(pure.search_debt_penalty_weight) <= 0.0:
+        search_penalty_norm = np.zeros((n,), dtype=np.float32)
+    elif int(pure.search_delay_mode) == 0:
+        search_penalty_norm = (float(pure.search_debt_penalty_weight) * packed.search_debt_ms).astype(np.float32)
+    else:
+        arg = np.minimum(packed.search_debt_ms / max(1e-3, float(pure.search_debt_tau_ms)), 20.0)
+        search_penalty_norm = (float(pure.search_debt_penalty_weight) * (np.exp(arg) - 1.0)).astype(np.float32)
+    if float(pure.search_delay_penalty_cap) >= 0.0:
+        search_penalty_norm = np.minimum(search_penalty_norm, float(pure.search_delay_penalty_cap))
+    search_penalty_norm = np.clip(np.where(packed.search_debt_ms > 0.0, search_penalty_norm, 0.0), 0.0, 10.0).astype(np.float32)
+
+    tracked_active = active & tracked
+    tracked_n = np.sum(tracked_active, axis=1).astype(np.float32)
+    tracked_delays = np.maximum(0.0, -t_desired) * tracked_active.astype(np.float32)
+    tracked_delay_sum = np.sum(tracked_delays, axis=1)
+    mean_tracked_delay_norm = np.divide(
+        tracked_delay_sum,
+        np.maximum(tracked_n, 1.0),
+        out=np.zeros_like(tracked_delay_sum),
+        where=tracked_n > 0,
+    )
+    mean_tracked_delay_norm = np.clip(mean_tracked_delay_norm / 2000.0, 0.0, 10.0)
+    overdue_count = np.sum((t_desired < 0.0) & tracked_active, axis=1).astype(np.float32)
+    overdue_frac = np.divide(overdue_count, np.maximum(tracked_n, 1.0), out=np.zeros_like(overdue_count), where=tracked_n > 0)
+    global_tardiness_norm = np.clip(tracked_delay_sum / 20000.0, 0.0, 10.0)
+    deadline_pressure = np.maximum(0.0, 100.0 - deadline) * tracked_active.astype(np.float32)
+    global_deadline_pressure_norm = np.clip(np.sum(deadline_pressure, axis=1) / 2000.0, 0.0, 10.0)
+    global_penalty_norm = np.clip(
+        0.001
+        * (
+            float(pure.global_tardiness_weight) * global_tardiness_norm
+            + float(pure.local_tardiness_weight) * mean_tracked_delay_norm
+        ),
+        0.0,
+        10.0,
+    )
+
+    x[:, 0, :8] = np.stack(
+        [
+            tracked_n / max(1, int(adapt.max_trackers)),
+            np.min(grids, axis=1),
+            global_tardiness_norm,
+            mean_tracked_delay_norm,
+            overdue_frac,
+            global_deadline_pressure_norm,
+            search_penalty_norm,
+            global_penalty_norm,
+        ],
+        axis=1,
+    )
+    x[:, 0, 0] = np.clip(x[:, 0, 0] / 3000.0, -2.0, 2.0)
+    x[:, 0, 1] = np.clip(x[:, 0, 1] / 3000.0, -2.0, 2.0)
+    x[:, 0, 2] = np.clip(x[:, 0, 2] / 100.0, 0.0, 2.0)
+    x[:, 0, 5] = np.clip(x[:, 0, 5] / 3000.0, -2.0, 2.0)
+
+    sector_idx = np.clip(np.round(packed.el_bin * 9.0).astype(np.int32) * 30 + np.round(packed.az_bin * 29.0).astype(np.int32), 0, 299)
+    sector_urgency = np.take_along_axis(grids, sector_idx, axis=1).astype(np.float32)
+    target_tardiness = np.maximum(0.0, -t_desired).astype(np.float32)
+    local_penalty_norm = np.clip(
+        0.001 * target_tardiness * (1.0 + 2.0 * priority) * float(pure.local_tardiness_weight),
+        0.0,
+        10.0,
+    ).astype(np.float32)
+    x[:, 1 : max_trackers + 1, 0] = np.clip(t_desired / 3000.0, -2.0, 2.0)
+    x[:, 1 : max_trackers + 1, 1] = np.clip(deadline / 3000.0, -2.0, 2.0)
+    x[:, 1 : max_trackers + 1, 2] = np.clip(dwell / 100.0, 0.0, 2.0)
+    x[:, 1 : max_trackers + 1, 3] = priority
+    x[:, 1 : max_trackers + 1, 4] = (active & tracked).astype(np.float32)
+    x[:, 1 : max_trackers + 1, 5] = np.clip(sector_urgency / 3000.0, -2.0, 2.0)
+    x[:, 1 : max_trackers + 1, 6] = local_penalty_norm
+    x[:, 1 : max_trackers + 1, 7] = (global_penalty_norm + search_penalty_norm)[:, None]
+    x[:, 1 : max_trackers + 1, 9] = np.clip(ranges / 184_000_000.0, 0.0, 1.5)
+    x[:, 1 : max_trackers + 1, 10] = ((ranges > 10_000_000.0) & (ranges < 184_000_000.0)).astype(np.float32)
+    x[:, 1 : max_trackers + 1, 11] = ((ranges > 5_000_000.0) & (ranges < 100_000_000.0)).astype(np.float32)
+    x[:, :, 12] = packed.sensor_id[:, None]
+    x[:, 0, 9] = np.clip(packed.s_busy_ms / 200.0, 0.0, 5.0)
+    x[:, 0, 10] = np.clip(packed.x_busy_ms / 200.0, 0.0, 5.0)
+    x[:, 0, 11] = packed.enable_x_band
+    if np.any(packed.use_grid_feature > 0.5):
+        age = 3000.0 - grids
+        mean_overdue = np.clip(np.mean(np.maximum(0.0, age - 3000.0) / 3000.0, axis=1), 0.0, 5.0)
+        drop_frac = np.clip(np.mean(age > 4500.0, axis=1), 0.0, 1.0)
+        max_age = np.clip(np.max(age, axis=1) / 4500.0, 0.0, 5.0)
+        mask = packed.use_grid_feature > 0.5
+        x[:, 0, 9] = np.where(mask, mean_overdue, x[:, 0, 9])
+        x[:, 0, 10] = np.where(mask, drop_frac, x[:, 0, 10])
+        x[:, 0, 11] = np.where(mask, max_age, x[:, 0, 11])
     return x
 
 
@@ -393,6 +594,13 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
             "root_obs_attach",
             lambda: [attach_env_obs(get_obs(envs[i], search_debt[i]), planner.env_cfg, True, True) for i in root_env_ids],
         )
+        packed = time_stage(
+            device,
+            profile_enabled,
+            stage_buckets,
+            "root_pack_observations",
+            lambda: pack_root_observations(obs2, MAXT),
+        )
         selected = [set() for _ in root_env_ids]
         elapsed = [0.0 for _ in root_env_ids]
         search_count = [0 for _ in root_env_ids]
@@ -403,21 +611,14 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
             profile_enabled,
             stage_buckets,
             "root_slot_template",
-            lambda: slot_features_batch(
-                obs2,
-                elapsed=elapsed,
-                search_count=search_count,
-                track_count=track_count,
-                last_action=last,
-                budget_ms=float(args.window_ms),
-            ),
+            lambda: slot_template_from_packed(packed, float(args.window_ms)),
         )
         root_tokens = time_stage(
             device,
             profile_enabled,
             stage_buckets,
             "root_tokenize_batch",
-            lambda: tokenize_root_batch_fast(adapt, obs2, MAXT, TOKEN_DIM),
+            lambda: tokenize_packed_root_fast(adapt, packed, MAXT, TOKEN_DIM),
         )
         sync(device)
         t0 = time.perf_counter()
@@ -632,20 +833,14 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         if not root_env_ids:
             break
         obs2 = [attach_env_obs(get_obs(envs[i], search_debt[i]), planner.env_cfg, True, True) for i in root_env_ids]
+        packed = pack_root_observations(obs2, MAXT)
         selected = [set() for _ in root_env_ids]
         elapsed = [0.0 for _ in root_env_ids]
         search_count = [0 for _ in root_env_ids]
         track_count = [0 for _ in root_env_ids]
         last = [-1 for _ in root_env_ids]
-        slot_template = slot_features_batch(
-            obs2,
-            elapsed=elapsed,
-            search_count=search_count,
-            track_count=track_count,
-            last_action=last,
-            budget_ms=float(args.window_ms),
-        )
-        root_tokens = tokenize_root_batch_fast(adapt, obs2, MAXT, TOKEN_DIM)
+        slot_template = slot_template_from_packed(packed, float(args.window_ms))
+        root_tokens = tokenize_packed_root_fast(adapt, packed, MAXT, TOKEN_DIM)
         sync(device)
         t0 = time.perf_counter()
         with torch.inference_mode():
