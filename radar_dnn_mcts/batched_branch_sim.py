@@ -150,3 +150,112 @@ class BatchedRootBranchSimulator:
         if getattr(self, "root_eng", None) is not None:
             self.root_eng.close()
             self.root_eng = None
+
+
+class BatchedMultiRootBranchSimulator:
+    """Vectorized one-step simulator for branches from many different roots."""
+
+    def __init__(
+        self,
+        initial_targets: int,
+        seeds: list[int],
+        env_cfg: dict,
+        batch_size: int,
+        max_trackers: int = MAXT,
+        window_ms: int = 200,
+    ):
+        self.initial_targets = int(initial_targets)
+        self.seeds = [int(seed) for seed in seeds]
+        self.env_cfg = engine_env_cfg(dict(env_cfg))
+        self.batch_size = int(batch_size)
+        self.max_trackers = int(max_trackers)
+        self.window_ms = int(window_ms)
+        self.obs_size = GRID_SIZE + self.max_trackers * FEATURES_PER_TRACKER + 1
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if not self.seeds:
+            raise ValueError("seeds must be non-empty")
+
+        self.root_engs = [
+            build_env(_DummyPlanner(), self.initial_targets, self.max_trackers, seed, self.window_ms, self.env_cfg)
+            for seed in self.seeds
+        ]
+        for eng, seed in zip(self.root_engs, self.seeds):
+            eng.reset(seed=seed)
+        self.root_snapshots = [binding.vec_snapshot(eng.env) for eng in self.root_engs]
+
+        self.obs_buf = np.zeros((self.batch_size, self.obs_size), dtype=np.float32)
+        self.act_buf = np.zeros((self.batch_size,), dtype=np.int32)
+        self.rew_buf = np.zeros((self.batch_size,), dtype=np.float32)
+        self.term_buf = np.zeros((self.batch_size,), dtype=np.uint8)
+        self.trunc_buf = np.zeros((self.batch_size,), dtype=np.uint8)
+        self.dt_buf = np.zeros((self.batch_size,), dtype=np.float32)
+        self.executed_buf = np.full((self.batch_size,), -1, dtype=np.int32)
+        self.env = binding.vec_init(
+            self.obs_buf,
+            self.act_buf,
+            self.rew_buf,
+            self.term_buf,
+            self.trunc_buf,
+            self.batch_size,
+            self.seeds[0],
+            initial_targets=self.initial_targets,
+            max_trackers=self.max_trackers,
+            **self.env_cfg,
+        )
+
+    def root_observations(self) -> list[dict]:
+        return [get_obs_from_buf(eng.obs_buf, max_trackers=self.max_trackers) for eng in self.root_engs]
+
+    def step_root_actions(
+        self,
+        root_indices: np.ndarray,
+        actions: np.ndarray,
+        include_observations: bool = False,
+    ) -> BranchStepResult:
+        root_indices = np.asarray(root_indices, dtype=np.int32).reshape(-1)
+        actions = np.asarray(actions, dtype=np.int32).reshape(-1)
+        if actions.size != root_indices.size:
+            raise ValueError("actions and root_indices must have the same size")
+        if actions.size > self.batch_size:
+            raise ValueError(f"actions has {actions.size} items, batch_size={self.batch_size}")
+        if actions.size == 0:
+            return BranchStepResult(
+                rewards=np.empty((0,), dtype=np.float32),
+                dt_ms=np.empty((0,), dtype=np.float32),
+                executed=np.empty((0,), dtype=np.int32),
+                terminals=np.empty((0,), dtype=np.uint8),
+                observations=[],
+            )
+        if np.any(root_indices < 0) or np.any(root_indices >= len(self.root_snapshots)):
+            raise ValueError("root index out of range")
+        if not hasattr(binding, "vec_restore_many"):
+            raise RuntimeError("binding.vec_restore_many is required for multi-root branch simulation")
+
+        count = int(actions.size)
+        snapshots = [self.root_snapshots[int(idx)] for idx in root_indices.tolist()]
+        binding.vec_restore_many(self.env, snapshots, count)
+        self.act_buf[:count] = actions
+        binding.vec_step_validated_into(self.env, self.dt_buf, self.executed_buf, count)
+        rewards = np.asarray(self.rew_buf[:count], dtype=np.float32).copy()
+        terminals = np.asarray(self.term_buf[:count], dtype=np.uint8).copy()
+        observations = (
+            [get_obs_from_buf(self.obs_buf[i], max_trackers=self.max_trackers) for i in range(count)]
+            if include_observations
+            else []
+        )
+        return BranchStepResult(
+            rewards=rewards,
+            dt_ms=self.dt_buf[:count].copy(),
+            executed=self.executed_buf[:count].copy(),
+            terminals=terminals,
+            observations=observations,
+        )
+
+    def close(self) -> None:
+        if getattr(self, "env", None) is not None:
+            binding.vec_close(self.env)
+            self.env = None
+        for eng in getattr(self, "root_engs", []):
+            eng.close()
+        self.root_engs = []

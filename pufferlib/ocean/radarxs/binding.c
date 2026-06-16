@@ -214,6 +214,54 @@ static PyObject* radarxs_vec_restore_n(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* radarxs_vec_restore_many(PyObject* self, PyObject* args) {
+    if (PyTuple_Size(args) != 3) {
+        PyErr_SetString(PyExc_TypeError, "vec_restore_many requires vec handle, snapshot list, and count");
+        return NULL;
+    }
+    PyObject* handle_obj = PyTuple_GetItem(args, 0);
+    if (!PyObject_TypeCheck(handle_obj, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "vec env handle must be an integer");
+        return NULL;
+    }
+    RadarxsVecEnv* vec = (RadarxsVecEnv*)PyLong_AsVoidPtr(handle_obj);
+    if (!vec || vec->num_envs <= 0 || !vec->envs) {
+        PyErr_SetString(PyExc_ValueError, "invalid vec env handle");
+        return NULL;
+    }
+    PyObject* snapshots_obj = PyTuple_GetItem(args, 1);
+    PyObject* snapshots = PySequence_Fast(snapshots_obj, "snapshots must be a sequence of snapshot dicts");
+    if (!snapshots) {
+        PyErr_SetString(PyExc_TypeError, "snapshots must be a sequence of snapshot dicts");
+        return NULL;
+    }
+    int count = (int)PyLong_AsLong(PyTuple_GetItem(args, 2));
+    if (count < 0 || count > vec->num_envs || PySequence_Fast_GET_SIZE(snapshots) < count) {
+        Py_DECREF(snapshots);
+        PyErr_SetString(PyExc_ValueError, "restore count out of range");
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        PyObject* item = PySequence_Fast_GET_ITEM(snapshots, i);
+        if (!item || !PyDict_Check(item)) {
+            Py_DECREF(snapshots);
+            PyErr_SetString(PyExc_TypeError, "snapshot item must be a dict");
+            return NULL;
+        }
+        if (!vec->envs[i]) {
+            Py_DECREF(snapshots);
+            PyErr_SetString(PyExc_ValueError, "invalid env in vector");
+            return NULL;
+        }
+        if (radarxs_restore_snapshot_into(vec->envs[i], item) < 0) {
+            Py_DECREF(snapshots);
+            return NULL;
+        }
+    }
+    Py_DECREF(snapshots);
+    Py_RETURN_NONE;
+}
+
 static PyObject* radarxs_vec_aux(PyObject* self, PyObject* args) {
     Radarxs* env = radarxs_unpack_vec_first(args);
     if (!env) {
@@ -491,6 +539,7 @@ static PyObject* radarxs_vec_step_validated_into(PyObject* self, PyObject* args)
     {"vec_restore", radarxs_vec_restore, METH_VARARGS, "Restore first radar env in a vector"}, \
     {"vec_restore_all", radarxs_vec_restore_all, METH_VARARGS, "Restore every radar env in a vector from one snapshot"}, \
     {"vec_restore_n", radarxs_vec_restore_n, METH_VARARGS, "Restore the first N radar envs in a vector from one snapshot"}, \
+    {"vec_restore_many", radarxs_vec_restore_many, METH_VARARGS, "Restore first N radar envs from N snapshot dicts"}, \
     {"vec_aux", radarxs_vec_aux, METH_VARARGS, "Return sensor busy timers and target ranges for first radar env"}, \
     {"vec_aux_all", radarxs_vec_aux_all, METH_VARARGS, "Return sensor busy timers and target ranges for every radar env"}, \
     {"vec_step_validated", radarxs_vec_step_validated, METH_VARARGS, "Step every env with Python-wrapper-compatible action validity"}, \

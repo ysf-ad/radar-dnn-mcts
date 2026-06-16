@@ -11,6 +11,7 @@ python scripts\profile_action_attention_steps.py --device cuda
 python scripts\perf_lab_batched_roots.py --device cuda --batch-sizes 1,8,32,128
 python scripts\perf_lab_batched_root_tables.py --device cuda --batch-sizes 1,8,32,128
 python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
+python scripts\perf_lab_multi_root_branch_sim.py --root-counts 1,4,8,16,32 --branches-per-root 8
 python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast
 python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
 python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batches 1,4,8,16,32,64
@@ -183,6 +184,46 @@ branches=58: fast vs legacy ~1.00x
 ```
 
 The larger practical win appears in cached root search, where later waves may have fewer active actions and observation dictionaries are unnecessary.
+
+## Multi-Root Branch Simulation
+
+`BatchedMultiRootBranchSimulator` extends the exact C branch simulator from:
+
+```text
+one root snapshot -> many branch actions
+```
+
+to:
+
+```text
+many root snapshots + many branch actions
+    -> flatten `(root_id, action)` pairs
+    -> restore each vector slot from its own root snapshot
+    -> one validated vector step
+```
+
+The C binding now includes `vec_restore_many`, which restores a list of snapshot dictionaries into the first `N` vector slots. This gives search code one primitive for exact branch evaluation across many independent roots/windows.
+
+Correctness matched the per-root loop for executed action, dwell time, and reward. Measured CPU-side C simulator throughput with 8 branches per root:
+
+```text
+roots=1, branches=8:     ~0.97x vs per-root loop
+roots=4, branches=32:    ~1.11x
+roots=8, branches=64:    ~1.16x
+roots=16, branches=128:  ~1.05x
+roots=32, branches=256:  ~1.13x
+```
+
+With 32 branches per root the path is near parity:
+
+```text
+roots=4, branches=128:    ~1.02x
+roots=8, branches=256:    ~1.03x
+roots=16, branches=512:   ~1.02x
+roots=32, branches=1024:  ~0.97x
+```
+
+So multi-root flattening is useful architecturally, but it is not the next large speed source by itself. The exact simulator is already fairly efficient after the previous active-count and buffer-output changes. Larger wins should come from batching neural state/action-table construction and reducing Python tree policy overhead around the simulator.
 
 ## End-to-End Online Profile
 
