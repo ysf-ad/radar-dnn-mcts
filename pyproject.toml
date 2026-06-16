@@ -1,0 +1,10 @@
+[project]
+name = "radar-dnn-mcts"
+version = "0.1.0"
+description = "Radar scheduling research code with transformer policy/Q models and MCTS-style planning."
+requires-python = ">=3.10"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "radar_dnn_mcts"]

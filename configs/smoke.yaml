@@ -1,0 +1,6 @@
+initial_targets: [20]
+arrival_rates: [2]
+eval_windows: 4
+eval_seeds: [916]
+window_ms: 200
+enable_x_band: true
