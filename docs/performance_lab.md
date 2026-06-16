@@ -8,6 +8,7 @@ This repo includes an initial performance lab for the main action-attention fact
 python scripts\perf_lab_action_attention.py --device cpu
 python scripts\perf_lab_action_attention.py --device cuda --forward-batches 1,8,32,128
 python scripts\profile_action_attention_steps.py --device cuda
+python scripts\perf_lab_batched_roots.py --device cuda --batch-sizes 1,8,32,128
 ```
 
 ## First Findings
@@ -39,6 +40,27 @@ batch=128: ~3.95M action scores/sec
 ```
 
 This says the GPU path becomes useful when we batch many states/actions, not when we send one tiny sequential decision at a time.
+
+## Batched Root Scoring
+
+`BatchedActionAttentionScorer` batches many independent radar states/root windows:
+
+```text
+observations[] -> stacked tokens/slots -> one model.forward_scores call
+               -> per-state valid action masks
+               -> best action or top-K root proposals
+```
+
+Measured CUDA root-scoring speedups against looping over states one by one:
+
+```text
+batch=1:   ~1.0x
+batch=8:   ~4.4x
+batch=32:  ~7.5x
+batch=128: ~6.4x
+```
+
+Root action choices matched the old per-state scorer in these tests.
 
 ## Current Optimization
 
@@ -78,9 +100,21 @@ Recurrent evaluation is called over batches.
 
 Our current radar MCTS/planning stack is still Python-control-flow heavy. The next major optimization should be a batched tree-state representation for radar planning, where rollouts and root states are grouped into tensor batches before model evaluation.
 
+`DenseRootSearchState` is the first step in that direction. It stores top-K root actions as dense arrays:
+
+```text
+actions:      [batch, top_k]
+prior_scores: [batch, top_k]
+visits:       [batch, top_k]
+value_sums:   [batch, top_k]
+valid:        [batch, top_k]
+```
+
+That layout mirrors the important MCTX idea: a batch dimension over independent searches and dense action dimensions inside each tree.
+
 ## Next Work
 
 - Batch multiple environment windows during evaluation.
-- Batch root candidate branches for MCTS expansion.
+- Expand `DenseRootSearchState` beyond the root into full batched tree tensors.
 - Replace Python node objects with dense tree tensors.
 - Keep simulator state transitions as the remaining hard part; either vectorize C simulation calls or build a PyTorch/JAX-compatible approximate rollout model.

@@ -21,6 +21,23 @@ class FastPlannerStats:
     use_compile: bool
 
 
+@dataclass
+class BatchedScoreResult:
+    scores: np.ndarray
+    actions: list[np.ndarray]
+    bases: list[np.ndarray]
+    sensors: list[np.ndarray]
+
+
+@dataclass
+class BatchedRootProposals:
+    actions: np.ndarray
+    scores: np.ndarray
+    bases: np.ndarray
+    sensors: np.ndarray
+    valid: np.ndarray
+
+
 def physical_action_arrays(obs: dict, selected: Iterable[int] | None = None, max_trackers: int = MAXT):
     """Return candidate action ids and score-table indices as NumPy arrays.
 
@@ -81,6 +98,31 @@ def select_best_action(score: np.ndarray, obs: dict, selected: Iterable[int] | N
     if vals.size == 0 or not np.isfinite(vals).any():
         return None
     return int(actions[int(np.nanargmax(vals))])
+
+
+def select_topk_actions(score: np.ndarray, obs: dict, selected: Iterable[int] | None = None, k: int = 8, max_trackers: int = MAXT):
+    actions, bases, sensors = physical_action_arrays(obs, selected=selected, max_trackers=max_trackers)
+    if actions.size == 0:
+        return (
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.int64),
+        )
+    vals = np.asarray(score, dtype=np.float32)[bases, sensors]
+    finite = np.isfinite(vals)
+    if not finite.any():
+        return actions[:0], vals[:0], bases[:0], sensors[:0]
+    actions = actions[finite]
+    bases = bases[finite]
+    sensors = sensors[finite]
+    vals = vals[finite]
+    take = min(int(k), int(vals.size))
+    if take <= 0:
+        return actions[:0], vals[:0], bases[:0], sensors[:0]
+    part = np.argpartition(-vals, take - 1)[:take]
+    order = part[np.argsort(-vals[part])]
+    return actions[order], vals[order], bases[order], sensors[order]
 
 
 class FastActionAttentionPlanner:
@@ -201,3 +243,128 @@ class FastActionAttentionPlanner:
             elapsed += max(1.0, float(dt))
             last = int(base)
         return plan if plan else [xs_s_search_action(MAXT)]
+
+
+class BatchedActionAttentionScorer:
+    """Batch many radar states through the action-attention policy/Q network.
+
+    This is the throughput-oriented API. It does not try to make one sequential
+    200 ms window magically parallel; it batches many windows/root states/rollout
+    branches into one model call so the GPU sees enough work.
+    """
+
+    def __init__(
+        self,
+        model: ActionAttentionFactorizedNet,
+        env_cfg: dict,
+        policy_weight: float = 1.0,
+        q_weight: float = 1.0,
+        search_score_bias: float = 0.0,
+        device: str | torch.device | None = None,
+        use_amp: bool = False,
+        use_compile: bool = False,
+    ):
+        dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.model = model.eval().to(dev)
+        if use_compile and hasattr(torch, "compile"):
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+        self.env_cfg = dict(env_cfg)
+        self.policy_weight = float(policy_weight)
+        self.q_weight = float(q_weight)
+        self.search_score_bias = float(search_score_bias)
+        self.device = dev
+        self.use_amp = bool(use_amp and dev.type == "cuda")
+        self.adapt = adapter()
+
+    def score_batch(
+        self,
+        observations: list[dict],
+        selected: list[Iterable[int]] | None = None,
+        elapsed: Iterable[float] | None = None,
+        search_count: Iterable[int] | None = None,
+        track_count: Iterable[int] | None = None,
+        last: Iterable[int] | None = None,
+        budget_ms: float = 200.0,
+    ) -> BatchedScoreResult:
+        n = len(observations)
+        selected = [set() for _ in range(n)] if selected is None else [set(x) for x in selected]
+        elapsed = [0.0] * n if elapsed is None else list(elapsed)
+        search_count = [0] * n if search_count is None else list(search_count)
+        track_count = [0] * n if track_count is None else list(track_count)
+        last = [-1] * n if last is None else list(last)
+
+        obs2 = [attach_env_obs(obs, self.env_cfg, True, True) for obs in observations]
+        tokens = np.stack(
+            [
+                tokenize(self.adapt, obs, selected=selected[i], search_count=int(search_count[i])).astype(np.float32)
+                for i, obs in enumerate(obs2)
+            ],
+            axis=0,
+        )
+        slots = np.stack(
+            [
+                slot_features(
+                    obs,
+                    float(elapsed[i]),
+                    int(search_count[i]),
+                    int(track_count[i]),
+                    int(last[i]),
+                    float(budget_ms),
+                ).astype(np.float32)
+                for i, obs in enumerate(obs2)
+            ],
+            axis=0,
+        )
+        with torch.inference_mode():
+            x = torch.from_numpy(tokens).to(self.device, dtype=torch.float32)
+            s = torch.from_numpy(slots).to(self.device, dtype=torch.float32)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
+                scores, q = self.model.forward_scores(x, s)
+            score = (self.policy_weight * scores + self.q_weight * q).float().cpu().numpy()
+        score[:, 0, :] += self.search_score_bias
+        action_arrays = [physical_action_arrays(obs2[i], selected=selected[i], max_trackers=MAXT) for i in range(n)]
+        return BatchedScoreResult(
+            scores=np.asarray(score, dtype=np.float32),
+            actions=[a[0] for a in action_arrays],
+            bases=[a[1] for a in action_arrays],
+            sensors=[a[2] for a in action_arrays],
+        )
+
+    def best_actions(self, observations: list[dict], **kwargs) -> np.ndarray:
+        result = self.score_batch(observations, **kwargs)
+        out = np.full((len(observations),), -1, dtype=np.int64)
+        for i in range(len(observations)):
+            actions = result.actions[i]
+            if actions.size == 0:
+                continue
+            vals = result.scores[i, result.bases[i], result.sensors[i]]
+            if np.isfinite(vals).any():
+                out[i] = int(actions[int(np.nanargmax(vals))])
+        return out
+
+    def topk_root_proposals(self, observations: list[dict], k: int = 8, **kwargs) -> BatchedRootProposals:
+        result = self.score_batch(observations, **kwargs)
+        n = len(observations)
+        actions = np.full((n, int(k)), -1, dtype=np.int64)
+        scores = np.full((n, int(k)), -np.inf, dtype=np.float32)
+        bases = np.full((n, int(k)), -1, dtype=np.int64)
+        sensors = np.full((n, int(k)), -1, dtype=np.int64)
+        valid = np.zeros((n, int(k)), dtype=bool)
+        for i in range(n):
+            vals = result.scores[i, result.bases[i], result.sensors[i]]
+            finite = np.isfinite(vals)
+            if not finite.any():
+                continue
+            row_actions = result.actions[i][finite]
+            row_bases = result.bases[i][finite]
+            row_sensors = result.sensors[i][finite]
+            row_vals = vals[finite]
+            take = min(int(k), int(row_vals.size))
+            part = np.argpartition(-row_vals, take - 1)[:take]
+            order = part[np.argsort(-row_vals[part])]
+            actions[i, :take] = row_actions[order]
+            scores[i, :take] = row_vals[order]
+            bases[i, :take] = row_bases[order]
+            sensors[i, :take] = row_sensors[order]
+            valid[i, :take] = True
+        return BatchedRootProposals(actions=actions, scores=scores, bases=bases, sensors=sensors, valid=valid)
