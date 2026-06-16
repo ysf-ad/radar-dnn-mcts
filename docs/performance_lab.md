@@ -2713,6 +2713,12 @@ graph probe, `graph_slot_h2d` moved from about `0.0819 ms` to `0.0763 ms`; the
 end-to-end timing was noisy, so this is tracked as a local allocation cleanup,
 not a claimed whole-pipeline speedup.
 
+Preallocating persistent GPU buffers for the per-window action template was
+tested and rejected. It preserved reward/actions, but `graph_action_template_h2d`
+became worse in the 32-env graph probe, increasing to about `1.06 ms` versus
+the prior roughly `0.53 ms`. The direct `.to(device)` uploads are faster here
+than several explicit slice `copy_` operations plus helper tensor updates.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only
