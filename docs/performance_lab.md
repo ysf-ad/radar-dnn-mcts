@@ -16,6 +16,7 @@ python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batch
 python scripts\perf_lab_batched_beam_planner.py --device cuda --beam-widths 1,4,8,16 --max-depth 24
 python scripts\perf_lab_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
 python scripts\perf_lab_persistent_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
+python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32
 ```
 
 ## First Findings
@@ -341,6 +342,43 @@ search_wave(top_k)
 ```
 
 This is still root-scoped, but it is now a real code path future MCTS work can call instead of a one-off benchmark script.
+
+## Persistent Dense Root Tree
+
+`PersistentDenseRootTree` adds a dense root-state layer around `PersistentRootSearch`:
+
+```text
+persistent neural proposer + exact vector C simulation
+    -> dense arrays for actions, priors, visits, value sums
+    -> PUCT-style root selection
+```
+
+This tests whether MCTS bookkeeping is a meaningful bottleneck once neural proposal and exact branch simulation are already batched. Measured CUDA profile for 8 waves of 32 actions from one cached root:
+
+```text
+neural proposal total:     ~56.1 ms
+exact branch sim total:    ~23.4 ms
+dense tree update total:    ~0.8 ms
+PUCT selection total:       ~1.4 ms
+combined iteration:        ~82.3 ms
+unique root actions:        32
+total visits:              256
+```
+
+The dense tree update is below 1% of the total, and PUCT selection is about 1.7%. This means the next real optimization target is not Python visit/value bookkeeping. It is:
+
+- reducing the repeated neural proposal cost inside search waves;
+- reducing exact branch simulation cost for larger waves;
+- batching deeper branches so the model sees larger tensor batches per call.
+
+AMP was slower in this benchmark:
+
+```text
+fp32 combined iteration: ~82.3 ms
+amp combined iteration: ~111.4 ms
+```
+
+So mixed precision should not be assumed helpful for this specific small-batch action-attention path.
 
 ## MCTX Takeaway
 

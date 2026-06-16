@@ -116,4 +116,5 @@ python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batch
 python scripts\perf_lab_batched_beam_planner.py --device cuda --beam-widths 1,4,8,16 --max-depth 24
 python scripts\perf_lab_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
 python scripts\perf_lab_persistent_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
+python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32
 ```
