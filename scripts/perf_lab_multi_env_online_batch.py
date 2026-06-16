@@ -1398,7 +1398,8 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         encode_times.append((time.perf_counter() - t0) * 1000.0)
 
         current_slots = slot_template.copy()
-        full_slot_t = torch.from_numpy(current_slots).to(device, dtype=torch.float32)
+        current_slots_cpu_t = torch.from_numpy(current_slots)
+        full_slot_t = current_slots_cpu_t.to(device, dtype=torch.float32)
         sync(device)
         t0 = time.perf_counter()
         graph_replay = _build_score_graph(planner, score_graph_cache, cls_out, tok_out, selected_t_all, token_active, full_slot_t)
@@ -1440,7 +1441,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                         profile_enabled,
                         stage_buckets,
                         "graph_slot_h2d",
-                        lambda: torch.from_numpy(slots).to(device, dtype=torch.float32),
+                        lambda: current_slots_cpu_t.to(device, dtype=torch.float32),
                     )
                     score_t = time_stage(
                         device,
@@ -1457,7 +1458,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                         if pos_t is None:
                             pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
                             live_pos_tensor_cache[key] = pos_t
-                        prealloc_full_slot_t.copy_(torch.from_numpy(current_slots), non_blocking=False)
+                        prealloc_full_slot_t.copy_(current_slots_cpu_t, non_blocking=False)
                         full_score_t = graph_replay(selected_t_all, prealloc_full_slot_t)
                         return full_score_t.index_select(0, pos_t)
 

@@ -2705,6 +2705,14 @@ path, the measured `graph_decision_select_device` stage dropped from about
 `0.232 ms` to `0.188 ms`; reward and executed action count remained
 `-531.6933881170116` and `4916`.
 
+The cached-root graph path now also reuses a stable CPU tensor view over the
+per-window slot matrix instead of rebuilding `torch.from_numpy(current_slots)`
+inside the decision loop. This is exact because the tensor shares the same
+NumPy backing store updated by the simulator bookkeeping. In the same 32-env
+graph probe, `graph_slot_h2d` moved from about `0.0819 ms` to `0.0763 ms`; the
+end-to-end timing was noisy, so this is tracked as a local allocation cleanup,
+not a claimed whole-pipeline speedup.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only
