@@ -45,6 +45,7 @@ class PersistentDenseRootTree:
         self.executed = np.full((self.capacity,), -1, dtype=np.int32)
         self.valid = np.zeros((self.capacity,), dtype=bool)
         self._q_live_cache = np.zeros((self.capacity,), dtype=np.float32)
+        self._visit_inv_cache = np.zeros((self.capacity,), dtype=np.float32)
         self._action_to_index: dict[int, int] = {}
         self._root_action_cursor = 0
         self._total_visits = 0
@@ -96,7 +97,9 @@ class PersistentDenseRootTree:
             self._total_visits += 1
             self.value_sums[idx] += float(rewards[row])
             self.reward_sums[idx] += float(rewards[row])
-            self._q_live_cache[idx] = self.value_sums[idx] / max(int(self.visits[idx]), 1)
+            visits = max(int(self.visits[idx]), 1)
+            self._q_live_cache[idx] = self.value_sums[idx] / visits
+            self._visit_inv_cache[idx] = 1.0 / float(1 + visits)
             self.elapsed_ms[idx] = float(dt_ms[row])
             self.executed[idx] = int(executed[row])
 
@@ -146,6 +149,7 @@ class PersistentDenseRootTree:
         self.value_sums[start:stop] = rewards[:take]
         self.reward_sums[start:stop] = rewards[:take]
         self._q_live_cache[start:stop] = rewards[:take]
+        self._visit_inv_cache[start:stop] = 0.5
         self.elapsed_ms[start:stop] = dt_ms[:take]
         self.executed[start:stop] = executed[:take]
         self.valid[start:stop] = True
@@ -255,10 +259,9 @@ class PersistentDenseRootTree:
             return -1
         q_live, prior_live = self._live_q_prior()
         parent_visits = max(self.total_visits, 1)
-        visits = self.visits[: self.size]
         live_scores = self._puct_scratch[: self.size]
         np.multiply(prior_live, float(c_puct) * np.sqrt(float(parent_visits)), out=live_scores)
-        np.divide(live_scores, 1.0 + visits, out=live_scores)
+        np.multiply(live_scores, self._visit_inv_cache[: self.size], out=live_scores)
         np.add(live_scores, q_live, out=live_scores)
         return int(np.argmax(live_scores))
 

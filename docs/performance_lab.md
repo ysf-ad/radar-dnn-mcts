@@ -944,6 +944,17 @@ The selected action and reward outputs matched. At this scale the full
 iteration is close to timing noise, but avoiding the allocation keeps the hot
 selection path predictable.
 
+The visit denominator is also cached as `_visit_inv_cache = 1 / (1 + visits)`
+when visits change. Selection now multiplies by this cached reciprocal instead
+of dividing by the live integer visit array:
+
+```text
+scratch scores + live visit divide: ~0.049 ms PUCT selection
+scratch scores + cached visit inv:  ~0.042 ms PUCT selection
+```
+
+The selected action and reward outputs matched.
+
 ## Cached Action-Attention Internals
 
 `profile_cached_action_attention_internals.py` splits the cached action-attention scoring path into stage timings. After the combined policy/Q scoring path, a full cached score pass is roughly 2.2-2.6 ms on CUDA across prefix batches from 1 to 64:
