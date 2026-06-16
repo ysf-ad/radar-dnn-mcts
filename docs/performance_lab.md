@@ -14,6 +14,7 @@ python scripts\profile_root_table_steps.py --device cuda --batch-size 32
 python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
 python scripts\perf_lab_multi_root_branch_sim.py --root-counts 1,4,8,16,32 --branches-per-root 8
 python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast
+python scripts\profile_branch_sim_steps.py --batch-sizes 1,8,16,32,64,128,256
 python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
 python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batches 1,4,8,16,32,64
 python scripts\profile_cached_action_attention_internals.py --device cuda --prefix-batches 1,4,8,16,32,64
@@ -805,6 +806,41 @@ waves=8, top_k=32:
 Rewards and selected actions matched in these paired runs. After bulk cursor
 expansion, the remaining cost is mostly the vectorized exact branch simulator
 rather than neural proposal or dense tree bookkeeping.
+
+## Fused C Restore/Step
+
+`profile_branch_sim_steps.py` splits branch simulation into root restore,
+action-buffer assignment, validated C stepping, and result copies. The profile
+showed validated stepping at roughly 90% of branch simulation time and restore
+at roughly 7-9%:
+
+```text
+batch=32:  validated step ~0.180 ms, restore ~0.014 ms
+batch=128: validated step ~0.727 ms, restore ~0.060 ms
+batch=256: validated step ~1.421 ms, restore ~0.134 ms
+```
+
+The binding now exposes `vec_restore_step_validated_into`, which restores the
+root snapshot, assigns the action, validates/steps, and writes `dt`/`executed`
+inside one C call. `BatchedRootBranchSimulator.step_actions` uses this fused
+entrypoint when available, with the older restore-then-step path as fallback.
+
+Branch benchmark equivalence checks passed for executed actions, dwell times,
+and rewards. The speedup is modest but real:
+
+```text
+58-root-action batch:
+    old fast vector step:  ~0.356-0.365 ms
+    fused restore/step:    ~0.347-0.351 ms
+
+bulk dense root expansion, waves=8, top_k=32:
+    before fused C path:   ~0.50 ms combined iteration
+    after fused C path:    ~0.42 ms combined iteration
+```
+
+At this point the exact simulator is the dominant remaining non-neural cost.
+Deeper gains require parallelizing the C loop itself or replacing exact branch
+simulation with a learned/vectorized rollout model.
 
 ## Cached Action-Attention Internals
 

@@ -95,14 +95,21 @@ class BatchedRootBranchSimulator:
                 terminals=np.empty((0,), dtype=np.uint8),
                 observations=[],
             )
-        self.restore_root(snapshot, count=int(actions.size))
-        self.act_buf[: actions.size] = actions
-        if hasattr(binding, "vec_step_validated_into"):
+        if hasattr(binding, "vec_restore_step_validated_into"):
+            snap = self.snapshot_root() if snapshot is None else snapshot
+            binding.vec_restore_step_validated_into(self.env, snap, actions, self.dt_buf, self.executed_buf, int(actions.size))
+            dt = self.dt_buf[: actions.size].copy()
+            executed = self.executed_buf[: actions.size].copy()
+        elif hasattr(binding, "vec_step_validated_into"):
+            self.restore_root(snapshot, count=int(actions.size))
+            self.act_buf[: actions.size] = actions
             binding.vec_step_validated_into(self.env, self.dt_buf, self.executed_buf, int(actions.size))
             dt = self.dt_buf[: actions.size].copy()
             executed = self.executed_buf[: actions.size].copy()
         else:
+            self.restore_root(snapshot, count=int(actions.size))
             self.act_buf[actions.size :] = -1
+            self.act_buf[: actions.size] = actions
             info = binding.vec_step_validated(self.env)
             dt = np.asarray(info["dt"], dtype=np.float32)[: actions.size]
             executed = np.asarray(info["executed"], dtype=np.int32)[: actions.size]
