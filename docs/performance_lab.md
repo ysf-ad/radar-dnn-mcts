@@ -916,6 +916,21 @@ cached_cursor_bulk without action map:
 Selection and reward outputs matched. This is a root-only specialization; the
 generic duplicate-aware tree update still maintains the map.
 
+Cursor proposals now also avoid copying cached root-table slices. The generic
+`propose_cached` path still returns concrete arrays because exclusion may
+materialize a filtered table, but cursor expansion uses `propose_cached_view`,
+which returns a contiguous view over the already-sorted cached action table.
+
+```text
+cursor-bulk without action map, copied proposal slices:
+    combined iteration: ~0.238 ms
+
+cursor-bulk without action map, no-copy proposal view:
+    combined iteration: ~0.213 ms
+```
+
+The output action/reward invariants matched.
+
 ## Cached Action-Attention Internals
 
 `profile_cached_action_attention_internals.py` splits the cached action-attention scoring path into stage timings. After the combined policy/Q scoring path, a full cached score pass is roughly 2.2-2.6 ms on CUDA across prefix batches from 1 to 64:

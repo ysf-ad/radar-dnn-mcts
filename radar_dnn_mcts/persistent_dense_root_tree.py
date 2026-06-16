@@ -186,7 +186,7 @@ class PersistentDenseRootTree:
         return self.append_new_from_wave(wave) if only_new else self.update_from_wave(wave)
 
     def propose_cached_cursor(self, top_k: int) -> tuple[np.ndarray, np.ndarray]:
-        actions, scores = self.search.propose_cached(top_k=int(top_k), offset=int(self._root_action_cursor))
+        actions, scores = self.search.propose_cached_view(top_k=int(top_k), offset=int(self._root_action_cursor))
         self._root_action_cursor += int(actions.size)
         return actions, scores
 

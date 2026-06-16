@@ -113,6 +113,13 @@ class PersistentRootSearch:
         stop = start + max(0, int(top_k))
         return np.asarray(actions[start:stop], dtype=np.int32), np.asarray(scores[start:stop], dtype=np.float32)
 
+    def propose_cached_view(self, top_k: int, offset: int = 0) -> tuple[np.ndarray, np.ndarray]:
+        """Return a no-copy contiguous slice from the cached root table."""
+        actions, scores = self.root_action_table()
+        start = max(0, int(offset))
+        stop = min(int(actions.size), start + max(0, int(top_k)))
+        return actions[start:stop], scores[start:stop]
+
     def simulate(self, actions: np.ndarray, include_observations: bool = False) -> BranchStepResult:
         return self.sim.step_actions(
             np.asarray(actions, dtype=np.int32),
