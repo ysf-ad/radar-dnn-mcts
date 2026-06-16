@@ -1747,6 +1747,37 @@ or larger. The next major speedup should therefore batch/vectorize simulator
 execution and feature construction rather than only shaving more microseconds
 from policy/Q scoring.
 
+### Slot Template Optimization
+
+Inside a cached-root window, most slot features are root-state constants:
+active target count, tracked target count, workload, deadline pressure, busy
+times, and arrival/load features. Only four fields change at each decision:
+
+```text
+elapsed / budget
+search_count / 20
+track_count / 100
+last_action_is_search
+```
+
+`perf_lab_multi_env_online_batch.py` now computes a per-window slot template
+once and updates only those four columns for live environments at each decision
+depth. This preserves the exact chosen actions/reward while avoiding repeated
+full `slot_features_batch(...)` calls.
+
+64-env profiled result:
+
+```text
+old slot_features_batch:  2.03 ms/decision round
+new slot_context_update:  0.046 ms/decision round
+root_slot_template:       2.02 ms/window
+```
+
+Clean 64-env throughput improved from about `305 env-windows/s` to
+`368 env-windows/s` on the same 60-target/rate-4 benchmark, with zero reward
+delta versus serial execution. The remaining large stages are now simulator
+stepping, root tokenization, and policy/Q score forward.
+
 ## Next Work
 
 - Promote cached-root multi-environment batching from benchmark script to a reusable evaluator/training data path.

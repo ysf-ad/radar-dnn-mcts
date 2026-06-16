@@ -49,6 +49,21 @@ def time_stage(device: torch.device, enabled: bool, buckets: dict[str, list[floa
     return out
 
 
+def make_live_slots(slot_template: np.ndarray, live_pos: list[int], elapsed, search_count, track_count, last, budget_ms: float) -> np.ndarray:
+    slots = np.asarray(slot_template, dtype=np.float32)[np.asarray(live_pos, dtype=np.int64)].copy()
+    if not live_pos:
+        return slots
+    elapsed_arr = np.asarray([elapsed[p] for p in live_pos], dtype=np.float32)
+    search_arr = np.asarray([search_count[p] for p in live_pos], dtype=np.float32)
+    track_arr = np.asarray([track_count[p] for p in live_pos], dtype=np.float32)
+    last_arr = np.asarray([last[p] for p in live_pos], dtype=np.int32)
+    slots[:, 0] = elapsed_arr / float(budget_ms)
+    slots[:, 1] = search_arr / 20.0
+    slots[:, 2] = track_arr / 100.0
+    slots[:, 3] = (last_arr == 0).astype(np.float32)
+    return slots
+
+
 def run_serial(planner, envs, args, device: torch.device) -> dict:
     from final_radar_campaign import get_obs
     from strict_window_report import execute_plan_until_budget
@@ -244,12 +259,26 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
         search_count = [0 for _ in root_env_ids]
         track_count = [0 for _ in root_env_ids]
         last = [-1 for _ in root_env_ids]
+        slot_template = time_stage(
+            device,
+            profile_enabled,
+            stage_buckets,
+            "root_slot_template",
+            lambda: slot_features_batch(
+                obs2,
+                elapsed=elapsed,
+                search_count=search_count,
+                track_count=track_count,
+                last_action=last,
+                budget_ms=float(args.window_ms),
+            ),
+        )
         root_tokens = time_stage(
             device,
             profile_enabled,
             stage_buckets,
             "root_tokenize_batch",
-            lambda: tokenize_batch(adapt, obs2, selected=selected, search_count=search_count),
+            lambda: tokenize_batch(adapt, obs2),
         )
         sync(device)
         t0 = time.perf_counter()
@@ -277,15 +306,8 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
                 device,
                 profile_enabled,
                 stage_buckets,
-                "slot_features_batch",
-                lambda: slot_features_batch(
-                    live_obs,
-                    elapsed=[elapsed[p] for p in live_pos],
-                    search_count=[search_count[p] for p in live_pos],
-                    track_count=[track_count[p] for p in live_pos],
-                    last_action=[last[p] for p in live_pos],
-                    budget_ms=float(args.window_ms),
-                ),
+                "slot_context_update",
+                lambda: make_live_slots(slot_template, live_pos, elapsed, search_count, track_count, last, float(args.window_ms)),
             )
             physical = time_stage(
                 device,
@@ -476,7 +498,15 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         search_count = [0 for _ in root_env_ids]
         track_count = [0 for _ in root_env_ids]
         last = [-1 for _ in root_env_ids]
-        root_tokens = tokenize_batch(adapt, obs2, selected=selected, search_count=search_count)
+        slot_template = slot_features_batch(
+            obs2,
+            elapsed=elapsed,
+            search_count=search_count,
+            track_count=track_count,
+            last_action=last,
+            budget_ms=float(args.window_ms),
+        )
+        root_tokens = tokenize_batch(adapt, obs2)
         sync(device)
         t0 = time.perf_counter()
         with torch.inference_mode():
@@ -486,14 +516,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         sync(device)
         encode_times.append((time.perf_counter() - t0) * 1000.0)
 
-        full_slots = slot_features_batch(
-            obs2,
-            elapsed=elapsed,
-            search_count=search_count,
-            track_count=track_count,
-            last_action=last,
-            budget_ms=float(args.window_ms),
-        )
+        full_slots = make_live_slots(slot_template, list(range(len(root_env_ids))), elapsed, search_count, track_count, last, float(args.window_ms))
         full_slot_t = torch.from_numpy(full_slots).to(device, dtype=torch.float32)
         sync(device)
         t0 = time.perf_counter()
@@ -506,14 +529,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         while live_pos and depth < int(args.max_depth):
             live_obs = [obs2[p] for p in live_pos]
             live_selected = [selected[p] for p in live_pos]
-            slots = slot_features_batch(
-                live_obs,
-                elapsed=[elapsed[p] for p in live_pos],
-                search_count=[search_count[p] for p in live_pos],
-                track_count=[track_count[p] for p in live_pos],
-                last_action=[last[p] for p in live_pos],
-                budget_ms=float(args.window_ms),
-            )
+            slots = make_live_slots(slot_template, live_pos, elapsed, search_count, track_count, last, float(args.window_ms))
             physical = physical_action_table_batch(live_obs, selected=live_selected, max_trackers=MAXT)
             sync(device)
             t0 = time.perf_counter()
