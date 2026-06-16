@@ -10,7 +10,7 @@ import torch
 
 from exact_env_mutual import attach_env_obs, xs_decode_action, xs_s_search_action, xs_x_search_action
 from exact_env_mutual import xs_s_track_action, xs_x_track_action
-from mutual_features import slot_features, slot_features_batch, tokenize, tokenize_batch
+from mutual_features import SLOT_DIM, slot_features, slot_features_batch, tokenize, tokenize_batch
 from realistic_reward_retrain import adapter
 from two_sensor_physical_head_eval import MAXT, ActionAttentionFactorizedNet
 
@@ -427,7 +427,14 @@ class FastActionAttentionPlanner:
             tok_out = tok_out.expand(batch, -1, -1)
         return self._combined_scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t)
 
-    def _build_cuda_graph_score_replay(self, cls_out, tok_out, root_selected, token_active, slot_width: int):
+    def _build_cuda_graph_score_replay(
+        self,
+        cls_out,
+        tok_out,
+        root_selected,
+        token_active,
+        slot_width: int,
+    ):
         if not self.use_cuda_graph or self.device.type != "cuda":
             return None
         key = (
@@ -529,6 +536,26 @@ class FastActionAttentionPlanner:
         action = int(actions_t[torch.argmax(vals)].item())
         return action if action >= 0 else None
 
+    def _slot_template(self, obs: dict, budget_ms: float) -> np.ndarray:
+        return slot_features(obs, 0.0, 0, 0, -1, float(budget_ms)).astype(np.float32, copy=True)
+
+    @staticmethod
+    def _update_slot_inplace(
+        slot: np.ndarray,
+        template: np.ndarray,
+        elapsed: float,
+        search_count: int,
+        track_count: int,
+        last_action: int,
+        budget_ms: float,
+    ) -> np.ndarray:
+        slot[:] = template
+        slot[0] = float(elapsed) / float(budget_ms)
+        slot[1] = float(search_count) / 20.0
+        slot[2] = float(track_count) / 100.0
+        slot[3] = 1.0 if int(last_action) == 0 else 0.0
+        return slot
+
     def plan(self, obs, budget_ms=200):
         t_plan = self._profile_start()
         t0 = self._profile_start()
@@ -555,22 +582,28 @@ class FastActionAttentionPlanner:
         selected_t = root_selected.clone()
         slot_width = int(self.model.backbone.slot_proj[0].normalized_shape[0])
         t0 = self._profile_start()
-        graph_replay = self._build_cuda_graph_score_replay(cls_out, tok_out, selected_t, token_active, slot_width)
-        self._profile_end("cuda_graph_prepare", t0)
         action_tensors = None
         if self.use_gpu_select:
-            t0 = self._profile_start()
             action_tensors = self._physical_action_tensors(obs)
             self._profile_end("candidate_h2d", t0)
+            t0 = self._profile_start()
+        graph_replay = self._build_cuda_graph_score_replay(cls_out, tok_out, selected_t, token_active, slot_width)
+        self._profile_end("cuda_graph_prepare", t0)
+        t0 = self._profile_start()
+        slot_template = self._slot_template(obs, float(budget_ms))
+        slot = np.empty((SLOT_DIM,), dtype=np.float32)
+        self._profile_end("slot_template", t0)
         while elapsed < float(budget_ms) and len(plan) < 64:
             t0 = self._profile_start()
-            slot = slot_features(obs, elapsed, search_count, track_count, last, float(budget_ms)).astype(np.float32)
-            self._profile_end("loop_slot_features", t0)
+            slot = self._update_slot_inplace(slot, slot_template, elapsed, search_count, track_count, last, float(budget_ms))
+            self._profile_end("loop_slot_features_fast", t0)
             if graph_replay is not None:
                 with torch.inference_mode():
                     t0 = self._profile_start()
-                    score_t = graph_replay(slot, selected_t)
+                    graph_out = graph_replay(slot, selected_t)
                     self._profile_end("loop_score_graph_replay", t0)
+                    score_t = graph_out
+                    selected_action_t = None
                     if self.use_gpu_select and action_tensors is not None:
                         score = None
                     else:
@@ -594,7 +627,11 @@ class FastActionAttentionPlanner:
                         self._profile_end("loop_score_d2h", t0)
             if self.use_gpu_select and action_tensors is not None:
                 t0 = self._profile_start()
-                best_action = self._select_best_action_torch(score_t, *action_tensors)
+                if graph_replay is not None and selected_action_t is not None:
+                    action = int(selected_action_t.item())
+                    best_action = action if action >= 0 else None
+                else:
+                    best_action = self._select_best_action_torch(score_t, *action_tensors)
                 self._profile_end("loop_select_best_action_gpu", t0)
             else:
                 t0 = self._profile_start()

@@ -1134,11 +1134,11 @@ script: scripts/perf_lab_cuda_graph_planner.py
 device=cuda, initial_targets=40, arrival_rate=3, seed=916,
 warmup=5, iterations=30
 
-regular fast planner:             50.257 ms / plan
-GPU-select fast planner:          49.905 ms / plan
-CUDA graph fast planner:          12.274 ms / plan
-CUDA graph + GPU-select planner:  10.959 ms / plan
-best speedup:                      4.59x
+regular fast planner:             50.803 ms / plan
+GPU-select fast planner:          48.402 ms / plan
+CUDA graph fast planner:          11.012 ms / plan
+CUDA graph + GPU-select planner:   9.426 ms / plan
+best speedup:                      5.39x
 plans match:                       true
 ```
 
@@ -1154,7 +1154,22 @@ full `[target_rows, sensors]` score table back to CPU and running NumPy
 selection, the planner gathers valid physical actions and runs `argmax` on the
 GPU, transferring only the selected action id. On its own it is neutral because
 the uncaptured model forward dominates latency, but after CUDA Graph replay it
-removes enough CPU/D2H work to improve the graph path by another ~11%.
+removes enough CPU/D2H work to improve the graph path.
+
+The fast planner also now builds a per-window slot-feature template. The
+observation-dependent slot terms are constant throughout a planning call, so the
+loop only updates:
+
+```text
+elapsed / budget
+search_count / 20
+track_count / 100
+last_action_is_search
+```
+
+This is numerically equivalent to calling `slot_features(...)` every decision
+for a fixed observation. In the internal profiler, slot construction dropped
+from roughly `0.18 ms/decision` to `0.024 ms/decision`.
 
 The graph path is optional because capture has a one-time cost and depends on
 CUDA availability. It is most useful for repeated fixed-shape online planning,
