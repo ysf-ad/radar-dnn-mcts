@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from exact_env_mutual import attach_env_obs, xs_decode_action
-from mutual_features import slot_features, tokenize
+from mutual_features import slot_features_batch, tokenize
 from perf_fast_planner import FastActionAttentionPlanner, physical_action_arrays
 from realistic_reward_retrain import adapter
 from two_sensor_physical_head_eval import MAXT
@@ -78,32 +78,33 @@ class BatchedWindowExpansionScorer:
             root_x = torch.from_numpy(root_tok).to(planner.device, dtype=torch.float32).unsqueeze(0)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
                 self.cls_out, self.tok_out, self.root_selected, self.token_active = planner.model.backbone.encode_tokens(root_x)
+        self._root_selected_cpu = self.root_selected.squeeze(0).detach().cpu().numpy().astype(bool, copy=True)
         self._root_actions, self._root_bases, self._root_sensors = physical_action_arrays(self.obs, selected=set(), max_trackers=MAXT)
         self._root_width = max(1, int(self._root_actions.size))
 
     def _selected_masks(self, prefixes: list[BranchPrefix]) -> torch.Tensor:
-        rows = int(self.root_selected.shape[1])
-        masks = self.root_selected.expand(len(prefixes), -1).clone()
+        rows = int(self._root_selected_cpu.shape[0])
+        masks = np.broadcast_to(self._root_selected_cpu[None, :], (len(prefixes), rows)).copy()
+        row_idx: list[int] = []
+        col_idx: list[int] = []
         for row, prefix in enumerate(prefixes):
             for base in prefix.selected:
-                if 0 <= int(base) < rows:
-                    masks[row, int(base)] = True
-        return masks
+                base_i = int(base)
+                if 0 <= base_i < rows:
+                    row_idx.append(row)
+                    col_idx.append(base_i)
+        if row_idx:
+            masks[np.asarray(row_idx, dtype=np.int64), np.asarray(col_idx, dtype=np.int64)] = True
+        return torch.as_tensor(masks, device=self.planner.device, dtype=torch.bool)
 
     def _slots(self, prefixes: list[BranchPrefix]) -> torch.Tensor:
-        slots = np.stack(
-            [
-                slot_features(
-                    self.obs,
-                    float(prefix.elapsed_ms),
-                    int(prefix.search_count),
-                    int(prefix.track_count),
-                    int(prefix.last),
-                    self.budget_ms,
-                ).astype(np.float32)
-                for prefix in prefixes
-            ],
-            axis=0,
+        slots = slot_features_batch(
+            [self.obs] * len(prefixes),
+            elapsed=[float(prefix.elapsed_ms) for prefix in prefixes],
+            search_count=[int(prefix.search_count) for prefix in prefixes],
+            track_count=[int(prefix.track_count) for prefix in prefixes],
+            last_action=[int(prefix.last) for prefix in prefixes],
+            budget_ms=self.budget_ms,
         )
         return torch.from_numpy(slots).to(self.planner.device, dtype=torch.float32)
 

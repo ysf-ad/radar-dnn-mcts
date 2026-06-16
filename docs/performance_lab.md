@@ -1270,6 +1270,21 @@ selected actions match: true
 max score difference:   < 2e-7
 ```
 
+The prefix scorer also moved selected-mask construction and slot-feature
+construction to batched array paths. With vectorized masks, batched slots, and
+the cached root action table, the same hard-root prefix benchmark improved
+further:
+
+```text
+prefixes  full-table path   GPU top-1 path   prepared device graph
+32        ~6.03 ms          ~4.78 ms         ~1.60 ms
+64        ~9.63 ms          ~7.13 ms         ~3.16 ms
+128       ~17.65 ms         ~11.48 ms        ~5.73 ms
+
+selected actions match: true
+max score difference:   < 2e-7
+```
+
 Live beam-planner A/B confirms that distinction. With a dynamic frontier, each
 depth creates a new prefix batch, so graph capture cannot be reused and the
 device-selection setup cost is paid every depth:
@@ -1296,6 +1311,17 @@ beam width 1, full-table top-1:       ~74.44 ms/window
 beam width 1, device top-1:           ~79.27 ms/window
 beam width 8, full-table top-1:       ~64.97 ms/window
 beam width 8, device top-1:           ~80.21 ms/window
+plans match fast planner:             true
+```
+
+After vectorized masks/slots, the normal full-table beam path improves, but the
+dynamic device top-1 path still does not win:
+
+```text
+beam width 1, full-table top-1:       ~59.35 ms/window
+beam width 1, device top-1:           ~72.29 ms/window
+beam width 8, full-table top-1:       ~59.27 ms/window
+beam width 8, device top-1:           ~78.31 ms/window
 plans match fast planner:             true
 ```
 
