@@ -787,25 +787,55 @@ The final-selection number is the root-expansion throughput lower bound for this
 
 ## Cached Action-Attention Internals
 
-`profile_cached_action_attention_internals.py` splits the cached action-attention scoring path into stage timings. On CUDA, the full cached score pass stays around 4.2-4.5 ms across prefix batches from 1 to 64, so throughput improves primarily by batching more prefixes per call:
+`profile_cached_action_attention_internals.py` splits the cached action-attention scoring path into stage timings. After the combined policy/Q scoring path, a full cached score pass is roughly 2.2-2.6 ms on CUDA across prefix batches from 1 to 64:
 
 ```text
-prefixes=1:   ~241 cached score batches/sec
-prefixes=32: ~7626 cached score batches/sec
-prefixes=64: ~14568 cached score batches/sec
+prefixes=1:    ~2.22 ms/call,   ~450 prefixes/sec
+prefixes=32:   ~2.18 ms/call, ~14706 prefixes/sec
+prefixes=64:   ~2.61 ms/call, ~24475 prefixes/sec
 ```
 
 Typical per-call stage costs at this model size:
 
 ```text
-sensor coupling:       ~0.85-0.90 ms
-action self-attention: ~0.75-1.04 ms
-target/type/residual heads combined: ~1.5 ms
-score/mask assembly:   ~0.3-0.6 ms
-CPU transfer:          ~0.08-0.14 ms
+sensor coupling:       ~0.49-0.54 ms
+action self-attention: ~0.46-0.92 ms
+target/type/residual heads combined: ~0.77-0.93 ms
+score/mask assembly:   ~0.17-0.22 ms
+CPU transfer:          ~0.06-0.08 ms
 ```
 
 `torch.compile` did not improve this profile on the tested Windows/CUDA setup; it was slightly slower. This points toward algorithmic batching/cache reuse before custom kernels.
+
+## Full Stack Profile
+
+`profile_online_pipeline.py` profiles real online windows and records `cProfile` output. A 30-window CUDA run on the 40-target, rate-3 cell gave:
+
+```text
+EDF planner:                  ~0.47 ms/window planning, ~3.98 ms/window execution
+old physical learned planner: ~88.36 ms/window planning, ~2.20 ms/window execution
+fast action-attention planner:~68.38 ms/window planning, ~2.05 ms/window execution
+```
+
+For the fast planner, the cumulative profiler is dominated by repeated `_combined_scores_from_encoded` calls. Environment stepping and result execution are small relative to learned planning latency.
+
+The batch-root stage profile at batch 64 shows a different bottleneck mix:
+
+```text
+legacy per-state tokenization: ~13.06 ms/batch
+model forward + CPU transfer:  ~4.58 ms/batch
+legacy per-state slot features:~4.26 ms/batch
+batched tokenization:          ~3.94 ms/batch
+batched slot features:         ~2.70 ms/batch
+```
+
+This confirms the split strategy:
+
+- scalar online planning is bottlenecked by repeated neural score calls;
+- batched root/MCTS work is bottlenecked by feature construction unless it uses the batched builders;
+- the best optimization target is still batched search/tree expansion, not more scalar planner micro-optimization.
+
+`summarize_perf_profiles.py` converts the online, root-table, and cached-internals JSON files into a compact Markdown report for slide/debug use.
 
 ## MCTX Takeaway
 
