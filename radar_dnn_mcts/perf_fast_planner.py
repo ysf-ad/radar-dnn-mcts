@@ -438,6 +438,42 @@ class BatchedActionAttentionScorer:
         score[:, 0, :] += self.search_score_bias
         return np.asarray(score, dtype=np.float32), obs2, selected
 
+    def _score_dense_torch(
+        self,
+        observations: list[dict],
+        selected: list[Iterable[int]] | None = None,
+        elapsed: Iterable[float] | None = None,
+        search_count: Iterable[int] | None = None,
+        track_count: Iterable[int] | None = None,
+        last: Iterable[int] | None = None,
+        budget_ms: float = 200.0,
+    ) -> tuple[torch.Tensor, list[dict], list[set[int]]]:
+        n = len(observations)
+        selected = [set() for _ in range(n)] if selected is None else [set(x) for x in selected]
+        elapsed = [0.0] * n if elapsed is None else list(elapsed)
+        search_count = [0] * n if search_count is None else list(search_count)
+        track_count = [0] * n if track_count is None else list(track_count)
+        last = [-1] * n if last is None else list(last)
+
+        obs2 = [attach_env_obs(obs, self.env_cfg, True, True) for obs in observations]
+        tokens = tokenize_batch(self.adapt, obs2, selected=selected, search_count=search_count)
+        slots = slot_features_batch(
+            obs2,
+            elapsed=elapsed,
+            search_count=search_count,
+            track_count=track_count,
+            last_action=last,
+            budget_ms=float(budget_ms),
+        )
+        with torch.inference_mode():
+            x = torch.from_numpy(tokens).to(self.device, dtype=torch.float32)
+            s = torch.from_numpy(slots).to(self.device, dtype=torch.float32)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
+                scores, q = self.model.forward_scores(x, s)
+            score = (self.policy_weight * scores + self.q_weight * q).float()
+            score[:, 0, :] += self.search_score_bias
+        return score, obs2, selected
+
     def score_batch(
         self,
         observations: list[dict],
@@ -614,3 +650,71 @@ class BatchedActionAttentionScorer:
             sensors[i, :take] = row_sensors[chosen]
             valid[i, :take] = True
         return BatchedRootActionTables(actions=actions, scores=scores, bases=bases, sensors=sensors, valid=valid, counts=counts)
+
+    def all_root_action_tables_torch(
+        self,
+        observations: list[dict],
+        max_actions: int | None = None,
+        **kwargs,
+    ) -> BatchedRootActionTables:
+        """Return sorted root action tables with score gather/sort on torch device."""
+        score_t, obs2, selected = self._score_dense_torch(observations, **kwargs)
+        physical = physical_action_table_batch(obs2, selected=selected, max_trackers=MAXT)
+        n = len(observations)
+        if n <= 0:
+            width = 0 if max_actions is None else int(max_actions)
+            return BatchedRootActionTables(
+                actions=np.full((0, width), -1, dtype=np.int64),
+                scores=np.full((0, width), -np.inf, dtype=np.float32),
+                bases=np.full((0, width), -1, dtype=np.int64),
+                sensors=np.full((0, width), -1, dtype=np.int64),
+                valid=np.zeros((0, width), dtype=bool),
+                counts=np.zeros((0,), dtype=np.int32),
+            )
+
+        device = score_t.device
+        actions_t = torch.as_tensor(physical.actions, device=device, dtype=torch.long)
+        bases_t = torch.as_tensor(physical.bases, device=device, dtype=torch.long)
+        sensors_t = torch.as_tensor(physical.sensors, device=device, dtype=torch.long)
+        valid_t = torch.as_tensor(physical.valid, device=device, dtype=torch.bool)
+        row_ids = torch.arange(n, device=device, dtype=torch.long)[:, None]
+        candidate_scores = score_t[row_ids, bases_t, sensors_t]
+        candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
+        counts_t = torch.sum(torch.isfinite(candidate_scores), dim=1).to(torch.int32)
+        width = int(counts_t.max().item()) if n else 0
+        if max_actions is not None:
+            width = min(width, int(max_actions))
+
+        sorted_scores_t, order_t = torch.sort(candidate_scores, dim=1, descending=True, stable=True)
+        if width > 0:
+            order_t = order_t[:, :width]
+            sorted_scores_t = sorted_scores_t[:, :width]
+            sorted_actions_t = torch.gather(actions_t, 1, order_t)
+            sorted_bases_t = torch.gather(bases_t, 1, order_t)
+            sorted_sensors_t = torch.gather(sensors_t, 1, order_t)
+            sorted_valid_t = torch.isfinite(sorted_scores_t)
+            actions = sorted_actions_t.cpu().numpy().astype(np.int64, copy=False)
+            scores = sorted_scores_t.cpu().numpy().astype(np.float32, copy=False)
+            bases = sorted_bases_t.cpu().numpy().astype(np.int64, copy=False)
+            sensors = sorted_sensors_t.cpu().numpy().astype(np.int64, copy=False)
+            valid = sorted_valid_t.cpu().numpy().astype(bool, copy=False)
+        else:
+            actions = np.full((n, 0), -1, dtype=np.int64)
+            scores = np.full((n, 0), -np.inf, dtype=np.float32)
+            bases = np.full((n, 0), -1, dtype=np.int64)
+            sensors = np.full((n, 0), -1, dtype=np.int64)
+            valid = np.zeros((n, 0), dtype=bool)
+        counts = counts_t.cpu().numpy().astype(np.int32, copy=False)
+        return BatchedRootActionTables(actions=actions, scores=scores, bases=bases, sensors=sensors, valid=valid, counts=counts)
+
+    def all_root_action_tables_fast(
+        self,
+        observations: list[dict],
+        max_actions: int | None = None,
+        torch_batch_threshold: int = 96,
+        **kwargs,
+    ) -> BatchedRootActionTables:
+        """Use the fastest measured root-table path for the current batch."""
+        if self.device.type == "cuda" and len(observations) >= int(torch_batch_threshold):
+            return self.all_root_action_tables_torch(observations, max_actions=max_actions, **kwargs)
+        return self.all_root_action_tables_vectorized(observations, max_actions=max_actions, **kwargs)

@@ -192,6 +192,47 @@ This confirms feature construction was a real bottleneck. The next larger
 target is the remaining model forward/action-attention stack and avoiding CPU
 round-trips when the caller can consume tensors directly.
 
+The root-table scorer now also has a Torch-native gather/sort path:
+
+```text
+score tensor [batch, rows, sensors] stays on CUDA
+    -> gather valid physical candidate scores on CUDA
+    -> sort candidate scores with torch.sort
+    -> transfer only compact sorted root tables back to CPU
+```
+
+This avoids copying the entire dense score table to NumPy before action-table
+construction. It is not universally faster because small batches pay extra
+tensor-construction and sort overhead, but it helps once the batch is large
+enough:
+
+```text
+batch=8:    torch path slower than vectorized NumPy
+batch=32:   roughly parity / slightly slower
+batch=128:  torch path faster, ~1.03-1.13x vs vectorized NumPy
+```
+
+`all_root_action_tables_fast` uses the measured rule:
+
+```text
+if CUDA and batch >= 96:
+    use Torch gather/sort
+else:
+    use vectorized NumPy gather/sort
+```
+
+Short validation run:
+
+```text
+batch=8:    fast ~4.88 ms,  ~7.2x vs per-root loop
+batch=32:   fast ~8.35 ms, ~16.8x vs per-root loop
+batch=128:  fast ~22.05 ms, ~25.2x vs per-root loop
+```
+
+This means large multi-root evaluations can now keep the high-volume score
+gather/sort work on the GPU, while small online batches stay on the lower
+overhead CPU/NumPy path.
+
 ## Current Optimization
 
 `FastActionAttentionPlanner` reuses the root target encoding inside a scheduling window:
