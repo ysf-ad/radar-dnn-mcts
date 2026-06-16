@@ -842,6 +842,29 @@ At this point the exact simulator is the dominant remaining non-neural cost.
 Deeper gains require parallelizing the C loop itself or replacing exact branch
 simulation with a learned/vectorized rollout model.
 
+The fused restore/step loop is now parallelized with OpenMP when the branch
+batch has at least 32 actions. The binding setup enables OpenMP for the local C
+extension build, and the fused path extracts snapshot bytes before entering the
+parallel region so no Python API calls occur inside the loop.
+
+Equivalence checks again passed for executed actions, dwell times, and rewards.
+The branch simulator speedup is substantial at realistic root batch sizes:
+
+```text
+58-root-action branch batch:
+    previous fused serial path: ~0.347-0.351 ms
+    OpenMP fused path:          ~0.100-0.116 ms
+
+bulk dense root expansion, waves=8, top_k=32:
+    fused serial C path:        ~0.42 ms combined iteration
+    OpenMP fused C path:        ~0.28 ms combined iteration
+    exact branch sim portion:   ~0.083 ms
+```
+
+This shifts the root-search bottleneck away from branch stepping; PUCT
+selection and dense tree update are now visible fractions of the remaining
+sub-millisecond root expansion path.
+
 ## Cached Action-Attention Internals
 
 `profile_cached_action_attention_internals.py` splits the cached action-attention scoring path into stage timings. After the combined policy/Q scoring path, a full cached score pass is roughly 2.2-2.6 ms on CUDA across prefix batches from 1 to 64:

@@ -1,5 +1,8 @@
 #include <Python.h>
 #include <numpy/arrayobject.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "radarxs.h"
 
 #define Env Radarxs
@@ -8,6 +11,18 @@ typedef struct {
     Radarxs** envs;
     int num_envs;
 } RadarxsVecEnv;
+
+typedef struct {
+    char* env_bytes;
+    Py_ssize_t env_len;
+    char* target_bytes;
+    Py_ssize_t target_len;
+    char* obs_bytes;
+    Py_ssize_t obs_len;
+    int action0;
+    float reward0;
+    unsigned char terminal0;
+} RadarxsSnapshotView;
 
 static Radarxs* radarxs_unpack_vec_first(PyObject* args) {
     if (PyTuple_Size(args) < 1) {
@@ -143,6 +158,56 @@ static int radarxs_restore_snapshot_into(Radarxs* env, PyObject* dict) {
     if (reward_obj) env->rewards[0] = (float)PyFloat_AsDouble(reward_obj);
     if (terminal_obj) env->terminals[0] = (unsigned char)PyLong_AsLong(terminal_obj);
     return 0;
+}
+
+static int radarxs_snapshot_view_from_dict(PyObject* dict, int max_trackers, RadarxsSnapshotView* view) {
+    if (!dict || !PyDict_Check(dict) || !view) {
+        PyErr_SetString(PyExc_TypeError, "snapshot must be a dict");
+        return -1;
+    }
+    PyObject* env_obj = PyDict_GetItemString(dict, "env");
+    PyObject* target_obj = PyDict_GetItemString(dict, "targets");
+    PyObject* obs_obj = PyDict_GetItemString(dict, "observations");
+    if (!env_obj || !target_obj || !obs_obj ||
+        PyBytes_AsStringAndSize(env_obj, &view->env_bytes, &view->env_len) < 0 ||
+        PyBytes_AsStringAndSize(target_obj, &view->target_bytes, &view->target_len) < 0 ||
+        PyBytes_AsStringAndSize(obs_obj, &view->obs_bytes, &view->obs_len) < 0) {
+        PyErr_SetString(PyExc_ValueError, "invalid snapshot byte payload");
+        return -1;
+    }
+    if (view->env_len != sizeof(Radarxs) || view->target_len != (Py_ssize_t)(sizeof(Target) * max_trackers)) {
+        PyErr_SetString(PyExc_ValueError, "snapshot shape does not match current env");
+        return -1;
+    }
+    PyObject* action_obj = PyDict_GetItemString(dict, "action0");
+    PyObject* reward_obj = PyDict_GetItemString(dict, "reward0");
+    PyObject* terminal_obj = PyDict_GetItemString(dict, "terminal0");
+    view->action0 = action_obj ? (int)PyLong_AsLong(action_obj) : 0;
+    view->reward0 = reward_obj ? (float)PyFloat_AsDouble(reward_obj) : 0.0f;
+    view->terminal0 = terminal_obj ? (unsigned char)PyLong_AsLong(terminal_obj) : 0;
+    if (PyErr_Occurred()) {
+        return -1;
+    }
+    return 0;
+}
+
+static void radarxs_restore_snapshot_view_into(Radarxs* env, const RadarxsSnapshotView* view) {
+    float* observations = env->observations;
+    int* actions = env->actions;
+    float* rewards = env->rewards;
+    unsigned char* terminals = env->terminals;
+    Target* targets = env->targets;
+    memcpy(env, view->env_bytes, sizeof(Radarxs));
+    env->observations = observations;
+    env->actions = actions;
+    env->rewards = rewards;
+    env->terminals = terminals;
+    env->targets = targets;
+    memcpy(env->targets, view->target_bytes, (size_t)view->target_len);
+    memcpy(env->observations, view->obs_bytes, (size_t)view->obs_len);
+    env->actions[0] = view->action0;
+    env->rewards[0] = view->reward0;
+    env->terminals[0] = view->terminal0;
 }
 
 static PyObject* radarxs_vec_restore_all(PyObject* self, PyObject* args) {
@@ -584,18 +649,27 @@ static PyObject* radarxs_vec_restore_step_validated_into(PyObject* self, PyObjec
         PyErr_SetString(PyExc_ValueError, "restore-step count out of range");
         return NULL;
     }
-    int* actions_in = (int*)PyArray_DATA(actions_arr);
-    float* dt_out = (float*)PyArray_DATA(dt_arr);
-    int* executed_out = (int*)PyArray_DATA(executed_arr);
     for (int i = 0; i < count; i++) {
-        Radarxs* env = vec->envs[i];
-        if (!env) {
+        if (!vec->envs[i]) {
             PyErr_SetString(PyExc_ValueError, "invalid env in vector");
             return NULL;
         }
-        if (radarxs_restore_snapshot_into(env, snapshot) < 0) {
-            return NULL;
-        }
+    }
+    RadarxsSnapshotView snapshot_view;
+    if (radarxs_snapshot_view_from_dict(snapshot, vec->envs[0]->max_trackers, &snapshot_view) < 0) {
+        return NULL;
+    }
+    int* actions_in = (int*)PyArray_DATA(actions_arr);
+    float* dt_out = (float*)PyArray_DATA(dt_arr);
+    int* executed_out = (int*)PyArray_DATA(executed_arr);
+    int i;
+    Py_BEGIN_ALLOW_THREADS
+    #ifdef _OPENMP
+    #pragma omp parallel for if(count >= 32) schedule(static)
+    #endif
+    for (i = 0; i < count; i++) {
+        Radarxs* env = vec->envs[i];
+        radarxs_restore_snapshot_view_into(env, &snapshot_view);
         int raw_action = actions_in[i];
         env->actions[0] = raw_action;
         int logical_action;
@@ -617,6 +691,7 @@ static PyObject* radarxs_vec_restore_step_validated_into(PyObject* self, PyObjec
             dt_out[i] = 0.0f;
         }
     }
+    Py_END_ALLOW_THREADS
     return PyLong_FromLong(count);
 }
 
