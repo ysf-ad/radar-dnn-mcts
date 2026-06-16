@@ -51,6 +51,7 @@ class PersistentDenseRootTree:
         self._prior_dirty = True
         self._prior_live_cache = np.empty((0,), dtype=np.float32)
         self._prior_live_size = 0
+        self._puct_scratch = np.empty((self.capacity,), dtype=np.float32)
         self.size = 0
 
     @property
@@ -255,8 +256,11 @@ class PersistentDenseRootTree:
         q_live, prior_live = self._live_q_prior()
         parent_visits = max(self.total_visits, 1)
         visits = self.visits[: self.size]
-        scores = q_live + float(c_puct) * prior_live * np.sqrt(float(parent_visits)) / (1.0 + visits)
-        return int(np.nanargmax(scores))
+        live_scores = self._puct_scratch[: self.size]
+        np.multiply(prior_live, float(c_puct) * np.sqrt(float(parent_visits)), out=live_scores)
+        np.divide(live_scores, 1.0 + visits, out=live_scores)
+        np.add(live_scores, q_live, out=live_scores)
+        return int(np.argmax(live_scores))
 
     def select_action(self, c_puct: float = 1.25) -> int:
         idx = self.select_index(c_puct=float(c_puct))

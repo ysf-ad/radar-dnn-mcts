@@ -931,6 +931,19 @@ cursor-bulk without action map, no-copy proposal view:
 
 The output action/reward invariants matched.
 
+PUCT selection now also uses an in-place scratch buffer for live scores instead
+of allocating a temporary score vector on every call:
+
+```text
+cached Q/prior + no-copy cursor proposal:
+    PUCT selection with temporary scores: ~0.064 ms
+    PUCT selection with scratch scores:   ~0.049 ms
+```
+
+The selected action and reward outputs matched. At this scale the full
+iteration is close to timing noise, but avoiding the allocation keeps the hot
+selection path predictable.
+
 ## Cached Action-Attention Internals
 
 `profile_cached_action_attention_internals.py` splits the cached action-attention scoring path into stage timings. After the combined policy/Q scoring path, a full cached score pass is roughly 2.2-2.6 ms on CUDA across prefix batches from 1 to 64:
