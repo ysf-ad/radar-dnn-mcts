@@ -2719,6 +2719,22 @@ became worse in the 32-env graph probe, increasing to about `1.06 ms` versus
 the prior roughly `0.53 ms`. The direct `.to(device)` uploads are faster here
 than several explicit slice `copy_` operations plus helper tensor updates.
 
+`perf_lab_multi_env_online_batch.py` now accepts `--paths` so expensive profiles
+can isolate the active optimization target instead of always running serial,
+reencode, cached-root, and graph variants. For graph-only profiling:
+
+```powershell
+python scripts\perf_lab_multi_env_online_batch.py --paths graph --device cuda `
+  --envs 32 --windows 20 --initial-targets 60 --rate 4 --amp `
+  --fast-env-step --direct-root-pack --cached-action-table `
+  --gpu-action-template --gpu-valid-mask --batch-env-step `
+  --padded-live-graph --pinned-action-d2h --profile-stages `
+  --checkpoint ..\CreateValid1\results\critic_bootstrap_medium_eval_two_row_action_attention_qpolicy_factored_loss.pt
+```
+
+When a baseline path is omitted, the corresponding speedup and reward-delta
+fields are reported as `null` rather than forcing unrelated benchmark work.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only

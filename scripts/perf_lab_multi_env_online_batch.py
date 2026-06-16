@@ -1699,6 +1699,11 @@ def main() -> None:
         help="Optional torch.set_float32_matmul_precision value for TF32/FP32 matmul experiments.",
     )
     parser.add_argument("--checkpoint", type=Path, default=None, help="Optional ActionAttentionFactorizedNet state dict to benchmark.")
+    parser.add_argument(
+        "--paths",
+        default="all",
+        help="Comma-separated benchmark paths to run: all,serial,reencode,cached,graph.",
+    )
     parser.add_argument("--out", type=Path, default=Path("results/perf_lab_multi_env_online_batch.json"))
     args = parser.parse_args()
 
@@ -1737,30 +1742,53 @@ def main() -> None:
         use_amp=bool(args.amp),
     )
 
-    serial_envs = build_envs(args, env_cfg)
-    batch_envs = build_envs(args, env_cfg)
-    cached_envs = build_envs(args, env_cfg)
-    graph_envs = build_envs(args, env_cfg) if not bool(args.skip_graph) else []
+    requested_paths = {p.strip().lower() for p in str(args.paths).split(",") if p.strip()}
+    valid_paths = {"all", "serial", "reencode", "cached", "graph"}
+    unknown_paths = requested_paths - valid_paths
+    if unknown_paths:
+        raise ValueError(f"unknown benchmark path(s): {sorted(unknown_paths)}")
+    if not requested_paths or "all" in requested_paths:
+        requested_paths = {"serial", "reencode", "cached", "graph"}
+    if bool(args.skip_graph):
+        requested_paths.discard("graph")
+
+    serial_envs = build_envs(args, env_cfg) if "serial" in requested_paths else []
+    batch_envs = build_envs(args, env_cfg) if "reencode" in requested_paths else []
+    cached_envs = build_envs(args, env_cfg) if "cached" in requested_paths else []
+    graph_envs = build_envs(args, env_cfg) if "graph" in requested_paths else []
+    serial_report: dict = {}
+    batched_report: dict = {}
+    cached_report: dict = {}
+    graph_report: dict = {}
     cpu_profiles: dict[str, list[dict[str, object]]] = {}
     active_sdp_state: dict[str, bool] = {}
     try:
         with sdp_backend(str(args.sdp_backend)) as active_sdp_state:
-            serial_report, cpu_profiles["serial_fast_graph_gpu_select"] = run_maybe_profiled(
-                "serial_fast_graph_gpu_select",
-                lambda: run_serial(serial, serial_envs, args, device),
-                int(args.profile_cpu_top),
-            )
-            batched_report, cpu_profiles["batched_multi_env_reencode"] = run_maybe_profiled(
-                "batched_multi_env_reencode",
-                lambda: run_batched(batched, batch_envs, args, device),
-                int(args.profile_cpu_top),
-            )
-            cached_report, cpu_profiles["batched_multi_env_cached_root"] = run_maybe_profiled(
-                "batched_multi_env_cached_root",
-                lambda: run_batched_cached(serial, cached_envs, args, device),
-                int(args.profile_cpu_top),
-            )
-            if graph_envs:
+            if "serial" in requested_paths:
+                serial_report, cpu_profiles["serial_fast_graph_gpu_select"] = run_maybe_profiled(
+                    "serial_fast_graph_gpu_select",
+                    lambda: run_serial(serial, serial_envs, args, device),
+                    int(args.profile_cpu_top),
+                )
+            else:
+                cpu_profiles["serial_fast_graph_gpu_select"] = []
+            if "reencode" in requested_paths:
+                batched_report, cpu_profiles["batched_multi_env_reencode"] = run_maybe_profiled(
+                    "batched_multi_env_reencode",
+                    lambda: run_batched(batched, batch_envs, args, device),
+                    int(args.profile_cpu_top),
+                )
+            else:
+                cpu_profiles["batched_multi_env_reencode"] = []
+            if "cached" in requested_paths:
+                cached_report, cpu_profiles["batched_multi_env_cached_root"] = run_maybe_profiled(
+                    "batched_multi_env_cached_root",
+                    lambda: run_batched_cached(serial, cached_envs, args, device),
+                    int(args.profile_cpu_top),
+                )
+            else:
+                cpu_profiles["batched_multi_env_cached_root"] = []
+            if "graph" in requested_paths:
                 graph_report, cpu_profiles["batched_multi_env_cached_root_graph"] = run_maybe_profiled(
                     "batched_multi_env_cached_root_graph",
                     lambda: run_batched_cached_graph(serial, graph_envs, args, device),
@@ -1781,6 +1809,7 @@ def main() -> None:
         "active_sdp_state": active_sdp_state,
         "matmul_precision": str(args.matmul_precision) if str(args.matmul_precision) else None,
         "pinned_action_d2h_requested": bool(args.pinned_action_d2h),
+        "paths_requested": sorted(requested_paths),
         "envs": int(args.envs),
         "windows": int(args.windows),
         "window_ms": int(args.window_ms),
@@ -1794,17 +1823,23 @@ def main() -> None:
         "batched_multi_env_cached_root_graph": graph_report,
         "throughput_speedup": float(
             cached_report["window_throughput_per_s"] / max(serial_report["window_throughput_per_s"], 1e-12)
-        ),
+        )
+        if cached_report and serial_report
+        else None,
         "graph_throughput_speedup": float(
             graph_report.get("window_throughput_per_s", 0.0) / max(serial_report["window_throughput_per_s"], 1e-12)
         )
-        if graph_report
+        if graph_report and serial_report
         else None,
-        "reward_delta_cached_minus_serial": float(cached_report["total_reward"] - serial_report["total_reward"]),
+        "reward_delta_cached_minus_serial": float(cached_report["total_reward"] - serial_report["total_reward"])
+        if cached_report and serial_report
+        else None,
         "reward_delta_graph_minus_serial": float(graph_report.get("total_reward", serial_report["total_reward"]) - serial_report["total_reward"])
-        if graph_report
+        if graph_report and serial_report
         else None,
-        "reward_delta_reencode_minus_serial": float(batched_report["total_reward"] - serial_report["total_reward"]),
+        "reward_delta_reencode_minus_serial": float(batched_report["total_reward"] - serial_report["total_reward"])
+        if batched_report and serial_report
+        else None,
         "cpu_profile_top": cpu_profiles if int(args.profile_cpu_top) > 0 else {},
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
