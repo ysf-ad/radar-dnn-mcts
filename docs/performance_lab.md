@@ -2622,6 +2622,11 @@ because Triton is unavailable. The script records that as a benchmark result
 instead of crashing. This means whole-score fusion via `torch.compile` remains
 blocked by the local runtime, not by model logic.
 
+The compile lab also includes a TorchScript trace variant for fixed-shape cached
+score calls. In AMP mode it was not exact (`max_abs` around `8e-3` to `1.6e-2`)
+and did not reliably beat eager execution in the scripted benchmark, so it is
+also rejected as an online planner path.
+
 The same labs now also expose `--matmul-precision`. In the isolated score-body
 profile, `--matmul-precision high` improved the mean cached score call:
 

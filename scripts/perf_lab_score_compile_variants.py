@@ -67,6 +67,16 @@ def make_inputs(args, device: torch.device):
     return planner, cls_out, tok_out, selected_t, token_active, slot_t
 
 
+class ScoreTraceWrapper(torch.nn.Module):
+    def __init__(self, planner):
+        super().__init__()
+        self.planner = planner
+        self.model = planner.model
+
+    def forward(self, cls_out, tok_out, selected_t, token_active, slot_t):
+        return self.planner.score_slots_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t).float()
+
+
 def time_variant(device: torch.device, name: str, fn, iters: int, warmup: int) -> dict[str, object]:
     values: list[float] = []
     last = None
@@ -115,6 +125,8 @@ def main() -> None:
         torch.set_float32_matmul_precision(str(args.matmul_precision))
     device = torch.device(args.device)
     planner, cls_out, tok_out, selected_t, token_active, slot_t = make_inputs(args, device)
+    for param in planner.model.parameters():
+        param.requires_grad_(False)
 
     def eager_score():
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=bool(args.amp) and device.type == "cuda"):
@@ -122,6 +134,8 @@ def main() -> None:
 
     compiled_reduce = None
     compiled_max = None
+    traced_score = None
+    trace_error = None
     if hasattr(torch, "compile"):
         compiled_reduce = torch.compile(
             planner.score_slots_from_encoded,
@@ -133,6 +147,16 @@ def main() -> None:
             mode="max-autotune",
             fullgraph=False,
         )
+    try:
+        trace_wrapper = ScoreTraceWrapper(planner).eval().to(device)
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16, enabled=bool(args.amp) and device.type == "cuda"):
+            traced_score = torch.jit.trace(
+                trace_wrapper,
+                (cls_out, tok_out, selected_t, token_active, slot_t),
+                check_trace=False,
+            )
+    except Exception as exc:
+        trace_error = repr(exc)
 
     def compiled_reduce_score():
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=bool(args.amp) and device.type == "cuda"):
@@ -143,6 +167,12 @@ def main() -> None:
             return compiled_max(cls_out, tok_out, selected_t, token_active, slot_t).float()
 
     variants = [time_variant(device, "eager", eager_score, int(args.iters), int(args.warmup))]
+    if traced_score is not None:
+        def traced_score_call():
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=bool(args.amp) and device.type == "cuda"):
+                return traced_score(cls_out, tok_out, selected_t, token_active, slot_t).float()
+
+        variants.append(time_variant(device, "torchscript_trace", traced_score_call, int(args.iters), int(args.warmup)))
     if compiled_reduce is not None:
         variants.append(time_variant(device, "compile_reduce_overhead", compiled_reduce_score, int(args.iters), int(args.warmup)))
         variants.append(time_variant(device, "compile_max_autotune", compiled_max_score, int(args.iters), int(args.warmup)))
@@ -151,6 +181,15 @@ def main() -> None:
         ref = eager_score()
     equivalence = {}
     if compiled_reduce is not None:
+        if traced_score is not None:
+            try:
+                trace_out = traced_score_call()
+                equivalence["trace_max_abs"] = float((ref - trace_out).abs().max().detach().cpu())
+                equivalence["trace_allclose"] = bool(torch.allclose(ref, trace_out, atol=1e-5, rtol=1e-5))
+            except Exception as exc:
+                equivalence["trace_error"] = repr(exc)
+        elif trace_error is not None:
+            equivalence["trace_error"] = trace_error
         try:
             reduce_out = compiled_reduce_score()
             equivalence["compile_reduce_max_abs"] = float((ref - reduce_out).abs().max().detach().cpu())
