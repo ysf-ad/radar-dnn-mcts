@@ -1718,10 +1718,40 @@ useful only if fixed-shape graph capture can be reused across many windows with
 static root buffers, or for offline rollouts where many repeated decision rounds
 share one prepared root batch.
 
+### Cached Multi-Env Stage Profile
+
+`perf_lab_multi_env_online_batch.py --profile-stages --skip-graph` splits the
+winning cached-root path into synchronized stages. This is not the clean
+throughput mode, but it shows where the next optimization work should go.
+
+Profiled at `initial_targets=60`, `arrival_rate=4`, `seed=916`:
+
+```text
+stage                         32 envs mean ms   64 envs mean ms
+env_step_batch                  2.21             4.35
+decision_score_forward          2.33             2.58
+root_tokenize_batch             1.66             3.14
+slot_features_batch             1.07             2.03
+root_obs_attach                 0.95             2.01
+root_h2d_encode                 1.51             1.42
+decision_tensor_prep_h2d        0.39             0.49
+physical_action_table_batch     0.28             0.46
+decision_select_device          0.31             0.34
+decision_action_d2h             0.06             0.06
+```
+
+This changes the optimization picture. At high batch counts, neural score
+forward is no longer the only bottleneck. Simulator stepping, root observation
+attachment, root tokenization, and slot feature construction are now comparable
+or larger. The next major speedup should therefore batch/vectorize simulator
+execution and feature construction rather than only shaving more microseconds
+from policy/Q scoring.
+
 ## Next Work
 
 - Promote cached-root multi-environment batching from benchmark script to a reusable evaluator/training data path.
 - Revisit fixed-shape CUDA Graph replay only if graph capture can be amortized across repeated prepared root batches.
+- Vectorize `env_step_batch`, root observation attachment, and token/slot feature construction for multi-env runs.
 - Expand `DenseRootSearchState` beyond the root into full batched tree tensors.
 - Replace Python node objects with dense tree tensors.
 - Use `BatchedRootBranchSimulator` for exact one-step branch expansion.

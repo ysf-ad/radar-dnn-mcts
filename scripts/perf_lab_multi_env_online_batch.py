@@ -30,6 +30,25 @@ def stats(values: list[float]) -> dict[str, float]:
     }
 
 
+def add_profile_stage(buckets: dict[str, list[float]], name: str, value_ms: float) -> None:
+    buckets.setdefault(name, []).append(float(value_ms))
+
+
+def profile_summary(buckets: dict[str, list[float]]) -> dict[str, dict[str, float]]:
+    return dict(sorted(((name, stats(values)) for name, values in buckets.items()), key=lambda item: item[1]["mean_ms"], reverse=True))
+
+
+def time_stage(device: torch.device, enabled: bool, buckets: dict[str, list[float]], name: str, fn):
+    if not enabled:
+        return fn()
+    sync(device)
+    t0 = time.perf_counter()
+    out = fn()
+    sync(device)
+    add_profile_stage(buckets, name, (time.perf_counter() - t0) * 1000.0)
+    return out
+
+
 def run_serial(planner, envs, args, device: torch.device) -> dict:
     from final_radar_campaign import get_obs
     from strict_window_report import execute_plan_until_budget
@@ -202,6 +221,8 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
     encode_times: list[float] = []
     batch_sizes: list[int] = []
     depth_counts: list[int] = []
+    profile_enabled = bool(getattr(args, "profile_stages", False))
+    stage_buckets: dict[str, list[float]] = {}
     if envs and hasattr(planner, "warmup"):
         planner.warmup(get_obs(envs[0], 0.0), budget_ms=int(args.window_ms))
     sync(device)
@@ -211,19 +232,40 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
         root_env_ids = [i for i, eng in enumerate(envs) if not eng.term_buf[0]]
         if not root_env_ids:
             break
-        obs2 = [attach_env_obs(get_obs(envs[i], search_debt[i]), planner.env_cfg, True, True) for i in root_env_ids]
+        obs2 = time_stage(
+            device,
+            profile_enabled,
+            stage_buckets,
+            "root_obs_attach",
+            lambda: [attach_env_obs(get_obs(envs[i], search_debt[i]), planner.env_cfg, True, True) for i in root_env_ids],
+        )
         selected = [set() for _ in root_env_ids]
         elapsed = [0.0 for _ in root_env_ids]
         search_count = [0 for _ in root_env_ids]
         track_count = [0 for _ in root_env_ids]
         last = [-1 for _ in root_env_ids]
-        root_tokens = tokenize_batch(adapt, obs2, selected=selected, search_count=search_count)
+        root_tokens = time_stage(
+            device,
+            profile_enabled,
+            stage_buckets,
+            "root_tokenize_batch",
+            lambda: tokenize_batch(adapt, obs2, selected=selected, search_count=search_count),
+        )
         sync(device)
         t0 = time.perf_counter()
-        with torch.inference_mode():
-            root_x = torch.from_numpy(root_tokens).to(device, dtype=torch.float32)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
-                cls_out, tok_out, selected_t_all, token_active = planner.model.backbone.encode_tokens(root_x)
+        def encode_root():
+            with torch.inference_mode():
+                root_x = torch.from_numpy(root_tokens).to(device, dtype=torch.float32)
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
+                    return planner.model.backbone.encode_tokens(root_x)
+
+        cls_out, tok_out, selected_t_all, token_active = time_stage(
+            device,
+            profile_enabled,
+            stage_buckets,
+            "root_h2d_encode",
+            encode_root,
+        )
         sync(device)
         encode_times.append((time.perf_counter() - t0) * 1000.0)
         live_pos = list(range(len(root_env_ids)))
@@ -231,68 +273,110 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
         while live_pos and depth < int(args.max_depth):
             live_obs = [obs2[p] for p in live_pos]
             live_selected = [selected[p] for p in live_pos]
-            slots = slot_features_batch(
-                live_obs,
-                elapsed=[elapsed[p] for p in live_pos],
-                search_count=[search_count[p] for p in live_pos],
-                track_count=[track_count[p] for p in live_pos],
-                last_action=[last[p] for p in live_pos],
-                budget_ms=float(args.window_ms),
+            slots = time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "slot_features_batch",
+                lambda: slot_features_batch(
+                    live_obs,
+                    elapsed=[elapsed[p] for p in live_pos],
+                    search_count=[search_count[p] for p in live_pos],
+                    track_count=[track_count[p] for p in live_pos],
+                    last_action=[last[p] for p in live_pos],
+                    budget_ms=float(args.window_ms),
+                ),
             )
-            physical = physical_action_table_batch(live_obs, selected=live_selected, max_trackers=MAXT)
+            physical = time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "physical_action_table_batch",
+                lambda: physical_action_table_batch(live_obs, selected=live_selected, max_trackers=MAXT),
+            )
             sync(device)
             t0 = time.perf_counter()
             with torch.inference_mode():
-                pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
-                slot_t = torch.from_numpy(slots).to(device, dtype=torch.float32)
-                selected_t = selected_t_all.index_select(0, pos_t)
-                cls_live = cls_out.index_select(0, pos_t)
-                tok_live = tok_out.index_select(0, pos_t)
-                active_live = token_active.index_select(0, pos_t)
-                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
-                    score_t = planner.score_slots_from_encoded(cls_live, tok_live, selected_t, active_live, slot_t).float()
-                score_t[:, 0, :] += planner.search_score_bias
-                actions_t = torch.as_tensor(physical.actions, device=device, dtype=torch.long)
-                flat_t = torch.as_tensor(physical.bases * 2 + physical.sensors, device=device, dtype=torch.long)
-                valid_t = torch.as_tensor(physical.valid, device=device, dtype=torch.bool)
-                candidate_scores = torch.gather(score_t.reshape(len(live_pos), -1), 1, flat_t)
-                candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
-                idx = torch.argmax(candidate_scores, dim=1)
-                best = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
-                has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
-                best = torch.where(has_valid, best, torch.full_like(best, -1))
-                actions = best.cpu().numpy().astype(np.int64, copy=False)
+                def prep_tensors():
+                    pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
+                    slot_t = torch.from_numpy(slots).to(device, dtype=torch.float32)
+                    selected_t = selected_t_all.index_select(0, pos_t)
+                    cls_live = cls_out.index_select(0, pos_t)
+                    tok_live = tok_out.index_select(0, pos_t)
+                    active_live = token_active.index_select(0, pos_t)
+                    actions_t = torch.as_tensor(physical.actions, device=device, dtype=torch.long)
+                    flat_t = torch.as_tensor(physical.bases * 2 + physical.sensors, device=device, dtype=torch.long)
+                    valid_t = torch.as_tensor(physical.valid, device=device, dtype=torch.bool)
+                    return slot_t, selected_t, cls_live, tok_live, active_live, actions_t, flat_t, valid_t
+
+                slot_t, selected_t, cls_live, tok_live, active_live, actions_t, flat_t, valid_t = time_stage(
+                    device,
+                    profile_enabled,
+                    stage_buckets,
+                    "decision_tensor_prep_h2d",
+                    prep_tensors,
+                )
+
+                def score_forward():
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
+                        score = planner.score_slots_from_encoded(cls_live, tok_live, selected_t, active_live, slot_t).float()
+                    score[:, 0, :] += planner.search_score_bias
+                    return score
+
+                score_t = time_stage(device, profile_enabled, stage_buckets, "decision_score_forward", score_forward)
+
+                def select_actions():
+                    candidate_scores = torch.gather(score_t.reshape(len(live_pos), -1), 1, flat_t)
+                    candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
+                    idx = torch.argmax(candidate_scores, dim=1)
+                    best = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
+                    has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
+                    return torch.where(has_valid, best, torch.full_like(best, -1))
+
+                best = time_stage(device, profile_enabled, stage_buckets, "decision_select_device", select_actions)
+                actions = time_stage(
+                    device,
+                    profile_enabled,
+                    stage_buckets,
+                    "decision_action_d2h",
+                    lambda: best.cpu().numpy().astype(np.int64, copy=False),
+                )
             sync(device)
             plan_round_times.append((time.perf_counter() - t0) * 1000.0)
             batch_sizes.append(len(live_pos))
             next_live: list[int] = []
-            for local_idx, pos in enumerate(live_pos):
-                env_idx = root_env_ids[pos]
-                eng = envs[env_idx]
-                if eng.term_buf[0] or elapsed[pos] >= float(args.window_ms):
-                    continue
-                remaining = max(0.0, float(args.window_ms) - float(elapsed[pos]))
-                reward, dt, executed_action = execute_first_valid_action(eng, [int(actions[local_idx])], remaining)
-                if executed_action is None or dt <= 0.0:
-                    continue
-                logical_action, _sensor = decode_sensor_action(int(executed_action), eng.max_trackers)
-                base, _ = xs_decode_action(int(executed_action), MAXT)
-                if int(logical_action) == 0:
-                    search_debt[env_idx] = 0.0
-                    search_count[pos] += 1
-                else:
-                    search_debt[env_idx] += max(float(dt), 0.0)
-                    if int(base) > 0:
-                        selected[pos].add(int(base))
-                        if 0 <= int(base) < selected_t_all.shape[1]:
-                            selected_t_all[pos, int(base)] = True
-                    track_count[pos] += 1
-                rewards[env_idx] += float(reward)
-                elapsed[pos] += float(dt)
-                executed[env_idx] += 1
-                last[pos] = int(base)
-                if not eng.term_buf[0] and elapsed[pos] < float(args.window_ms):
-                    next_live.append(pos)
+            def step_envs():
+                next_ids: list[int] = []
+                for local_idx, pos in enumerate(live_pos):
+                    env_idx = root_env_ids[pos]
+                    eng = envs[env_idx]
+                    if eng.term_buf[0] or elapsed[pos] >= float(args.window_ms):
+                        continue
+                    remaining = max(0.0, float(args.window_ms) - float(elapsed[pos]))
+                    reward, dt, executed_action = execute_first_valid_action(eng, [int(actions[local_idx])], remaining)
+                    if executed_action is None or dt <= 0.0:
+                        continue
+                    logical_action, _sensor = decode_sensor_action(int(executed_action), eng.max_trackers)
+                    base, _ = xs_decode_action(int(executed_action), MAXT)
+                    if int(logical_action) == 0:
+                        search_debt[env_idx] = 0.0
+                        search_count[pos] += 1
+                    else:
+                        search_debt[env_idx] += max(float(dt), 0.0)
+                        if int(base) > 0:
+                            selected[pos].add(int(base))
+                            if 0 <= int(base) < selected_t_all.shape[1]:
+                                selected_t_all[pos, int(base)] = True
+                        track_count[pos] += 1
+                    rewards[env_idx] += float(reward)
+                    elapsed[pos] += float(dt)
+                    executed[env_idx] += 1
+                    last[pos] = int(base)
+                    if not eng.term_buf[0] and elapsed[pos] < float(args.window_ms):
+                        next_ids.append(pos)
+                return next_ids
+
+            next_live = time_stage(device, profile_enabled, stage_buckets, "env_step_batch", step_envs)
             live_pos = next_live
             depth += 1
         depth_counts.append(depth)
@@ -315,6 +399,7 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
         "planning_ms_per_env_action": float(sum(plan_round_times) / max(1, sum(batch_sizes))),
         "total_reward": float(sum(rewards)),
         "executed_actions": int(sum(executed)),
+        "stage_profile": profile_summary(stage_buckets) if profile_enabled else {},
     }
 
 
@@ -542,6 +627,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=916)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--skip-graph", action="store_true")
+    parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("results/perf_lab_multi_env_online_batch.json"))
     args = parser.parse_args()
 
