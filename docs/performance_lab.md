@@ -1778,11 +1778,43 @@ Clean 64-env throughput improved from about `305 env-windows/s` to
 delta versus serial execution. The remaining large stages are now simulator
 stepping, root tokenization, and policy/Q score forward.
 
+### Root Tokenizer Fast Path
+
+The cached-root benchmark only tokenizes root windows: no targets are selected
+yet and root `search_count` is zero. `perf_lab_multi_env_online_batch.py` now
+uses a root-only tokenizer for this path. It preserves the same root tensor as
+the general tokenizer, including the root-token normalization and optional grid
+feature override.
+
+Validation check on an 8-env batch:
+
+```text
+tokenize_batch shape:          (8, 101, 13)
+tokenize_root_batch_fast shape:(8, 101, 13)
+max_abs_diff:                  0.0
+allclose:                      True
+```
+
+Corrected 64-env profile:
+
+```text
+root_tokenize_batch: 2.89 ms/window batch
+clean cached throughput: 366.86 env-windows/s
+reward delta vs serial:  0.0
+```
+
+The improvement is smaller than the slot-template change because most tokenizer
+time is real array work: stacking target arrays, computing sector urgency from
+the grid, and filling the token tensor. The next tokenization speedup should
+therefore come from a broader packed observation representation rather than more
+root-only branches.
+
 ## Next Work
 
 - Promote cached-root multi-environment batching from benchmark script to a reusable evaluator/training data path.
 - Revisit fixed-shape CUDA Graph replay only if graph capture can be amortized across repeated prepared root batches.
 - Vectorize `env_step_batch`, root observation attachment, and token/slot feature construction for multi-env runs.
+- Replace list-of-dict observations with a packed batched observation structure for multi-env runs.
 - Expand `DenseRootSearchState` beyond the root into full batched tree tensors.
 - Replace Python node objects with dense tree tensors.
 - Use `BatchedRootBranchSimulator` for exact one-step branch expansion.

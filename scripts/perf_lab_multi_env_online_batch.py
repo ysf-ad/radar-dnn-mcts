@@ -64,6 +64,145 @@ def make_live_slots(slot_template: np.ndarray, live_pos: list[int], elapsed, sea
     return slots
 
 
+def tokenize_root_batch_fast(adapt, observations, max_trackers: int, token_dim: int) -> np.ndarray:
+    """Root-only tokenizer for cached multi-env windows.
+
+    Equivalent to ``tokenize_batch(adapt, observations)`` for the root call
+    where no targets are selected and search_count is zero, but avoids selected
+    set construction and a few optional per-row branches in the hot benchmark.
+    """
+    n = len(observations)
+    x = np.zeros((n, int(max_trackers) + 1, int(token_dim)), dtype=np.float32)
+    if n <= 0:
+        return x
+
+    t_desired = np.stack([np.asarray(obs["t_desired"], dtype=np.float32)[:max_trackers] for obs in observations], axis=0)
+    deadline = np.stack([np.asarray(obs["t_deadline"], dtype=np.float32)[:max_trackers] for obs in observations], axis=0)
+    dwell = np.stack([np.asarray(obs["t_dwell"], dtype=np.float32)[:max_trackers] for obs in observations], axis=0)
+    active = np.stack([np.asarray(obs["active_mask"], dtype=bool)[:max_trackers] for obs in observations], axis=0)
+    tracked = np.stack(
+        [
+            np.asarray(obs.get("tracked_mask", np.asarray(obs["active_mask"], dtype=bool) & (np.asarray(obs["t_deadline"]) > 0)), dtype=bool)[
+                :max_trackers
+            ]
+            for obs in observations
+        ],
+        axis=0,
+    )
+    priority = np.stack(
+        [np.asarray(obs.get("priority", np.zeros(max_trackers, dtype=np.float32)), dtype=np.float32)[:max_trackers] for obs in observations],
+        axis=0,
+    )
+    ranges = np.stack(
+        [np.asarray(obs.get("target_range", np.zeros(max_trackers, dtype=np.float32)), dtype=np.float32)[:max_trackers] for obs in observations],
+        axis=0,
+    )
+    grids = [np.asarray(obs.get("grid", np.zeros((300,), dtype=np.float32)), dtype=np.float32) for obs in observations]
+    grid_min = np.asarray([float(np.min(grid)) for grid in grids], dtype=np.float32)
+    search_debt_ms = np.asarray([float(obs.get("search_debt_ms", 0.0)) for obs in observations], dtype=np.float32)
+    pure = adapt.pure_mcts
+    if float(pure.search_debt_penalty_weight) <= 0.0:
+        search_penalty_norm = np.zeros((n,), dtype=np.float32)
+    elif int(pure.search_delay_mode) == 0:
+        search_penalty_norm = (float(pure.search_debt_penalty_weight) * search_debt_ms).astype(np.float32)
+    else:
+        arg = np.minimum(search_debt_ms / max(1e-3, float(pure.search_debt_tau_ms)), 20.0)
+        search_penalty_norm = (float(pure.search_debt_penalty_weight) * (np.exp(arg) - 1.0)).astype(np.float32)
+    if float(pure.search_delay_penalty_cap) >= 0.0:
+        search_penalty_norm = np.minimum(search_penalty_norm, float(pure.search_delay_penalty_cap))
+    search_penalty_norm = np.clip(np.where(search_debt_ms > 0.0, search_penalty_norm, 0.0), 0.0, 10.0).astype(np.float32)
+
+    tracked_active = active & tracked
+    tracked_n = np.sum(tracked_active, axis=1).astype(np.float32)
+    tracked_delays = np.maximum(0.0, -t_desired) * tracked_active.astype(np.float32)
+    tracked_delay_sum = np.sum(tracked_delays, axis=1)
+    mean_tracked_delay_norm = np.divide(
+        tracked_delay_sum,
+        np.maximum(tracked_n, 1.0),
+        out=np.zeros_like(tracked_delay_sum),
+        where=tracked_n > 0,
+    )
+    mean_tracked_delay_norm = np.clip(mean_tracked_delay_norm / 2000.0, 0.0, 10.0)
+    overdue_count = np.sum((t_desired < 0.0) & tracked_active, axis=1).astype(np.float32)
+    overdue_frac = np.divide(overdue_count, np.maximum(tracked_n, 1.0), out=np.zeros_like(overdue_count), where=tracked_n > 0)
+    global_tardiness_norm = np.clip(tracked_delay_sum / 20000.0, 0.0, 10.0)
+    deadline_pressure = np.maximum(0.0, 100.0 - deadline) * tracked_active.astype(np.float32)
+    global_deadline_pressure_norm = np.clip(np.sum(deadline_pressure, axis=1) / 2000.0, 0.0, 10.0)
+    global_penalty_norm = np.clip(
+        0.001
+        * (
+            float(pure.global_tardiness_weight) * global_tardiness_norm
+            + float(pure.local_tardiness_weight) * mean_tracked_delay_norm
+        ),
+        0.0,
+        10.0,
+    )
+
+    x[:, 0, :8] = np.stack(
+        [
+            tracked_n / max(1, int(adapt.max_trackers)),
+            grid_min,
+            global_tardiness_norm,
+            mean_tracked_delay_norm,
+            overdue_frac,
+            global_deadline_pressure_norm,
+            search_penalty_norm,
+            global_penalty_norm,
+        ],
+        axis=1,
+    )
+    x[:, 0, 0] = np.clip(x[:, 0, 0] / 3000.0, -2.0, 2.0)
+    x[:, 0, 1] = np.clip(x[:, 0, 1] / 3000.0, -2.0, 2.0)
+    x[:, 0, 2] = np.clip(x[:, 0, 2] / 100.0, 0.0, 2.0)
+    x[:, 0, 5] = np.clip(x[:, 0, 5] / 3000.0, -2.0, 2.0)
+
+    az_bin = np.stack([np.asarray(obs.get("az_bin", np.zeros(max_trackers, dtype=np.float32)), dtype=np.float32)[:max_trackers] for obs in observations], axis=0)
+    el_bin = np.stack([np.asarray(obs.get("el_bin", np.zeros(max_trackers, dtype=np.float32)), dtype=np.float32)[:max_trackers] for obs in observations], axis=0)
+    sector_idx = np.clip(np.round(el_bin * 9.0).astype(np.int32) * 30 + np.round(az_bin * 29.0).astype(np.int32), 0, 299)
+    sector_urgency = np.zeros((n, max_trackers), dtype=np.float32)
+    for i, grid in enumerate(grids):
+        if len(grid) > 0:
+            sector_urgency[i] = grid[np.clip(sector_idx[i], 0, len(grid) - 1)].astype(np.float32)
+
+    target_tardiness = np.maximum(0.0, -t_desired).astype(np.float32)
+    local_penalty_norm = np.clip(
+        0.001 * target_tardiness * (1.0 + 2.0 * priority) * float(pure.local_tardiness_weight),
+        0.0,
+        10.0,
+    ).astype(np.float32)
+    x[:, 1 : max_trackers + 1, 0] = np.clip(t_desired / 3000.0, -2.0, 2.0)
+    x[:, 1 : max_trackers + 1, 1] = np.clip(deadline / 3000.0, -2.0, 2.0)
+    x[:, 1 : max_trackers + 1, 2] = np.clip(dwell / 100.0, 0.0, 2.0)
+    x[:, 1 : max_trackers + 1, 3] = priority
+    x[:, 1 : max_trackers + 1, 4] = (active & tracked).astype(np.float32)
+    x[:, 1 : max_trackers + 1, 5] = np.clip(sector_urgency / 3000.0, -2.0, 2.0)
+    x[:, 1 : max_trackers + 1, 6] = local_penalty_norm
+    x[:, 1 : max_trackers + 1, 7] = (global_penalty_norm + search_penalty_norm)[:, None]
+    range_norm = np.clip(ranges / 184_000_000.0, 0.0, 1.5)
+    x[:, 1 : max_trackers + 1, 9] = range_norm
+    x[:, 1 : max_trackers + 1, 10] = ((ranges > 10_000_000.0) & (ranges < 184_000_000.0)).astype(np.float32)
+    x[:, 1 : max_trackers + 1, 11] = ((ranges > 5_000_000.0) & (ranges < 100_000_000.0)).astype(np.float32)
+    x[:, :, 12] = np.asarray([float(obs.get("sensor_id", 0.0)) for obs in observations], dtype=np.float32)[:, None]
+    x[:, 0, 9] = np.clip(np.asarray([float(obs.get("s_band_busy_ms", 0.0)) for obs in observations], dtype=np.float32) / 200.0, 0.0, 5.0)
+    x[:, 0, 10] = np.clip(np.asarray([float(obs.get("x_band_busy_ms", 0.0)) for obs in observations], dtype=np.float32) / 200.0, 0.0, 5.0)
+    x[:, 0, 11] = np.asarray([float(obs.get("enable_x_band", 0.0)) for obs in observations], dtype=np.float32)
+    for i, obs in enumerate(observations):
+        if float(obs.get("use_grid_feature", 0.0)) > 0.5:
+            grid = grids[i]
+            if grid.size == 0:
+                mean_overdue, drop_frac, max_age = 0.0, 0.0, 0.0
+            else:
+                age = 3000.0 - grid
+                overdue = np.maximum(0.0, age - 3000.0) / 3000.0
+                mean_overdue = float(np.clip(float(np.mean(overdue)), 0.0, 5.0))
+                drop_frac = float(np.clip(float(np.mean(age > 4500.0)), 0.0, 1.0))
+                max_age = float(np.clip(float(np.max(age) / 4500.0), 0.0, 5.0))
+            x[i, 0, 9] = mean_overdue
+            x[i, 0, 10] = drop_frac
+            x[i, 0, 11] = max_age
+    return x
+
+
 def run_serial(planner, envs, args, device: torch.device) -> dict:
     from final_radar_campaign import get_obs
     from strict_window_report import execute_plan_until_budget
@@ -222,7 +361,7 @@ def run_batched(scorer, envs, args, device: torch.device) -> dict:
 def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
     from exact_env_mutual import attach_env_obs, xs_decode_action
     from final_radar_campaign import get_obs
-    from mutual_features import slot_features_batch, tokenize_batch
+    from mutual_features import TOKEN_DIM, slot_features_batch
     from perf_fast_planner import physical_action_table_batch
     from realistic_reward_retrain import adapter
     from repaired_campaign_tools import decode_sensor_action, execute_first_valid_action
@@ -278,7 +417,7 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
             profile_enabled,
             stage_buckets,
             "root_tokenize_batch",
-            lambda: tokenize_batch(adapt, obs2),
+            lambda: tokenize_root_batch_fast(adapt, obs2, MAXT, TOKEN_DIM),
         )
         sync(device)
         t0 = time.perf_counter()
@@ -466,7 +605,7 @@ def _build_score_graph(planner, cls_out, tok_out, selected_t, token_active, slot
 def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     from exact_env_mutual import attach_env_obs, xs_decode_action
     from final_radar_campaign import get_obs
-    from mutual_features import slot_features_batch, tokenize_batch
+    from mutual_features import TOKEN_DIM, slot_features_batch
     from perf_fast_planner import physical_action_table_batch
     from realistic_reward_retrain import adapter
     from repaired_campaign_tools import decode_sensor_action, execute_first_valid_action
@@ -506,7 +645,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
             last_action=last,
             budget_ms=float(args.window_ms),
         )
-        root_tokens = tokenize_batch(adapt, obs2)
+        root_tokens = tokenize_root_batch_fast(adapt, obs2, MAXT, TOKEN_DIM)
         sync(device)
         t0 = time.perf_counter()
         with torch.inference_mode():
