@@ -48,6 +48,14 @@ class BatchedRootActionTables:
     counts: np.ndarray
 
 
+@dataclass
+class BatchedPhysicalActionTable:
+    actions: np.ndarray
+    bases: np.ndarray
+    sensors: np.ndarray
+    valid: np.ndarray
+
+
 def physical_action_arrays(obs: dict, selected: Iterable[int] | None = None, max_trackers: int = MAXT):
     """Return candidate action ids and score-table indices as NumPy arrays.
 
@@ -98,6 +106,89 @@ def physical_action_arrays(obs: dict, selected: Iterable[int] | None = None, max
         np.asarray(base_ids, dtype=np.int64),
         np.asarray(sensor_ids, dtype=np.int64),
     )
+
+
+def physical_action_table_batch(
+    observations: list[dict],
+    selected: list[Iterable[int]] | None = None,
+    max_trackers: int = MAXT,
+) -> BatchedPhysicalActionTable:
+    """Build dense valid physical action tables for many observations.
+
+    Candidate order matches `physical_action_arrays`: S search, optional X
+    search, S tracks by earliest deadline, then X tracks by earliest deadline.
+    The table is dense and validity-masked so callers can gather model scores
+    without rebuilding per-root Python action lists.
+    """
+    n = len(observations)
+    width = 2 + 2 * int(max_trackers)
+    actions = np.full((n, width), -1, dtype=np.int64)
+    bases = np.zeros((n, width), dtype=np.int64)
+    sensors = np.zeros((n, width), dtype=np.int64)
+    valid = np.zeros((n, width), dtype=bool)
+    if n <= 0:
+        return BatchedPhysicalActionTable(actions=actions, bases=bases, sensors=sensors, valid=valid)
+
+    active = np.stack([np.asarray(obs["active_mask"], dtype=bool)[:max_trackers] for obs in observations], axis=0)
+    deadline = np.stack([np.asarray(obs["t_deadline"], dtype=np.float32)[:max_trackers] for obs in observations], axis=0)
+    ranges = np.stack(
+        [
+            np.asarray(obs.get("target_range", np.zeros(max_trackers, dtype=np.float32)), dtype=np.float32)[:max_trackers]
+            for obs in observations
+        ],
+        axis=0,
+    )
+    selected_mask = np.zeros((n, max_trackers), dtype=bool)
+    if selected is not None:
+        for row, selected_row in enumerate(selected):
+            for base in selected_row:
+                idx = int(base) - 1
+                if 0 <= idx < max_trackers:
+                    selected_mask[row, idx] = True
+
+    s_free = np.asarray([float(obs.get("s_band_busy_ms", 0.0)) <= 0.0 for obs in observations], dtype=bool)
+    x_free = np.asarray(
+        [
+            bool(int(obs.get("enable_x_band", 0))) and float(obs.get("x_band_busy_ms", 0.0)) <= 0.0
+            for obs in observations
+        ],
+        dtype=bool,
+    )
+    valid_target = active & np.isfinite(deadline) & (deadline >= 0.0) & ~selected_mask
+    sort_key = np.where(valid_target, deadline, np.inf)
+    target_order = np.argsort(sort_key, axis=1, kind="stable")
+    row_idx = np.arange(n)[:, None]
+    ordered_ranges = ranges[row_idx, target_order]
+    ordered_valid = valid_target[row_idx, target_order]
+    ordered_bases = target_order + 1
+
+    s_search = xs_s_search_action(max_trackers)
+    x_search = xs_x_search_action(max_trackers)
+    s_track_by_target = np.asarray([xs_s_track_action(i + 1, max_trackers) for i in range(max_trackers)], dtype=np.int64)
+    x_track_by_target = np.asarray([xs_x_track_action(i + 1, max_trackers) for i in range(max_trackers)], dtype=np.int64)
+
+    actions[:, 0] = s_search
+    bases[:, 0] = 0
+    sensors[:, 0] = 0
+    valid[:, 0] = True
+
+    actions[:, 1] = x_search
+    bases[:, 1] = 0
+    sensors[:, 1] = 1
+    valid[:, 1] = x_free
+
+    s_cols = slice(2, 2 + max_trackers)
+    x_cols = slice(2 + max_trackers, 2 + 2 * max_trackers)
+    actions[:, s_cols] = s_track_by_target[target_order]
+    bases[:, s_cols] = ordered_bases
+    sensors[:, s_cols] = 0
+    valid[:, s_cols] = ordered_valid & s_free[:, None] & (ordered_ranges > 10_000_000.0) & (ordered_ranges < 184_000_000.0)
+
+    actions[:, x_cols] = x_track_by_target[target_order]
+    bases[:, x_cols] = ordered_bases
+    sensors[:, x_cols] = 1
+    valid[:, x_cols] = ordered_valid & x_free[:, None] & (ordered_ranges > 5_000_000.0) & (ordered_ranges < 100_000_000.0)
+    return BatchedPhysicalActionTable(actions=actions, bases=bases, sensors=sensors, valid=valid)
 
 
 def select_best_action(score: np.ndarray, obs: dict, selected: Iterable[int] | None = None, max_trackers: int = MAXT) -> int | None:
@@ -311,7 +402,7 @@ class BatchedActionAttentionScorer:
         self.use_amp = bool(use_amp and dev.type == "cuda")
         self.adapt = adapter()
 
-    def score_batch(
+    def _score_dense(
         self,
         observations: list[dict],
         selected: list[Iterable[int]] | None = None,
@@ -320,7 +411,7 @@ class BatchedActionAttentionScorer:
         track_count: Iterable[int] | None = None,
         last: Iterable[int] | None = None,
         budget_ms: float = 200.0,
-    ) -> BatchedScoreResult:
+    ) -> tuple[np.ndarray, list[dict], list[set[int]]]:
         n = len(observations)
         selected = [set() for _ in range(n)] if selected is None else [set(x) for x in selected]
         elapsed = [0.0] * n if elapsed is None else list(elapsed)
@@ -357,9 +448,31 @@ class BatchedActionAttentionScorer:
                 scores, q = self.model.forward_scores(x, s)
             score = (self.policy_weight * scores + self.q_weight * q).float().cpu().numpy()
         score[:, 0, :] += self.search_score_bias
+        return np.asarray(score, dtype=np.float32), obs2, selected
+
+    def score_batch(
+        self,
+        observations: list[dict],
+        selected: list[Iterable[int]] | None = None,
+        elapsed: Iterable[float] | None = None,
+        search_count: Iterable[int] | None = None,
+        track_count: Iterable[int] | None = None,
+        last: Iterable[int] | None = None,
+        budget_ms: float = 200.0,
+    ) -> BatchedScoreResult:
+        score, obs2, selected = self._score_dense(
+            observations,
+            selected=selected,
+            elapsed=elapsed,
+            search_count=search_count,
+            track_count=track_count,
+            last=last,
+            budget_ms=budget_ms,
+        )
+        n = len(observations)
         action_arrays = [physical_action_arrays(obs2[i], selected=selected[i], max_trackers=MAXT) for i in range(n)]
         return BatchedScoreResult(
-            scores=np.asarray(score, dtype=np.float32),
+            scores=score,
             actions=[a[0] for a in action_arrays],
             bases=[a[1] for a in action_arrays],
             sensors=[a[2] for a in action_arrays],
@@ -459,3 +572,57 @@ class BatchedActionAttentionScorer:
             valid=valid,
             counts=counts,
         )
+
+    def all_root_action_tables_vectorized(
+        self,
+        observations: list[dict],
+        max_actions: int | None = None,
+        **kwargs,
+    ) -> BatchedRootActionTables:
+        """Return sorted valid root action tables using batched physical masks."""
+        score, obs2, selected = self._score_dense(observations, **kwargs)
+        physical = physical_action_table_batch(obs2, selected=selected, max_trackers=MAXT)
+        n = len(observations)
+        if n <= 0:
+            width = 0 if max_actions is None else int(max_actions)
+            return BatchedRootActionTables(
+                actions=np.full((0, width), -1, dtype=np.int64),
+                scores=np.full((0, width), -np.inf, dtype=np.float32),
+                bases=np.full((0, width), -1, dtype=np.int64),
+                sensors=np.full((0, width), -1, dtype=np.int64),
+                valid=np.zeros((0, width), dtype=bool),
+                counts=np.zeros((0,), dtype=np.int32),
+            )
+
+        row_ids = np.arange(n)[:, None]
+        candidate_scores = score[row_ids, physical.bases, physical.sensors]
+        candidate_scores = np.where(physical.valid & np.isfinite(candidate_scores), candidate_scores, -np.inf).astype(np.float32)
+        finite = np.isfinite(candidate_scores)
+        counts = finite.sum(axis=1).astype(np.int32)
+        width = int(counts.max(initial=0))
+        if max_actions is not None:
+            width = min(width, int(max_actions))
+
+        actions = np.full((n, width), -1, dtype=np.int64)
+        scores = np.full((n, width), -np.inf, dtype=np.float32)
+        bases = np.full((n, width), -1, dtype=np.int64)
+        sensors = np.full((n, width), -1, dtype=np.int64)
+        valid = np.zeros((n, width), dtype=bool)
+        for i in range(n):
+            row_finite = finite[i]
+            row_count = int(row_finite.sum())
+            if row_count <= 0 or width <= 0:
+                continue
+            row_actions = physical.actions[i, row_finite]
+            row_bases = physical.bases[i, row_finite]
+            row_sensors = physical.sensors[i, row_finite]
+            row_scores = candidate_scores[i, row_finite]
+            order = np.argsort(-row_scores)
+            take = min(width, row_count)
+            chosen = order[:take]
+            actions[i, :take] = row_actions[chosen]
+            scores[i, :take] = row_scores[chosen]
+            bases[i, :take] = row_bases[chosen]
+            sensors[i, :take] = row_sensors[chosen]
+            valid[i, :take] = True
+        return BatchedRootActionTables(actions=actions, scores=scores, bases=bases, sensors=sensors, valid=valid, counts=counts)

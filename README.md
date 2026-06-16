@@ -110,6 +110,7 @@ python scripts\perf_lab_action_attention.py --device cuda --forward-batches 1,8,
 python scripts\profile_action_attention_steps.py --device cuda
 python scripts\perf_lab_batched_roots.py --device cuda --batch-sizes 1,8,32,128
 python scripts\perf_lab_batched_root_tables.py --device cuda --batch-sizes 1,8,32,128
+python scripts\profile_root_table_steps.py --device cuda --batch-size 32
 python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
 python scripts\perf_lab_multi_root_branch_sim.py --root-counts 1,4,8,16,32 --branches-per-root 8
 python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast

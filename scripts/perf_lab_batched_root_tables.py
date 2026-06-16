@@ -91,17 +91,28 @@ def main() -> None:
         obs_batch = observations[: int(batch_size)]
         ref_tables = [scorer.all_root_action_tables([obs]) for obs in obs_batch]
         batch_ref = scorer.all_root_action_tables(obs_batch)
+        batch_vec = scorer.all_root_action_tables_vectorized(obs_batch)
         actions_match = True
         scores_match = True
+        vectorized_actions_match = True
+        vectorized_scores_match = True
+        vectorized_counts_match = np.array_equal(batch_ref.counts, batch_vec.counts)
         counts = []
         for row, table in enumerate(ref_tables):
             count = int(table.counts[0])
             counts.append(count)
             actions_match = actions_match and np.array_equal(table.actions[0, :count], batch_ref.actions[row, :count])
             scores_match = scores_match and np.allclose(table.scores[0, :count], batch_ref.scores[row, :count], atol=1e-5)
+            vectorized_actions_match = vectorized_actions_match and np.array_equal(
+                batch_ref.actions[row, :count], batch_vec.actions[row, :count]
+            )
+            vectorized_scores_match = vectorized_scores_match and np.allclose(
+                batch_ref.scores[row, :count], batch_vec.scores[row, :count], atol=1e-5
+            )
 
         loop_times = []
         batch_times = []
+        vectorized_times = []
         for i in range(int(args.warmup) + int(args.iters)):
             sync(device)
             t0 = time.perf_counter()
@@ -116,23 +127,38 @@ def main() -> None:
             sync(device)
             batch_ms = (time.perf_counter() - t1) * 1000.0
 
+            sync(device)
+            t2 = time.perf_counter()
+            _ = scorer.all_root_action_tables_vectorized(obs_batch)
+            sync(device)
+            vectorized_ms = (time.perf_counter() - t2) * 1000.0
+
             if i >= int(args.warmup):
                 loop_times.append(loop_ms)
                 batch_times.append(batch_ms)
+                vectorized_times.append(vectorized_ms)
 
         loop_stat = stats(loop_times)
         batch_stat = stats(batch_times)
+        vectorized_stat = stats(vectorized_times)
         report["batch_sizes"].append(
             {
                 "batch": int(batch_size),
                 "actions_match": bool(actions_match),
                 "scores_match": bool(scores_match),
+                "vectorized_actions_match": bool(vectorized_actions_match),
+                "vectorized_scores_match": bool(vectorized_scores_match),
+                "vectorized_counts_match": bool(vectorized_counts_match),
                 "mean_action_count": float(np.mean(counts)) if counts else 0.0,
                 "sequential_root_tables": loop_stat,
                 "batched_root_tables": batch_stat,
+                "vectorized_batched_root_tables": vectorized_stat,
                 "speedup_mean": float(loop_stat["mean_ms"] / max(batch_stat["mean_ms"], 1e-12)),
+                "vectorized_speedup_vs_sequential_mean": float(loop_stat["mean_ms"] / max(vectorized_stat["mean_ms"], 1e-12)),
+                "vectorized_speedup_vs_batched_mean": float(batch_stat["mean_ms"] / max(vectorized_stat["mean_ms"], 1e-12)),
                 "root_tables_per_second_sequential": float(batch_size / max(loop_stat["mean_ms"], 1e-12) * 1000.0),
                 "root_tables_per_second_batched": float(batch_size / max(batch_stat["mean_ms"], 1e-12) * 1000.0),
+                "root_tables_per_second_vectorized": float(batch_size / max(vectorized_stat["mean_ms"], 1e-12) * 1000.0),
             }
         )
 

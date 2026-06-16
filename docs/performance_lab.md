@@ -10,6 +10,7 @@ python scripts\perf_lab_action_attention.py --device cuda --forward-batches 1,8,
 python scripts\profile_action_attention_steps.py --device cuda
 python scripts\perf_lab_batched_roots.py --device cuda --batch-sizes 1,8,32,128
 python scripts\perf_lab_batched_root_tables.py --device cuda --batch-sizes 1,8,32,128
+python scripts\profile_root_table_steps.py --device cuda --batch-size 32
 python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
 python scripts\perf_lab_multi_root_branch_sim.py --root-counts 1,4,8,16,32 --branches-per-root 8
 python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast
@@ -104,6 +105,43 @@ The batched fp32 tables matched the per-root action order and scores in the
 benchmark. AMP was slower and changed some action rankings, so root action table
 construction should stay fp32 unless a tolerance-aware/ranking-stable mixed
 precision path is added later.
+
+The root-table path now also has a vectorized physical action table builder:
+
+```text
+observations[]
+    -> batched active/deadline/range/free-sensor masks
+    -> dense candidate action table [batch, 2 + 2 * max_targets]
+    -> batched score gather
+    -> per-root sorted valid actions
+```
+
+The vectorized path matched the legacy batched path for action order, scores,
+and counts. Measured CUDA fp32 timings:
+
+```text
+batch=1:    legacy batched ~3.90 ms, vectorized ~3.82 ms, ~1.02x
+batch=8:    legacy batched ~5.72 ms, vectorized ~6.03 ms, ~0.95x
+batch=32:   legacy batched ~12.79 ms, vectorized ~12.24 ms, ~1.04x
+batch=128:  legacy batched ~47.42 ms, vectorized ~44.10 ms, ~1.08x
+```
+
+This is useful but not a major win by itself. A stage profile at batch 32 showed
+where the remaining root-table time goes:
+
+```text
+tokenize_stack:                    ~5.55 ms, ~41.0%
+model_forward_and_cpu_transfer:     ~3.83 ms, ~28.4%
+slot_features_stack:                ~1.81 ms, ~13.4%
+legacy physical action arrays:      ~1.08 ms,  ~8.0%
+vectorized physical action table:   ~0.29 ms,  ~2.2%
+vectorized gather/sort:             ~0.39 ms,  ~2.9%
+host_to_device:                     ~0.25 ms,  ~1.8%
+attach_env_obs:                     ~0.02 ms,  ~0.2%
+```
+
+So the next larger opportunity is to reduce repeated token/slot feature
+construction or cache more state, not to custom-kernel the physical action mask.
 
 ## Current Optimization
 
