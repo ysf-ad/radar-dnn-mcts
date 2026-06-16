@@ -1467,6 +1467,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     graph_select_replay_rounds = 0
     raw_rounds = 0
     padded_graph_rounds = 0
+    padded_full_select_rounds = 0
     batch_env_step_fn = getattr(radar_binding, "vec_step_selected_known_valid_into", None)
     if batch_env_step_fn is None:
         batch_env_step_fn = getattr(radar_binding, "vec_step_selected_validated_into", None)
@@ -1678,13 +1679,19 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                     graph_replay_rounds += 1
                 elif graph_replay is not None and bool(getattr(args, "padded_live_graph", False)):
                     def padded_graph_score_path():
+                        prealloc_full_slot_t.copy_(current_slots_cpu_t, non_blocking=False)
+                        full_score_t = graph_replay(selected_t_all, prealloc_full_slot_t)
+                        if (
+                            bool(getattr(args, "padded_live_full_select", False))
+                            and gpu_action_template is not None
+                            and bool(getattr(args, "gpu_valid_mask", False))
+                        ):
+                            return full_score_t
                         key = tuple(live_pos)
                         pos_t = live_pos_tensor_cache.get(key)
                         if pos_t is None:
                             pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
                             live_pos_tensor_cache[key] = pos_t
-                        prealloc_full_slot_t.copy_(current_slots_cpu_t, non_blocking=False)
-                        full_score_t = graph_replay(selected_t_all, prealloc_full_slot_t)
                         return full_score_t.index_select(0, pos_t)
 
                     score_t = time_stage(device, profile_enabled, stage_buckets, "graph_padded_score_replay", padded_graph_score_path)
@@ -1706,6 +1713,18 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                     score_t[:, 0, :] += planner.search_score_bias
                 if best is None:
                     def action_tensor_prep():
+                        if (
+                            bool(getattr(args, "padded_live_full_select", False))
+                            and gpu_action_template is not None
+                            and bool(getattr(args, "gpu_valid_mask", False))
+                            and len(live_pos) != len(root_env_ids)
+                            and score_t is not None
+                            and int(score_t.shape[0]) == len(root_env_ids)
+                        ):
+                            actions_t, flat_t, gather_t, search_action_t, template_valid_t, valid_t = gpu_action_template
+                            selected_by_action = torch.gather(selected_t_all, 1, gather_t)
+                            valid_t.copy_(template_valid_t & (search_action_t | ~selected_by_action), non_blocking=False)
+                            return actions_t, flat_t, valid_t
                         if gpu_action_template is not None and bool(getattr(args, "gpu_valid_mask", False)) and len(live_pos) == len(root_env_ids):
                             actions_t, flat_t, gather_t, search_action_t, template_valid_t, valid_t = gpu_action_template
                             selected_by_action = torch.gather(selected_t_all, 1, gather_t)
@@ -1745,12 +1764,22 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                     actions_t, flat_t, valid_t = time_stage(device, profile_enabled, stage_buckets, "graph_action_tensor_prep_h2d", action_tensor_prep)
 
                     def select_actions():
-                        candidate_scores = torch.gather(score_t.reshape(len(live_pos), -1), 1, flat_t)
+                        candidate_scores = torch.gather(score_t.reshape(actions_t.shape[0], -1), 1, flat_t)
                         candidate_scores.masked_fill_(~valid_t, -torch.inf)
                         idx = torch.argmax(candidate_scores, dim=1)
-                        return torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
+                        best_all = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
+                        if int(best_all.shape[0]) == len(live_pos):
+                            return best_all
+                        key = tuple(live_pos)
+                        pos_t = live_pos_tensor_cache.get(key)
+                        if pos_t is None:
+                            pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
+                            live_pos_tensor_cache[key] = pos_t
+                        return best_all.index_select(0, pos_t)
 
                     best = time_stage(device, profile_enabled, stage_buckets, "graph_decision_select_device", select_actions)
+                    if int(best.shape[0]) == len(live_pos) and int(score_t.shape[0]) == len(root_env_ids) and len(live_pos) != len(root_env_ids):
+                        padded_full_select_rounds += 1
 
                 def action_d2h():
                     if pinned_action_cpu is not None:
@@ -1865,6 +1894,8 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         "graph_replay_rounds": int(graph_replay_rounds),
         "graph_select_replay_rounds": int(graph_select_replay_rounds),
         "padded_graph_rounds": int(padded_graph_rounds),
+        "padded_live_full_select": bool(getattr(args, "padded_live_full_select", False)),
+        "padded_full_select_rounds": int(padded_full_select_rounds),
         "raw_rounds": int(raw_rounds),
         "batch_env_step_calls": int(batch_env_step_calls),
         "scalar_env_step_calls": int(scalar_env_step_calls),
@@ -1914,6 +1945,7 @@ def main() -> None:
     parser.add_argument("--gpu-action-template", action="store_true", help="Keep cached action IDs and score indices resident on GPU.")
     parser.add_argument("--gpu-valid-mask", action="store_true", help="Derive per-decision action validity from cached GPU bases and selected masks.")
     parser.add_argument("--padded-live-graph", action="store_true", help="Replay the full-batch score graph for partial live batches and gather live rows.")
+    parser.add_argument("--padded-live-full-select", action="store_true", help="For padded live graph rounds, select actions over the full batch on CUDA before gathering live rows.")
     parser.add_argument("--full-select-graph", action="store_true", help="Use a CUDA graph that captures score replay plus action selection for full-live graph rounds.")
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--profile-cuda-events", action="store_true", help="Also record CUDA-event elapsed time for profiled stages.")

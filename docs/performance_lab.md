@@ -2807,6 +2807,23 @@ end-to-end throughput fell to about `702 env-windows/s`. This path may be useful
 for longer steady-state runs or if graph setup is amortized further, but the
 default should keep the cheaper score-only graph for now.
 
+`--padded-live-full-select` tests the same idea for partial-live padded graph
+rounds without capturing a second graph. Since padded replay already scores the
+full batch, this option also runs CUDA action selection over the full batch and
+gathers only the chosen live actions afterward. On a 64-env/10-window A/B run it
+preserved reward/actions and reduced action tensor prep, but the net gain was
+small:
+
+```text
+mode                         ms/env-action   action prep total   select total
+live-row gather/select       0.06997         85.37 ms            80.12 ms
+full-batch padded select     0.06884         69.62 ms            81.71 ms
+```
+
+This confirms that full-batch selection can remove some per-round indexing and
+H2D work, but it is not a clear default yet because selection itself becomes
+heavier and simulator timing noise can dominate the small win.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only
