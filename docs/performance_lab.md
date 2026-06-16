@@ -1285,6 +1285,21 @@ selected actions match: true
 max score difference:   < 2e-7
 ```
 
+For a fixed root observation, only four slot fields vary across prefixes:
+elapsed time, search count, track count, and whether the last action was search.
+The scorer now caches a slot template and overwrites just those columns. This
+removes repeated observation-derived slot work:
+
+```text
+prefixes  full-table path   GPU top-1 path   prepared device graph
+32        ~4.63 ms          ~3.74 ms         ~1.61 ms
+64        ~8.08 ms          ~5.21 ms         ~2.79 ms
+128       ~13.42 ms         ~7.89 ms         ~4.98 ms
+
+selected actions match: true
+max score difference:   < 2e-7
+```
+
 Live beam-planner A/B confirms that distinction. With a dynamic frontier, each
 depth creates a new prefix batch, so graph capture cannot be reused and the
 device-selection setup cost is paid every depth:
@@ -1322,6 +1337,17 @@ beam width 1, full-table top-1:       ~59.35 ms/window
 beam width 1, device top-1:           ~72.29 ms/window
 beam width 8, full-table top-1:       ~59.27 ms/window
 beam width 8, device top-1:           ~78.31 ms/window
+plans match fast planner:             true
+```
+
+After the slot-template optimization, the same live beam case remains fastest on
+the full-table path:
+
+```text
+beam width 1, full-table top-1:       ~60.74 ms/window
+beam width 1, device top-1:           ~73.61 ms/window
+beam width 8, full-table top-1:       ~60.33 ms/window
+beam width 8, device top-1:           ~73.60 ms/window
 plans match fast planner:             true
 ```
 

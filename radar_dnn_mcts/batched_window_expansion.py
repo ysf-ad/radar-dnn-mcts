@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from exact_env_mutual import attach_env_obs, xs_decode_action
-from mutual_features import slot_features_batch, tokenize
+from mutual_features import slot_features, tokenize
 from perf_fast_planner import FastActionAttentionPlanner, physical_action_arrays
 from realistic_reward_retrain import adapter
 from two_sensor_physical_head_eval import MAXT
@@ -81,6 +81,7 @@ class BatchedWindowExpansionScorer:
         self._root_selected_cpu = self.root_selected.squeeze(0).detach().cpu().numpy().astype(bool, copy=True)
         self._root_actions, self._root_bases, self._root_sensors = physical_action_arrays(self.obs, selected=set(), max_trackers=MAXT)
         self._root_width = max(1, int(self._root_actions.size))
+        self._slot_template = slot_features(self.obs, 0.0, 0, 0, -1, self.budget_ms).astype(np.float32, copy=True)
 
     def _selected_masks(self, prefixes: list[BranchPrefix]) -> torch.Tensor:
         rows = int(self._root_selected_cpu.shape[0])
@@ -98,14 +99,17 @@ class BatchedWindowExpansionScorer:
         return torch.as_tensor(masks, device=self.planner.device, dtype=torch.bool)
 
     def _slots(self, prefixes: list[BranchPrefix]) -> torch.Tensor:
-        slots = slot_features_batch(
-            [self.obs] * len(prefixes),
-            elapsed=[float(prefix.elapsed_ms) for prefix in prefixes],
-            search_count=[int(prefix.search_count) for prefix in prefixes],
-            track_count=[int(prefix.track_count) for prefix in prefixes],
-            last_action=[int(prefix.last) for prefix in prefixes],
-            budget_ms=self.budget_ms,
-        )
+        n = len(prefixes)
+        slots = np.broadcast_to(self._slot_template[None, :], (n, self._slot_template.shape[0])).copy()
+        if n:
+            elapsed = np.fromiter((float(prefix.elapsed_ms) for prefix in prefixes), dtype=np.float32, count=n)
+            search_count = np.fromiter((int(prefix.search_count) for prefix in prefixes), dtype=np.float32, count=n)
+            track_count = np.fromiter((int(prefix.track_count) for prefix in prefixes), dtype=np.float32, count=n)
+            last_action = np.fromiter((int(prefix.last) for prefix in prefixes), dtype=np.int32, count=n)
+            slots[:, 0] = elapsed / float(self.budget_ms)
+            slots[:, 1] = search_count / 20.0
+            slots[:, 2] = track_count / 100.0
+            slots[:, 3] = (last_action == 0).astype(np.float32)
         return torch.from_numpy(slots).to(self.planner.device, dtype=torch.float32)
 
     def score_prefixes(self, prefixes: Iterable[BranchPrefix]) -> BranchExpansionResult:
