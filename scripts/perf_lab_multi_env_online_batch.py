@@ -1676,6 +1676,12 @@ def main() -> None:
         choices=["default", "math_only", "flash_only", "mem_efficient_only", "cudnn_only", "flash_math", "all_no_cudnn"],
         help="Torch scaled-dot-product attention backend selection for score-body experiments.",
     )
+    parser.add_argument(
+        "--matmul-precision",
+        default="",
+        choices=["", "highest", "high", "medium"],
+        help="Optional torch.set_float32_matmul_precision value for TF32/FP32 matmul experiments.",
+    )
     parser.add_argument("--checkpoint", type=Path, default=None, help="Optional ActionAttentionFactorizedNet state dict to benchmark.")
     parser.add_argument("--out", type=Path, default=Path("results/perf_lab_multi_env_online_batch.json"))
     args = parser.parse_args()
@@ -1687,6 +1693,8 @@ def main() -> None:
     torch.manual_seed(123)
     np.random.seed(123)
     torch.set_num_threads(1)
+    if str(args.matmul_precision):
+        torch.set_float32_matmul_precision(str(args.matmul_precision))
     device = torch.device(args.device)
     env_cfg = env_preset_cfg("repaired_stress")
     env_cfg["poisson_rate_per_second"] = float(args.rate)
@@ -1755,6 +1763,7 @@ def main() -> None:
         "amp": bool(args.amp),
         "sdp_backend": str(args.sdp_backend),
         "active_sdp_state": active_sdp_state,
+        "matmul_precision": str(args.matmul_precision) if str(args.matmul_precision) else None,
         "envs": int(args.envs),
         "windows": int(args.windows),
         "window_ms": int(args.window_ms),

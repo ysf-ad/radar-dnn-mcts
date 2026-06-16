@@ -2610,6 +2610,30 @@ was slower than the default while preserving reward/actions. This means SDP
 backend tuning should stay an explicit benchmark knob for now; the default
 runtime path should keep PyTorch's default backend selection.
 
+The score-body compile lab checks whether `torch.compile` can fuse the cached
+policy/Q score path:
+
+```powershell
+python scripts\perf_lab_score_compile_variants.py --device cuda --amp --prefixes 64 --checkpoint ..\CreateValid1\results\critic_bootstrap_medium_eval_two_row_action_attention_qpolicy_factored_loss.pt
+```
+
+On the current Windows environment, Inductor cannot compile the score body
+because Triton is unavailable. The script records that as a benchmark result
+instead of crashing. This means whole-score fusion via `torch.compile` remains
+blocked by the local runtime, not by model logic.
+
+The same labs now also expose `--matmul-precision`. In the isolated score-body
+profile, `--matmul-precision high` improved the mean cached score call:
+
+```text
+default precision: ~2.39 ms
+high precision:    ~2.19 ms
+```
+
+But the online smoke run changed decisions/reward. It is therefore not an exact
+runtime optimization for the current trained policy; keep it as an experimental
+speed/accuracy knob only.
+
 Current synchronized 64-env/10-window graph-stage profile:
 
 ```text

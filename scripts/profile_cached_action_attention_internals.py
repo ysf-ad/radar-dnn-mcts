@@ -215,6 +215,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--matmul-precision", default="", choices=["", "highest", "high", "medium"])
     parser.add_argument("--prefix-batches", default="1,4,8,16,32,64")
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
@@ -234,6 +235,8 @@ def main() -> None:
     torch.manual_seed(123)
     np.random.seed(123)
     torch.set_num_threads(1)
+    if str(args.matmul_precision):
+        torch.set_float32_matmul_precision(str(args.matmul_precision))
     device = torch.device(args.device)
     env_cfg = env_preset_cfg("repaired_stress")
     env_cfg["poisson_rate_per_second"] = float(args.rate)
@@ -251,6 +254,7 @@ def main() -> None:
         "cuda_available": bool(torch.cuda.is_available()),
         "amp": bool(args.amp),
         "compile": bool(args.compile),
+        "matmul_precision": str(args.matmul_precision) if str(args.matmul_precision) else None,
         "initial_targets": int(args.initial_targets),
         "rate": float(args.rate),
         "seed": int(args.seed),
