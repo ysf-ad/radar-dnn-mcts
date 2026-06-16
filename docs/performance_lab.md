@@ -2774,6 +2774,12 @@ rounds were full-batch and the remaining partial rounds ranged from 2 to 7
 active envs; this makes padded replay/adaptive replay decisions inspectable from
 one report instead of requiring separate log parsing.
 
+The graph path now fills the selected-env index/action buffers for the batched C
+step with NumPy bulk assignment instead of a Python loop. In the 64-env/20-window
+graph-only run this moved `graph_env_step_batch` from about `0.889 ms` to
+`0.864 ms`, with unchanged reward/actions (`-6951.252`, `24449`). End-to-end
+throughput moved from about `727.7` to `733.9 env-windows/s` in the paired run.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only

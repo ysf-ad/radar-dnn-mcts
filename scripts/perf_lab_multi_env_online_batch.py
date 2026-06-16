@@ -1450,12 +1450,14 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         sync(device)
         graph_build_times.append((time.perf_counter() - t0) * 1000.0)
         live_pos = list(range(len(root_env_ids)))
+        root_env_ids_arr = np.asarray(root_env_ids, dtype=np.int32)
         table_width = 2 + 2 * int(MAXT)
         prealloc_action_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.long)
         prealloc_flat_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.long)
         prealloc_valid_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.bool)
         prealloc_full_slot_t = torch.empty((len(root_env_ids), slot_template.shape[1]), device=device, dtype=torch.float32)
         live_pos_tensor_cache: dict[tuple[int, ...], torch.Tensor] = {}
+        live_pos_np_cache: dict[tuple[int, ...], np.ndarray] = {}
         depth = 0
         while live_pos and depth < int(args.max_depth):
             slots = time_stage(
@@ -1593,9 +1595,13 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                 next_ids: list[int] = []
                 if env_vec is not None and len(live_pos) > 0:
                     count = int(len(live_pos))
-                    for local_idx, pos in enumerate(live_pos):
-                        env_index_buf[local_idx] = int(root_env_ids[pos])
-                        env_action_buf[local_idx] = int(actions[local_idx])
+                    key = tuple(live_pos)
+                    live_np = live_pos_np_cache.get(key)
+                    if live_np is None:
+                        live_np = np.asarray(live_pos, dtype=np.int64)
+                        live_pos_np_cache[key] = live_np
+                    env_index_buf[:count] = root_env_ids_arr[live_np]
+                    env_action_buf[:count] = actions[:count]
                     batch_env_step_fn(
                         env_vec,
                         env_index_buf,
