@@ -327,6 +327,21 @@ persistent scorer, wave=32:         ~7.7 ms
 
 This confirms that caching encoded root/search state is not optional for a fast planner. After caching, exact C branch simulation becomes a meaningful share of large waves, so the next optimization should combine persistent dense tree state with batched C branch stepping rather than repeatedly constructing Python scorer objects.
 
+The reusable primitive is `PersistentRootSearch`:
+
+```text
+PersistentRootSearch
+    owns root snapshot
+    owns vector branch simulator
+    owns cached root action-attention scorer
+
+search_wave(top_k)
+    -> propose top-K actions with cached neural state
+    -> simulate actions exactly in one vector C step
+```
+
+This is still root-scoped, but it is now a real code path future MCTS work can call instead of a one-off benchmark script.
+
 ## MCTX Takeaway
 
 MCTX is useful as a design reference because its search tree is dense and batched:

@@ -44,10 +44,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path("perf_lab_persistent_neural_exact_wave.json"))
     args = parser.parse_args()
 
-    from batched_branch_sim import BatchedRootBranchSimulator
-    from batched_window_expansion import BatchedWindowExpansionScorer, BranchPrefix
-    from final_radar_campaign import get_obs
     from perf_fast_planner import FastActionAttentionPlanner
+    from persistent_root_search import PersistentRootSearch
     from repaired_campaign_tools import env_preset_cfg
     from two_sensor_physical_head_eval import ActionAttentionFactorizedNet
 
@@ -61,15 +59,20 @@ def main() -> None:
     env_cfg["enable_x_band"] = 1
 
     max_wave = max(int(x) for x in str(args.wave_sizes).split(",") if x.strip())
-    sim = BatchedRootBranchSimulator(args.initial_targets, args.seed, env_cfg, batch_size=max_wave)
-    root_snapshot = sim.snapshot_root()
-    root_obs = get_obs(sim.root_eng, 0.0)
     model = ActionAttentionFactorizedNet(48, 4, 2).eval()
     planner = FastActionAttentionPlanner(model, env_cfg, device=device, use_amp=bool(args.amp), use_compile=bool(args.compile))
 
+    search = None
     sync(device)
     t_setup = time.perf_counter()
-    scorer = BatchedWindowExpansionScorer(planner, root_obs, budget_ms=200.0)
+    search = PersistentRootSearch(
+        planner,
+        initial_targets=args.initial_targets,
+        seed=args.seed,
+        env_cfg=env_cfg,
+        batch_size=max_wave,
+        budget_ms=200.0,
+    )
     sync(device)
     one_time_setup_ms = (time.perf_counter() - t_setup) * 1000.0
 
@@ -99,13 +102,12 @@ def main() -> None:
             for i in range(int(args.warmup) + int(args.iters)):
                 sync(device)
                 t1 = time.perf_counter()
-                prefixes = scorer.expand_prefixes([BranchPrefix()], top_k=wave_size)
-                actions = np.asarray([p.actions[-1] for p in prefixes], dtype=np.int32)
+                actions, _scores = search.propose(wave_size)
                 sync(device)
                 neural_ms = (time.perf_counter() - t1) * 1000.0
 
                 t2 = time.perf_counter()
-                result = sim.step_actions(actions, snapshot=root_snapshot)
+                result = search.simulate(actions)
                 sim_ms = (time.perf_counter() - t2) * 1000.0
                 combined_ms = neural_ms + sim_ms
                 if i >= int(args.warmup):
@@ -135,7 +137,8 @@ def main() -> None:
                 }
             )
     finally:
-        sim.close()
+        if search is not None:
+            search.close()
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")
