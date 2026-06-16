@@ -1134,11 +1134,11 @@ script: scripts/perf_lab_cuda_graph_planner.py
 device=cuda, initial_targets=40, arrival_rate=3, seed=916,
 warmup=5, iterations=30
 
-regular fast planner:             48.067 ms / plan
-GPU-select fast planner:          45.662 ms / plan
-CUDA graph fast planner:          10.473 ms / plan
-CUDA graph + GPU-select planner:   8.621 ms / plan
-best speedup:                      5.58x
+regular fast planner:             58.404 ms / plan
+GPU-select fast planner:          50.509 ms / plan
+CUDA graph fast planner:          10.093 ms / plan
+CUDA graph + GPU-select planner:   9.171 ms / plan
+best speedup:                      6.37x
 plans match:                       true
 ```
 
@@ -1166,6 +1166,18 @@ candidate_score = score.reshape(-1)[flat_index]
 This avoids two-dimensional advanced indexing in the hot loop. The internal
 profile improved GPU-selection time from about `0.209 ms/decision` to
 `0.185 ms/decision`.
+
+`perf_lab_gpu_select_variants.py` compares the standard PyTorch ways to gather
+candidate scores and pick the best action. On the 58-candidate table used by
+the stress-cell root state, all tested variants selected the same action. The
+fastest path was:
+
+```text
+vals = torch.take(score.reshape(-1), flat_index)
+action = actions[torch.max(vals, dim=0).indices]
+```
+
+That replaces the earlier `index_select + argmax` selector.
 
 The CUDA Graph replay path also reuses its static selected-mask input as the
 live selected-mask tensor for the planning loop. That removes a per-decision

@@ -532,10 +532,10 @@ class FastActionAttentionPlanner:
     ) -> int | None:
         if actions_t.numel() <= 0:
             return None
-        vals = score_t.reshape(-1).index_select(0, flat_indices_t)
+        vals = torch.take(score_t.reshape(-1), flat_indices_t)
         if self.search_score_bias != 0.0:
             vals = vals + is_search_t.to(vals.dtype) * float(self.search_score_bias)
-        action = int(actions_t[torch.argmax(vals)].item())
+        action = int(actions_t[torch.max(vals, dim=0).indices].item())
         return action if action >= 0 else None
 
     def _slot_template(self, obs: dict, budget_ms: float) -> np.ndarray:
