@@ -390,11 +390,10 @@ class FastActionAttentionPlanner:
             with torch.inference_mode():
                 slot_t = torch.from_numpy(slot).to(self.device, dtype=torch.float32).unsqueeze(0)
                 with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
-                    score_t = self._scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t)
-                score = score_t.squeeze(0).float().cpu().numpy()
+                    score_t = self._combined_scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t).squeeze(0).float()
+                score = score_t.cpu().numpy()
             score = np.asarray(score, dtype=np.float32).copy()
             score[0, :] += self.search_score_bias
-
             best_action = select_best_action(score, obs, selected=selected, max_trackers=MAXT)
             if best_action is None:
                 break

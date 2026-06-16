@@ -166,7 +166,7 @@ def main() -> None:
                     slot_t = torch.from_numpy(slot).to(device, dtype=torch.float32).unsqueeze(0)
                     sync(device)
                     t0 = time.perf_counter()
-                    score_t = helper._scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t)
+                    score_t = helper._combined_scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t)
                     sync(device)
                     timer.values["fast_action_score_from_encoded_cuda_sync"].append((time.perf_counter() - t0) * 1000.0)
                     score = score_t.squeeze(0).float().cpu().numpy()

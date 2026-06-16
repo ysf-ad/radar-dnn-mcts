@@ -298,6 +298,29 @@ larger shared projections. Custom CUDA kernels are only justified after that,
 because the current bottleneck is still high-level transformer/head dispatch
 rather than a single obvious scalar kernel.
 
+For the single-window greedy online planner, an attempted GPU scalar action
+selector was measured and rejected. It avoided copying the small `[rows, 2]`
+score table back to CPU, but it introduced per-decision tensor construction and a
+scalar synchronization. The measured default is therefore:
+
+```text
+cached combined score on CUDA
+    -> copy one small [rows, 2] score table to CPU
+    -> vectorized NumPy physical candidate selection
+```
+
+Online step profile on CUDA after this correction:
+
+```text
+plans_match baseline: true
+fast_action_score_from_encoded:       ~3.33 ms mean, ~2.20 ms p50
+fast_vectorized_candidate_select:     ~0.13 ms mean
+failed GPU scalar candidate selector: ~1.42 ms mean in the rejected test
+```
+
+This reinforces the current rule: keep large batched action-table gather/sort on
+GPU, but keep tiny single-window greedy candidate selection on CPU.
+
 ## Current Optimization
 
 `FastActionAttentionPlanner` reuses the root target encoding inside a scheduling window:
