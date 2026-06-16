@@ -1302,6 +1302,14 @@ class BatchedActionAttentionScorer:
             best = self._best_actions_from_device_tensors(prepared)
             return best.cpu().numpy().astype(np.int64, copy=False)
 
+    def best_actions_prepared_device_tensor(self, prepared: DevicePreparedBatchedRootBatch) -> torch.Tensor:
+        """Score a device-resident prepared batch and keep best actions on device."""
+        n = int(prepared.count)
+        if n <= 0:
+            return torch.empty((0,), device=self.device, dtype=torch.long)
+        with torch.inference_mode():
+            return self._best_actions_from_device_tensors(prepared)
+
     def best_actions_prepared_device_graph(self, prepared: DevicePreparedBatchedRootBatch) -> np.ndarray:
         """Replay a CUDA Graph over a fixed device-resident prepared batch."""
         n = int(prepared.count)

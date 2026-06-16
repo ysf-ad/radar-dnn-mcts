@@ -160,6 +160,86 @@ def profile_prepared_batch(batcher, observations: list[dict], iters: int, warmup
     }
 
 
+def profile_device_prepared_batch(batcher, observations: list[dict], iters: int, warmup: int, budget_ms: float) -> dict:
+    """Profile the fully device-resident root path.
+
+    This separates the one-time CPU preparation/device transfer cost from the
+    repeated score+argmax cost. It is the closest local proxy for batched MCTS or
+    batched online planning where a wave of root states stays resident while the
+    GPU evaluates policy and Q for all actions.
+    """
+    device = batcher.device
+    buckets: dict[str, list[float]] = {
+        "prepare_root_batch": [],
+        "prepared_to_device": [],
+        "score_device": [],
+        "score_device_tensor": [],
+        "score_device_graph": [],
+        "total_device_score_call": [],
+        "total_device_tensor_call": [],
+        "total_device_graph_call": [],
+    }
+    prepared = timed(device, buckets, "prepare_root_batch", lambda: batcher.prepare_root_batch(observations, budget_ms=float(budget_ms)))
+    device_prepared = timed(device, buckets, "prepared_to_device", lambda: batcher.prepared_to_device(prepared))
+    last_actions = None
+    last_graph_actions = None
+
+    for i in range(int(warmup) + int(iters)):
+        record = i >= int(warmup)
+        run_buckets = buckets if record else {key: [] for key in buckets}
+        sync(device)
+        t_total = time.perf_counter()
+        last_actions = timed(device, run_buckets, "score_device", lambda: batcher.best_actions_prepared_device(device_prepared))
+        sync(device)
+        if record:
+            buckets["total_device_score_call"].append((time.perf_counter() - t_total) * 1000.0)
+
+    last_tensor_actions = None
+    for i in range(int(warmup) + int(iters)):
+        record = i >= int(warmup)
+        run_buckets = buckets if record else {key: [] for key in buckets}
+        sync(device)
+        t_total = time.perf_counter()
+        last_tensor_actions = timed(device, run_buckets, "score_device_tensor", lambda: batcher.best_actions_prepared_device_tensor(device_prepared))
+        sync(device)
+        if record:
+            buckets["total_device_tensor_call"].append((time.perf_counter() - t_total) * 1000.0)
+
+    if device.type == "cuda":
+        for i in range(int(warmup) + int(iters)):
+            record = i >= int(warmup)
+            run_buckets = buckets if record else {key: [] for key in buckets}
+            sync(device)
+            t_total = time.perf_counter()
+            last_graph_actions = timed(device, run_buckets, "score_device_graph", lambda: batcher.best_actions_prepared_device_graph(device_prepared))
+            sync(device)
+            if record:
+                buckets["total_device_graph_call"].append((time.perf_counter() - t_total) * 1000.0)
+
+    graph_matches = None
+    if last_graph_actions is not None and last_actions is not None:
+        graph_matches = bool(np.array_equal(np.asarray(last_actions), np.asarray(last_graph_actions)))
+
+    return {
+        "prepare_once": stats(buckets["prepare_root_batch"]),
+        "prepared_to_device_once": stats(buckets["prepared_to_device"]),
+        "score_device": stats(buckets["score_device"]),
+        "score_device_tensor": stats(buckets["score_device_tensor"]),
+        "total_device_score_call": stats(buckets["total_device_score_call"]),
+        "total_device_tensor_call": stats(buckets["total_device_tensor_call"]),
+        "score_device_graph": stats(buckets["score_device_graph"]),
+        "total_device_graph_call": stats(buckets["total_device_graph_call"]),
+        "graph_matches_device": graph_matches,
+        "selected_actions_head": [int(x) for x in np.asarray(last_actions[: min(8, len(last_actions))], dtype=np.int64)],
+        "selected_tensor_actions_head": []
+        if last_tensor_actions is None
+        else [int(x) for x in last_tensor_actions[: min(8, int(last_tensor_actions.numel()))].detach().cpu().numpy().astype(np.int64)],
+        "selected_graph_actions_head": []
+        if last_graph_actions is None
+        else [int(x) for x in np.asarray(last_graph_actions[: min(8, len(last_graph_actions))], dtype=np.int64)],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -210,6 +290,7 @@ def main() -> None:
         obs_batch = observations[:batch_size]
         result = profile_batch(batcher, obs_batch, int(args.iters), int(args.warmup), 200.0)
         result["prepared_path"] = profile_prepared_batch(batcher, obs_batch, int(args.iters), int(args.warmup), 200.0)
+        result["device_prepared_path"] = profile_device_prepared_batch(batcher, obs_batch, int(args.iters), int(args.warmup), 200.0)
         report["batches"].append(result)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

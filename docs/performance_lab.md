@@ -2663,6 +2663,25 @@ PyTorch CUDA extensions on Windows generally need MSVC `cl.exe` plus a tested
 CUDA-toolkit/PyTorch ABI combination. The current repo therefore keeps custom
 kernel work behind environment validation rather than adding unbuildable code.
 
+`profile_batched_scorer_stages.py` now also compares CPU-prepared, per-call
+host-to-device prepared, device-resident prepared, device-resident tensor-return,
+and CUDA-graph replay paths. On the RTX 3080 Ti AMP smoke
+(`--batch-sizes 8,32,64 --iters 10 --warmup 3`), the repeated score/select call
+times were:
+
+```text
+batch  prepared CPU->GPU  device resident  device tensor return  device graph
+8      5.71 ms            5.56 ms          5.47 ms               5.50 ms
+32     6.03 ms            5.95 ms          5.81 ms               5.64 ms
+64     6.35 ms            5.50 ms          5.39 ms               5.75 ms
+```
+
+The reliable optimization is keeping root tensors/action tables resident on the
+GPU and, when a downstream batched search can consume it, returning the selected
+action tensor without an immediate device-to-host synchronization. CUDA Graph
+replay is shape-compatible and action-compatible in this probe, but not
+consistently faster, so it should stay behind the measured opt-in path.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only
