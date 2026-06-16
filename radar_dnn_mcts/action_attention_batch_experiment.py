@@ -115,7 +115,8 @@ class CachedActionAttentionPlanner:
                             selected_t[0, int(base)] = True
                 score = self._scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t).squeeze(0).cpu().numpy()
             score = np.asarray(score, dtype=np.float32).copy()
-            score[0, :] += self.search_score_bias
+            if self.search_score_bias != 0.0:
+                score[0, :] += self.search_score_bias
             if self.stateless_selected:
                 for base in selected:
                     if 0 <= int(base) < score.shape[0]:

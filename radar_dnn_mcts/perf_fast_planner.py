@@ -865,7 +865,8 @@ class FastActionAttentionPlanner:
             else:
                 t0 = self._profile_start()
                 score = np.asarray(score, dtype=np.float32).copy()
-                score[0, :] += self.search_score_bias
+                if self.search_score_bias != 0.0:
+                    score[0, :] += self.search_score_bias
                 self._profile_end("loop_score_postprocess", t0)
                 t0 = self._profile_start()
                 best_action = select_best_action(score, obs, selected=selected, max_trackers=MAXT)
@@ -1008,7 +1009,8 @@ class BatchedActionAttentionScorer:
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
                 score_t = self._combined_scores_from_tokens(x, s)
             score = score_t.float().cpu().numpy()
-        score[:, 0, :] += self.search_score_bias
+        if self.search_score_bias != 0.0:
+            score[:, 0, :] += self.search_score_bias
         return np.asarray(score, dtype=np.float32), obs2, selected
 
     def _score_dense_torch(
@@ -1043,7 +1045,8 @@ class BatchedActionAttentionScorer:
             s = torch.from_numpy(slots).to(self.device, dtype=torch.float32)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
                 score = self._combined_scores_from_tokens(x, s).float()
-            score[:, 0, :] += self.search_score_bias
+            if self.search_score_bias != 0.0:
+                score[:, 0, :] += self.search_score_bias
         return score, obs2, selected
 
     def score_batch(
@@ -1160,7 +1163,8 @@ class BatchedActionAttentionScorer:
             valid_t = torch.as_tensor(prepared.valid, device=self.device, dtype=torch.bool)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
                 score_t = self._combined_scores_from_tokens(x, s).float()
-            score_t[:, 0, :] += self.search_score_bias
+            if self.search_score_bias != 0.0:
+                score_t[:, 0, :] += self.search_score_bias
             flat_scores = score_t.reshape(n, -1)
             candidate_scores = torch.gather(flat_scores, 1, flat_t)
             candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
@@ -1203,7 +1207,8 @@ class BatchedActionAttentionScorer:
                 def compute_best() -> torch.Tensor:
                     with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
                         score_t = self._combined_scores_from_tokens(static_tokens, static_slots).float()
-                    score_t[:, 0, :] += self.search_score_bias
+                    if self.search_score_bias != 0.0:
+                        score_t[:, 0, :] += self.search_score_bias
                     flat_scores = score_t.reshape(n, -1)
                     candidate_scores = torch.gather(flat_scores, 1, static_flat)
                     candidate_scores = candidate_scores.masked_fill(~(static_valid & torch.isfinite(candidate_scores)), -torch.inf)
@@ -1274,7 +1279,8 @@ class BatchedActionAttentionScorer:
         n = int(prepared.count)
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
             score_t = self._combined_scores_from_tokens(prepared.tokens, prepared.slots).float()
-        score_t[:, 0, :] += self.search_score_bias
+        if self.search_score_bias != 0.0:
+            score_t[:, 0, :] += self.search_score_bias
         flat_scores = score_t.reshape(n, -1)
         candidate_scores = torch.gather(flat_scores, 1, prepared.flat_indices)
         candidate_scores = candidate_scores.masked_fill(~(prepared.valid & torch.isfinite(candidate_scores)), -torch.inf)

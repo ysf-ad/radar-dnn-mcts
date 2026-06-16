@@ -1001,7 +1001,8 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
                 def score_forward():
                     with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
                         score = planner.score_slots_from_encoded(cls_live, tok_live, selected_t, active_live, slot_t).float()
-                    score[:, 0, :] += planner.search_score_bias
+                    if planner.search_score_bias != 0.0:
+                        score[:, 0, :] += planner.search_score_bias
                     return score
 
                 score_t = time_stage(device, profile_enabled, stage_buckets, "decision_score_forward", score_forward)
@@ -1428,7 +1429,8 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
 
                     score_t = time_stage(device, profile_enabled, stage_buckets, "graph_raw_score_forward", raw_score_path)
                     raw_rounds += 1
-                score_t[:, 0, :] += planner.search_score_bias
+                if planner.search_score_bias != 0.0:
+                    score_t[:, 0, :] += planner.search_score_bias
                 def action_tensor_prep():
                     if gpu_action_template is not None and bool(getattr(args, "gpu_valid_mask", False)) and len(live_pos) == len(root_env_ids):
                         actions_t, flat_t, gather_t, search_action_t, template_valid_t, valid_t = gpu_action_template

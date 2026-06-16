@@ -99,7 +99,8 @@ def profile_batch(batcher, observations: list[dict], iters: int, warmup: int, bu
             def forward():
                 with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=batcher.use_amp):
                     score = batcher._combined_scores_from_tokens(x, s).float()
-                score[:, 0, :] += batcher.search_score_bias
+                if batcher.search_score_bias != 0.0:
+                    score[:, 0, :] += batcher.search_score_bias
                 return score
 
             score_t = timed(device, run_buckets, "model_forward", forward)

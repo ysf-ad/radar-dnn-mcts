@@ -1912,7 +1912,8 @@ class PhysicalHeadPlanner:
                 scores, q, _ = self.model.forward_physical_flat(x, s)
                 score = (self.policy_weight * scores + self.q_weight * q).squeeze(0).cpu().numpy()
         score = np.asarray(score, dtype=np.float32).copy()
-        score[0, :] += self.search_score_bias
+        if self.search_score_bias != 0.0:
+            score[0, :] += self.search_score_bias
         return score
 
     def plan(self, obs, budget_ms=200):

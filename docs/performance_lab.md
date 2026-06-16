@@ -2530,6 +2530,70 @@ remaining large costs have moved back to neural scoring and root encoding. The
 next high-leverage step is to reduce `decision_score_forward` or avoid
 re-encoding unchanged root state across repeated eval/training batches.
 
+### Graph Replay and Batched Online Path
+
+The current fastest benchmark path combines:
+
+```text
+direct packed root observations
+    + cached root encodings
+    + cached/GPU physical action templates
+    + GPU valid masks
+    + padded live CUDA Graph replay
+    + batched C environment stepping
+```
+
+Recommended command:
+
+```powershell
+python scripts\perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --cached-action-table --gpu-action-template --gpu-valid-mask --batch-env-step --padded-live-graph --checkpoint ..\CreateValid1\results\critic_bootstrap_medium_eval_two_row_action_attention_qpolicy_factored_loss.pt --out results\perf_lab_64x20.json
+```
+
+The best clean 64-env/20-window run after dense auxiliary root arrays measured:
+
+```text
+graph throughput:          ~928.6 env-windows/s
+planning ms/env-action:    ~0.0326
+reward delta vs cached:     0.0
+executed actions matched:   24449
+```
+
+A later run with zero-search-bias guards measured `~892.4 env-windows/s` with
+the same cached-root and graph reward/action count. This is within observed
+run-to-run noise and confirms the guard is behavior-preserving.
+
+The zero-search-bias guard skips a default no-op score update:
+
+```text
+if search_score_bias != 0:
+    score[:, search_row, :] += search_score_bias
+```
+
+It is small, but it removes an avoidable GPU add kernel from the default
+configuration and keeps benchmark, reusable fast planner, branch expansion, and
+profiling helpers consistent.
+
+Current synchronized 64-env/10-window graph-stage profile:
+
+```text
+graph_score_replay:          ~1.90 ms
+graph_padded_score_replay:   ~1.90 ms
+graph_env_step_batch:        ~1.36 ms
+graph_root_tokenize_batch:   ~1.22 ms
+graph_root_pack_direct:      ~0.68 ms
+graph_action_template_h2d:   ~0.68 ms
+graph_physical_action_template: ~0.54 ms
+graph_root_slot_template:    ~0.53 ms
+graph_action_tensor_prep_h2d: ~0.28 ms
+graph_decision_select_device: ~0.27 ms
+```
+
+This puts the next optimization opportunities in three buckets:
+
+- Reduce/fuse the action-attention score replay body.
+- Keep more root/action template data resident on device across rounds.
+- Reduce batched environment stepping and tokenization cost.
+
 ## Next Work
 
 - Promote cached-root multi-environment batching from benchmark script to a reusable evaluator/training data path.

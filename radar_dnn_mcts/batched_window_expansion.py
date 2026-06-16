@@ -265,7 +265,8 @@ class BatchedWindowExpansionScorer:
             t0 = self._profile_start()
             score_tables = score_t.float().cpu().numpy()
             self._profile_end("scorer_score_d2h", t0)
-        score_tables[:, 0, :] += self.planner.search_score_bias
+        if self.planner.search_score_bias != 0.0:
+            score_tables[:, 0, :] += self.planner.search_score_bias
 
         t0 = self._profile_start()
         actions_t, bases_t, sensors_t = self._physical_tables_for_prefixes(prefix_list)
@@ -323,7 +324,8 @@ class BatchedWindowExpansionScorer:
             selected_t, valid_np = self._prefix_selected_and_valid(prefix_list)
             slot_t = self._slots(prefix_list)
             score_t = self._score_slots(selected_t, slot_t)
-            score_t[:, 0, :] += self.planner.search_score_bias
+            if self.planner.search_score_bias != 0.0:
+                score_t[:, 0, :] += self.planner.search_score_bias
             flat_scores = score_t.reshape(len(prefix_list), -1)
             actions_dev = self._root_actions_dev.expand(len(prefix_list), -1)
             bases_dev = self._root_bases_dev.expand(len(prefix_list), -1)
@@ -393,7 +395,8 @@ class BatchedWindowExpansionScorer:
             score_t = self._score_slots(prepared.selected, prepared.slots)
         else:
             score_t = self._score_slots_raw(prepared.selected, prepared.slots)
-        score_t[:, 0, :] += self.planner.search_score_bias
+        if self.planner.search_score_bias != 0.0:
+            score_t[:, 0, :] += self.planner.search_score_bias
         flat_scores = score_t.reshape(n, -1)
         candidate_scores = torch.gather(flat_scores, 1, prepared.flat_indices)
         candidate_scores = candidate_scores.masked_fill(~(prepared.valid & torch.isfinite(candidate_scores)), -torch.inf)
