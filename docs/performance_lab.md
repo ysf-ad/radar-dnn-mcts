@@ -1598,6 +1598,56 @@ The one-pass fast planner remains the lower-latency deployment path; beam search
 is now close enough to be useful for offline/teacher generation and small online
 lookahead experiments.
 
+## Clean Online CUDA Graph Timing
+
+The internal profiler is useful for attribution, but it synchronizes around
+every stage. Clean wall-clock timing without per-stage synchronization is much
+lower. On the same stress root state (`initial_targets=60`, `arrival_rate=4`,
+`seed=916`, `iters=40`, `warmup=8`):
+
+```text
+base fast planner:              45.61 ms/window
+GPU select only:                44.29 ms/window
+CUDA graph:                     10.42 ms/window
+CUDA graph + GPU select:         8.58 ms/window
+```
+
+All four variants selected the same 20-action plan. The graph+GPU-select path is
+therefore the current lowest-latency one-pass deployment path, at about `5.3x`
+faster than the uncaptured fast planner on this benchmark.
+
+## Action Selection Kernel Notes
+
+The GPU selector microbenchmark compares native PyTorch ways to gather candidate
+action scores and pick the best action from the dense `[target, sensor]` score
+table. On the same 60-target/rate-4 state with 82 valid candidates:
+
+```text
+index_select + max: 0.083 ms
+take + max:         0.083 ms
+topk(1):            0.088 ms
+gather + argmax:    0.090 ms
+index_select+argmax 0.090 ms
+```
+
+With a nonzero search bias, all variants clustered around `0.131-0.133 ms`.
+This means the current PyTorch selector is already close to the best available
+native path.
+
+I also tested moving `take -> bias -> argmax -> action` inside the captured CUDA
+Graph. On this Windows/CUDA/PyTorch stack, that operation fails during graph
+capture with:
+
+```text
+RuntimeError: CUDA error: operation failed due to a previous error during capture
+```
+
+A fused action-select CUDA kernel could still remove kernel-launch overhead and
+return the action more directly, but the practical upper bound is modest: the
+clean graph+GPU-select planner is already `8-9 ms/window`, and the remaining
+selector work is partly the unavoidable CPU synchronization needed to update the
+next selected-target mask and window bookkeeping.
+
 ## Next Work
 
 - Batch multiple environment windows during evaluation.
