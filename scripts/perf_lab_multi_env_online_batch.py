@@ -1433,6 +1433,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=916)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--skip-graph", action="store_true")
+    parser.add_argument("--paired-heads", action="store_true", help="Use inference-only paired policy/Q MLP head execution.")
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--profile-cpu-top", type=int, default=0, help="Record top cumulative cProfile functions for each benchmark path.")
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
@@ -1463,6 +1464,7 @@ def main() -> None:
         use_amp=bool(args.amp),
         use_cuda_graph=True,
         use_gpu_select=True,
+        use_paired_heads=bool(args.paired_heads),
     )
     batched = BatchedActionAttentionScorer(
         batch_model,

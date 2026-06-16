@@ -7,6 +7,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from exact_env_mutual import attach_env_obs, xs_decode_action, xs_s_search_action, xs_x_search_action
 from exact_env_mutual import xs_s_track_action, xs_x_track_action
@@ -78,6 +79,63 @@ class DevicePreparedBatchedRootBatch:
     count: int
     graph: object | None = None
     graph_best: torch.Tensor | None = None
+
+
+def _paired_mlp_outputs(
+    left: nn.Module,
+    right: nn.Module,
+    x: torch.Tensor,
+    cache: dict[tuple, tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate two same-shape LayerNorm/Linear/GELU/Linear MLP heads together."""
+    if (
+        isinstance(left, nn.Sequential)
+        and isinstance(right, nn.Sequential)
+        and len(left) == 4
+        and len(right) == 4
+        and isinstance(left[0], nn.LayerNorm)
+        and isinstance(right[0], nn.LayerNorm)
+        and isinstance(left[1], nn.Linear)
+        and isinstance(right[1], nn.Linear)
+        and isinstance(left[2], nn.GELU)
+        and isinstance(right[2], nn.GELU)
+        and isinstance(left[3], nn.Linear)
+        and isinstance(right[3], nn.Linear)
+        and left[1].in_features == right[1].in_features
+        and left[1].out_features == right[1].out_features
+        and left[3].in_features == right[3].in_features
+        and left[3].out_features == right[3].out_features
+    ):
+        key = (
+            id(left),
+            id(right),
+            x.device.type,
+            x.device.index,
+            x.dtype,
+            left[1].weight._version,
+            right[1].weight._version,
+            left[3].weight._version,
+            right[3].weight._version,
+        )
+        packed = cache.get(key) if cache is not None else None
+        if packed is None:
+            w1 = torch.block_diag(left[1].weight.detach(), right[1].weight.detach())
+            b1 = torch.cat([left[1].bias.detach(), right[1].bias.detach()], dim=0) if left[1].bias is not None and right[1].bias is not None else None
+            w2 = torch.block_diag(left[3].weight.detach(), right[3].weight.detach())
+            b2 = torch.cat([left[3].bias.detach(), right[3].bias.detach()], dim=0) if left[3].bias is not None and right[3].bias is not None else None
+            packed = (w1, b1, w2, b2)
+            if cache is not None:
+                cache[key] = packed
+        w1, b1, w2, b2 = packed
+        x_left = left[0](x)
+        x_right = right[0](x)
+        hidden = torch.nn.functional.linear(torch.cat([x_left, x_right], dim=-1), w1, b1)
+        left_h, right_h = hidden.split(left[1].out_features, dim=-1)
+        left_h = left[2](left_h)
+        right_h = right[2](right_h)
+        out = torch.nn.functional.linear(torch.cat([left_h, right_h], dim=-1), w2, b2)
+        return out.split(left[3].out_features, dim=-1)
+    return left(x), right(x)
 
 
 def physical_action_arrays(obs: dict, selected: Iterable[int] | None = None, max_trackers: int = MAXT):
@@ -271,6 +329,7 @@ class FastActionAttentionPlanner:
         use_compile: bool = False,
         use_cuda_graph: bool = False,
         use_gpu_select: bool = False,
+        use_paired_heads: bool = False,
     ):
         dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = model.eval().to(dev)
@@ -285,10 +344,12 @@ class FastActionAttentionPlanner:
         self.use_compile = bool(use_compile)
         self.use_cuda_graph = bool(use_cuda_graph and dev.type == "cuda")
         self.use_gpu_select = bool(use_gpu_select)
+        self.use_paired_heads = bool(use_paired_heads)
         self.adapt = adapter()
         self.stats = FastPlannerStats(True, str(dev), self.use_amp, self.use_compile)
         self._row_is_search_cache: dict[tuple[int, str, int | None], torch.Tensor] = {}
         self._cuda_graph_score_cache: dict[tuple, dict[str, object]] = {}
+        self._paired_head_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]] = {}
         self._action_base_cache: dict[int, np.ndarray] = {}
         self.profile_enabled = False
         self._profile_values: dict[str, list[float]] = defaultdict(list)
@@ -351,16 +412,24 @@ class FastActionAttentionPlanner:
         sensor_state = model.sensor_state_proj(torch.cat([cls_s, slot_s, sensor], dim=-1))
         coupled_sensor = model.sensor_coupler(sensor_state)
         type_ctx = torch.cat([cls_s, slot_s, coupled_sensor], dim=-1)
-        type_logits = model.type_head(type_ctx)
-        type_q = model.type_q_head(type_ctx)
+        if self.use_paired_heads:
+            type_logits, type_q = _paired_mlp_outputs(model.type_head, model.type_q_head, type_ctx, self._paired_head_cache)
+        else:
+            type_logits = model.type_head(type_ctx)
+            type_q = model.type_q_head(type_ctx)
 
         tok_st = tok_out[:, :, None, :].expand(-1, -1, 2, -1)
         cls_st = cls_out[:, None, None, :].expand(-1, rows, 2, -1)
         slot_st = slot_emb[:, None, None, :].expand(-1, rows, 2, -1)
         sensor_st = coupled_sensor[:, None, :, :].expand(bsz, rows, -1, -1)
         target_ctx = torch.cat([tok_st, cls_st, slot_st, sensor_st], dim=-1)
-        target_logits = model.target_head(target_ctx).squeeze(-1)
-        target_q = model.target_q_head(target_ctx).squeeze(-1)
+        if self.use_paired_heads:
+            target_logits_raw, target_q_raw = _paired_mlp_outputs(model.target_head, model.target_q_head, target_ctx, self._paired_head_cache)
+            target_logits = target_logits_raw.squeeze(-1)
+            target_q = target_q_raw.squeeze(-1)
+        else:
+            target_logits = model.target_head(target_ctx).squeeze(-1)
+            target_q = model.target_q_head(target_ctx).squeeze(-1)
 
         base_scores = slot_t.new_full((bsz, rows, 2), -1e9)
         base_q = slot_t.new_zeros((bsz, rows, 2))
@@ -375,8 +444,18 @@ class FastActionAttentionPlanner:
         valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
         action_ctx = model.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
         action_ctx = model.action_coupler(action_ctx, src_key_padding_mask=~valid.reshape(bsz, rows * 2))
-        residual = model.action_policy_residual(action_ctx).reshape(bsz, rows, 2)
-        q_residual = model.action_q_residual(action_ctx).reshape(bsz, rows, 2)
+        if self.use_paired_heads:
+            residual_raw, q_residual_raw = _paired_mlp_outputs(
+                model.action_policy_residual,
+                model.action_q_residual,
+                action_ctx,
+                self._paired_head_cache,
+            )
+            residual = residual_raw.reshape(bsz, rows, 2)
+            q_residual = q_residual_raw.reshape(bsz, rows, 2)
+        else:
+            residual = model.action_policy_residual(action_ctx).reshape(bsz, rows, 2)
+            q_residual = model.action_q_residual(action_ctx).reshape(bsz, rows, 2)
         scores = (base_scores + residual).masked_fill(~valid, -1e9)
         q = (base_q + q_residual).masked_fill(~valid, 0.0)
         return self.policy_weight * scores + self.q_weight * q

@@ -1916,6 +1916,30 @@ semantically usable, but the current online path is still dominated by graph
 score replay and Python/tensor staging enough that the OpenMP selected-step
 call does not obviously improve end-to-end throughput.
 
+An inference-only paired policy/Q head path was also tested behind
+`--paired-heads`. It packs same-architecture policy and Q MLP pairs into cached
+block-diagonal projections for type, target, and action-residual heads. The
+direct CUDA AMP equivalence check on a cached score state was exact:
+
+```text
+score shape:       (1, 101, 2)
+max_abs_diff:      0.0
+allclose:          true
+```
+
+The full 64-env, 20-window graph benchmark preserved reward parity but did not
+beat the current path:
+
+```text
+current graph path:       ~829.6 env-windows/s
+paired-head graph path:   ~813.7 env-windows/s
+reward delta:             0.0
+```
+
+This suggests the separate policy/Q MLP launches are not the dominant source of
+score replay latency once CUDA graphs are active. The action self-attention and
+surrounding tensor staging remain the higher-value targets.
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer
