@@ -1066,6 +1066,43 @@ valid:        [batch, top_k]
 
 That layout mirrors the important MCTX idea: a batch dimension over independent searches and dense action dimensions inside each tree.
 
+## Root Expansion Step Profile
+
+`perf_lab_root_expansion_compare.py` is the current one-command profile for the
+root expansion hot path. It compares the older proposal/update modes against
+the fastest batched cursor path and reports the four major step costs:
+
+```text
+mode                         total   propose   sim     update   select   unique
+recompute                    46.914  44.973    0.629   0.865    0.066    32
+cached_unique                 1.204   0.223    0.426   0.277    0.052    58
+cached_cursor                 0.666   0.078    0.331   0.086    0.035    58
+cached_cursor_bulk_with_map   0.237   0.016    0.089   0.035    0.047    58
+cached_cursor_bulk_best       0.217   0.017    0.082   0.023    0.046    58
+```
+
+Configuration:
+
+```text
+device=cuda, initial_targets=40, arrival_rate=3, seed=916,
+waves=8, top_k=32, warmup=8, iterations=40
+```
+
+This profile makes the current optimization picture clear:
+
+- recomputing neural proposals every wave is the original bottleneck;
+- cached root action tables remove almost all repeated neural work;
+- cursor expansion removes duplicate filtering and repeated top-K selection;
+- bulk cursor expansion exposes enough simulator work for the OpenMP fused C
+  stepper to matter;
+- the best path is now dominated by exact branch simulation and PUCT selection,
+  each under 0.1 ms at this root workload.
+
+The `cached_cursor_bulk_best` path is a root-only specialization. It disables
+the Python action-to-index map because the cursor walks a sorted cached root
+action table exactly once, so duplicates are impossible in that benchmarked
+path. Duplicate-aware modes still keep the map.
+
 ## Next Work
 
 - Batch multiple environment windows during evaluation.
