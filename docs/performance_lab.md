@@ -2780,6 +2780,14 @@ graph-only run this moved `graph_env_step_batch` from about `0.889 ms` to
 `0.864 ms`, with unchanged reward/actions (`-6951.252`, `24449`). End-to-end
 throughput moved from about `727.7` to `733.9 env-windows/s` in the paired run.
 
+`--full-select-graph` captures score replay plus action gather/mask/argmax for
+full-live graph rounds. It is correct but remains opt-in: on the 64-env/20-window
+graph-only run, planning latency improved from about `0.0385` to
+`0.0355 ms/env-action`, but graph build/setup cost roughly doubled and
+end-to-end throughput fell to about `702 env-windows/s`. This path may be useful
+for longer steady-state runs or if graph setup is amortized further, but the
+default should keep the cheaper score-only graph for now.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only

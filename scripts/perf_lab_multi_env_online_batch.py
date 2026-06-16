@@ -1251,6 +1251,131 @@ def _build_score_graph(planner, graph_cache: dict, cls_out, tok_out, selected_t,
         return None
 
 
+def _build_score_select_graph(
+    planner,
+    graph_cache: dict,
+    cls_out,
+    tok_out,
+    selected_t,
+    token_active,
+    slot_t,
+    actions_t,
+    flat_t,
+    gather_t,
+    search_action_t,
+    template_valid_t,
+):
+    if planner.device.type != "cuda":
+        return None
+    key = (
+        tuple(cls_out.shape),
+        tuple(tok_out.shape),
+        tuple(selected_t.shape),
+        tuple(token_active.shape),
+        tuple(slot_t.shape),
+        tuple(actions_t.shape),
+        str(cls_out.dtype),
+        str(actions_t.dtype),
+        bool(planner.use_amp),
+        float(planner.search_score_bias),
+    )
+    try:
+        cache = graph_cache.get(key)
+        if cache is None:
+            static_cls = torch.empty_like(cls_out)
+            static_tok = torch.empty_like(tok_out)
+            static_selected = torch.empty_like(selected_t)
+            static_active = torch.empty_like(token_active)
+            static_slot = torch.empty_like(slot_t)
+            static_actions = torch.empty_like(actions_t)
+            static_flat = torch.empty_like(flat_t)
+            static_gather = torch.empty_like(gather_t)
+            static_search = torch.empty_like(search_action_t)
+            static_template_valid = torch.empty_like(template_valid_t)
+            static_cls.copy_(cls_out, non_blocking=False)
+            static_tok.copy_(tok_out, non_blocking=False)
+            static_selected.copy_(selected_t, non_blocking=False)
+            static_active.copy_(token_active, non_blocking=False)
+            static_slot.copy_(slot_t, non_blocking=False)
+            static_actions.copy_(actions_t, non_blocking=False)
+            static_flat.copy_(flat_t, non_blocking=False)
+            static_gather.copy_(gather_t, non_blocking=False)
+            static_search.copy_(search_action_t, non_blocking=False)
+            static_template_valid.copy_(template_valid_t, non_blocking=False)
+
+            def compute_best():
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
+                    score_t = planner.score_slots_from_encoded(
+                        static_cls,
+                        static_tok,
+                        static_selected,
+                        static_active,
+                        static_slot,
+                    ).float()
+                if planner.search_score_bias != 0.0:
+                    score_t[:, 0, :] += planner.search_score_bias
+                selected_by_action = torch.gather(static_selected, 1, static_gather)
+                valid_t = static_template_valid & (static_search | ~selected_by_action)
+                candidate_scores = torch.gather(score_t.reshape(static_actions.shape[0], -1), 1, static_flat)
+                candidate_scores.masked_fill_(~valid_t, -torch.inf)
+                idx = torch.argmax(candidate_scores, dim=1)
+                return torch.gather(static_actions, 1, idx[:, None]).squeeze(1)
+
+            with torch.inference_mode():
+                for _ in range(3):
+                    _ = compute_best()
+                torch.cuda.synchronize(planner.device)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    static_best = compute_best()
+            cache = {
+                "graph": graph,
+                "static_cls": static_cls,
+                "static_tok": static_tok,
+                "static_selected": static_selected,
+                "static_active": static_active,
+                "static_slot": static_slot,
+                "static_actions": static_actions,
+                "static_flat": static_flat,
+                "static_gather": static_gather,
+                "static_search": static_search,
+                "static_template_valid": static_template_valid,
+                "static_best": static_best,
+            }
+            graph_cache[key] = cache
+        else:
+            graph = cache["graph"]
+            static_cls = cache["static_cls"]
+            static_tok = cache["static_tok"]
+            static_selected = cache["static_selected"]
+            static_active = cache["static_active"]
+            static_slot = cache["static_slot"]
+            static_actions = cache["static_actions"]
+            static_flat = cache["static_flat"]
+            static_gather = cache["static_gather"]
+            static_search = cache["static_search"]
+            static_template_valid = cache["static_template_valid"]
+            static_best = cache["static_best"]
+            static_cls.copy_(cls_out, non_blocking=False)
+            static_tok.copy_(tok_out, non_blocking=False)
+            static_active.copy_(token_active, non_blocking=False)
+            static_actions.copy_(actions_t, non_blocking=False)
+            static_flat.copy_(flat_t, non_blocking=False)
+            static_gather.copy_(gather_t, non_blocking=False)
+            static_search.copy_(search_action_t, non_blocking=False)
+            static_template_valid.copy_(template_valid_t, non_blocking=False)
+
+        def replay(next_selected_t, next_slot_t):
+            static_selected.copy_(next_selected_t, non_blocking=False)
+            static_slot.copy_(next_slot_t, non_blocking=False)
+            graph.replay()
+            return static_best
+
+        return replay
+    except Exception:
+        return None
+
+
 def _build_root_encode_graph(planner, graph_cache: dict, root_x: torch.Tensor):
     if planner.device.type != "cuda":
         return None
@@ -1320,11 +1445,13 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     depth_counts: list[int] = []
     root_graph_cache: dict = {}
     score_graph_cache: dict = {}
+    score_select_graph_cache: dict = {}
     stage_buckets: dict[str, list[float]] = {}
     profile_enabled = bool(getattr(args, "profile_stages", False))
     root_graph_replays = 0
     root_raw_encodes = 0
     graph_replay_rounds = 0
+    graph_select_replay_rounds = 0
     raw_rounds = 0
     padded_graph_rounds = 0
     batch_env_step_fn = getattr(radar_binding, "vec_step_selected_known_valid_into", None)
@@ -1447,6 +1574,27 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         sync(device)
         t0 = time.perf_counter()
         graph_replay = _build_score_graph(planner, score_graph_cache, cls_out, tok_out, selected_t_all, token_active, full_slot_t)
+        graph_select_replay = None
+        if (
+            bool(getattr(args, "full_select_graph", False))
+            and gpu_action_template is not None
+            and bool(getattr(args, "gpu_valid_mask", False))
+        ):
+            actions_t0, flat_t0, gather_t0, search_action_t0, template_valid_t0, _valid_t0 = gpu_action_template
+            graph_select_replay = _build_score_select_graph(
+                planner,
+                score_select_graph_cache,
+                cls_out,
+                tok_out,
+                selected_t_all,
+                token_active,
+                full_slot_t,
+                actions_t0,
+                flat_t0,
+                gather_t0,
+                search_action_t0,
+                template_valid_t0,
+            )
         sync(device)
         graph_build_times.append((time.perf_counter() - t0) * 1000.0)
         live_pos = list(range(len(root_env_ids)))
@@ -1481,7 +1629,25 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
             sync(device)
             t0 = time.perf_counter()
             with torch.inference_mode():
-                if graph_replay is not None and len(live_pos) == len(root_env_ids):
+                best = None
+                if graph_select_replay is not None and len(live_pos) == len(root_env_ids):
+                    slot_t = time_stage(
+                        device,
+                        profile_enabled,
+                        stage_buckets,
+                        "graph_select_slot_h2d",
+                        lambda: current_slots_cpu_t.to(device, dtype=torch.float32),
+                    )
+                    best = time_stage(
+                        device,
+                        profile_enabled,
+                        stage_buckets,
+                        "graph_score_select_replay",
+                        lambda: graph_select_replay(selected_t_all, slot_t),
+                    )
+                    score_t = None
+                    graph_select_replay_rounds += 1
+                elif graph_replay is not None and len(live_pos) == len(root_env_ids):
                     slot_t = time_stage(
                         device,
                         profile_enabled,
@@ -1523,54 +1689,55 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
 
                     score_t = time_stage(device, profile_enabled, stage_buckets, "graph_raw_score_forward", raw_score_path)
                     raw_rounds += 1
-                if planner.search_score_bias != 0.0:
+                if score_t is not None and planner.search_score_bias != 0.0:
                     score_t[:, 0, :] += planner.search_score_bias
-                def action_tensor_prep():
-                    if gpu_action_template is not None and bool(getattr(args, "gpu_valid_mask", False)) and len(live_pos) == len(root_env_ids):
-                        actions_t, flat_t, gather_t, search_action_t, template_valid_t, valid_t = gpu_action_template
-                        selected_by_action = torch.gather(selected_t_all, 1, gather_t)
-                        valid_t.copy_(template_valid_t & (search_action_t | ~selected_by_action), non_blocking=False)
-                        return actions_t, flat_t, valid_t
-                    if gpu_action_template is not None and bool(getattr(args, "gpu_valid_mask", False)):
-                        actions_t, flat_t, gather_t, search_action_t, template_valid_t, _valid_t = gpu_action_template
-                        key = tuple(live_pos)
-                        pos_t = live_pos_tensor_cache.get(key)
-                        if pos_t is None:
-                            pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
-                            live_pos_tensor_cache[key] = pos_t
-                        actions_live = actions_t.index_select(0, pos_t)
-                        flat_live = flat_t.index_select(0, pos_t)
-                        gather_live = gather_t.index_select(0, pos_t)
-                        search_live = search_action_t.index_select(0, pos_t)
-                        template_valid_live = template_valid_t.index_select(0, pos_t)
-                        selected_live = selected_t_all.index_select(0, pos_t)
-                        selected_by_action = torch.gather(selected_live, 1, gather_live)
-                        valid_live = template_valid_live & (search_live | ~selected_by_action)
-                        return actions_live, flat_live, valid_live
-                    if gpu_action_template is not None and len(live_pos) == len(root_env_ids):
-                        actions_t, flat_t, _gather_t, _search_action_t, _template_valid_t, valid_t = gpu_action_template
-                        valid_t.copy_(torch.from_numpy(physical.valid), non_blocking=False)
-                        return actions_t, flat_t, valid_t
-                    if len(live_pos) == len(root_env_ids):
-                        prealloc_action_t.copy_(torch.from_numpy(physical.actions), non_blocking=False)
-                        prealloc_flat_t.copy_(torch.from_numpy(physical.bases * 2 + physical.sensors), non_blocking=False)
-                        prealloc_valid_t.copy_(torch.from_numpy(physical.valid), non_blocking=False)
-                        return prealloc_action_t, prealloc_flat_t, prealloc_valid_t
-                    return (
-                        torch.as_tensor(physical.actions, device=device, dtype=torch.long),
-                        torch.as_tensor(physical.bases * 2 + physical.sensors, device=device, dtype=torch.long),
-                        torch.as_tensor(physical.valid, device=device, dtype=torch.bool),
-                    )
+                if best is None:
+                    def action_tensor_prep():
+                        if gpu_action_template is not None and bool(getattr(args, "gpu_valid_mask", False)) and len(live_pos) == len(root_env_ids):
+                            actions_t, flat_t, gather_t, search_action_t, template_valid_t, valid_t = gpu_action_template
+                            selected_by_action = torch.gather(selected_t_all, 1, gather_t)
+                            valid_t.copy_(template_valid_t & (search_action_t | ~selected_by_action), non_blocking=False)
+                            return actions_t, flat_t, valid_t
+                        if gpu_action_template is not None and bool(getattr(args, "gpu_valid_mask", False)):
+                            actions_t, flat_t, gather_t, search_action_t, template_valid_t, _valid_t = gpu_action_template
+                            key = tuple(live_pos)
+                            pos_t = live_pos_tensor_cache.get(key)
+                            if pos_t is None:
+                                pos_t = torch.as_tensor(live_pos, device=device, dtype=torch.long)
+                                live_pos_tensor_cache[key] = pos_t
+                            actions_live = actions_t.index_select(0, pos_t)
+                            flat_live = flat_t.index_select(0, pos_t)
+                            gather_live = gather_t.index_select(0, pos_t)
+                            search_live = search_action_t.index_select(0, pos_t)
+                            template_valid_live = template_valid_t.index_select(0, pos_t)
+                            selected_live = selected_t_all.index_select(0, pos_t)
+                            selected_by_action = torch.gather(selected_live, 1, gather_live)
+                            valid_live = template_valid_live & (search_live | ~selected_by_action)
+                            return actions_live, flat_live, valid_live
+                        if gpu_action_template is not None and len(live_pos) == len(root_env_ids):
+                            actions_t, flat_t, _gather_t, _search_action_t, _template_valid_t, valid_t = gpu_action_template
+                            valid_t.copy_(torch.from_numpy(physical.valid), non_blocking=False)
+                            return actions_t, flat_t, valid_t
+                        if len(live_pos) == len(root_env_ids):
+                            prealloc_action_t.copy_(torch.from_numpy(physical.actions), non_blocking=False)
+                            prealloc_flat_t.copy_(torch.from_numpy(physical.bases * 2 + physical.sensors), non_blocking=False)
+                            prealloc_valid_t.copy_(torch.from_numpy(physical.valid), non_blocking=False)
+                            return prealloc_action_t, prealloc_flat_t, prealloc_valid_t
+                        return (
+                            torch.as_tensor(physical.actions, device=device, dtype=torch.long),
+                            torch.as_tensor(physical.bases * 2 + physical.sensors, device=device, dtype=torch.long),
+                            torch.as_tensor(physical.valid, device=device, dtype=torch.bool),
+                        )
 
-                actions_t, flat_t, valid_t = time_stage(device, profile_enabled, stage_buckets, "graph_action_tensor_prep_h2d", action_tensor_prep)
+                    actions_t, flat_t, valid_t = time_stage(device, profile_enabled, stage_buckets, "graph_action_tensor_prep_h2d", action_tensor_prep)
 
-                def select_actions():
-                    candidate_scores = torch.gather(score_t.reshape(len(live_pos), -1), 1, flat_t)
-                    candidate_scores.masked_fill_(~valid_t, -torch.inf)
-                    idx = torch.argmax(candidate_scores, dim=1)
-                    return torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
+                    def select_actions():
+                        candidate_scores = torch.gather(score_t.reshape(len(live_pos), -1), 1, flat_t)
+                        candidate_scores.masked_fill_(~valid_t, -torch.inf)
+                        idx = torch.argmax(candidate_scores, dim=1)
+                        return torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
 
-                best = time_stage(device, profile_enabled, stage_buckets, "graph_decision_select_device", select_actions)
+                    best = time_stage(device, profile_enabled, stage_buckets, "graph_decision_select_device", select_actions)
 
                 def action_d2h():
                     if pinned_action_cpu is not None:
@@ -1683,6 +1850,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         "root_graph_replays": int(root_graph_replays),
         "root_raw_encodes": int(root_raw_encodes),
         "graph_replay_rounds": int(graph_replay_rounds),
+        "graph_select_replay_rounds": int(graph_select_replay_rounds),
         "padded_graph_rounds": int(padded_graph_rounds),
         "raw_rounds": int(raw_rounds),
         "batch_env_step_calls": int(batch_env_step_calls),
@@ -1732,6 +1900,7 @@ def main() -> None:
     parser.add_argument("--gpu-action-template", action="store_true", help="Keep cached action IDs and score indices resident on GPU.")
     parser.add_argument("--gpu-valid-mask", action="store_true", help="Derive per-decision action validity from cached GPU bases and selected masks.")
     parser.add_argument("--padded-live-graph", action="store_true", help="Replay the full-batch score graph for partial live batches and gather live rows.")
+    parser.add_argument("--full-select-graph", action="store_true", help="Use a CUDA graph that captures score replay plus action selection for full-live graph rounds.")
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--profile-cpu-top", type=int, default=0, help="Record top cumulative cProfile functions for each benchmark path.")
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
