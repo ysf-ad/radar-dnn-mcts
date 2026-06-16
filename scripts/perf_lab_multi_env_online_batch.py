@@ -120,6 +120,14 @@ class PackedRootObs:
     arrival_rate: np.ndarray
 
 
+@dataclass
+class PhysicalActionTemplate:
+    actions: np.ndarray
+    bases: np.ndarray
+    sensors: np.ndarray
+    valid: np.ndarray
+
+
 def pack_root_observations(observations: list[dict], max_trackers: int) -> PackedRootObs:
     n = len(observations)
     zeros_t = np.zeros(max_trackers, dtype=np.float32)
@@ -585,6 +593,68 @@ def physical_action_table_from_packed(packed: PackedRootObs, live_pos: list[int]
     bases[:, x_cols] = ordered_bases
     sensors[:, x_cols] = 1
     valid[:, x_cols] = ordered_valid & x_free[:, None] & (ordered_ranges > 5_000_000.0) & (ordered_ranges < 100_000_000.0)
+    return BatchedPhysicalActionTable(actions=actions, bases=bases, sensors=sensors, valid=valid)
+
+
+def physical_action_template_from_packed(packed: PackedRootObs, max_trackers: int) -> PhysicalActionTemplate:
+    from exact_env_mutual import xs_s_search_action, xs_s_track_action, xs_x_search_action, xs_x_track_action
+
+    n = int(packed.active.shape[0])
+    width = 2 + 2 * int(max_trackers)
+    actions = np.full((n, width), -1, dtype=np.int64)
+    bases = np.zeros((n, width), dtype=np.int64)
+    sensors = np.zeros((n, width), dtype=np.int64)
+    valid = np.zeros((n, width), dtype=bool)
+    if n <= 0:
+        return PhysicalActionTemplate(actions=actions, bases=bases, sensors=sensors, valid=valid)
+
+    active = packed.active
+    deadline = packed.deadline
+    ranges = packed.ranges
+    s_free = packed.s_busy_ms <= 0.0
+    x_free = (packed.enable_x_band.astype(np.int32) != 0) & (packed.x_busy_ms <= 0.0)
+    valid_target = active & np.isfinite(deadline) & (deadline >= 0.0)
+    sort_key = np.where(valid_target, deadline, np.inf)
+    target_order = np.argsort(sort_key, axis=1, kind="stable")
+    row_idx = np.arange(n)[:, None]
+    ordered_ranges = ranges[row_idx, target_order]
+    ordered_valid = valid_target[row_idx, target_order]
+    ordered_bases = target_order + 1
+
+    s_track_by_target = np.asarray([xs_s_track_action(i + 1, max_trackers) for i in range(max_trackers)], dtype=np.int64)
+    x_track_by_target = np.asarray([xs_x_track_action(i + 1, max_trackers) for i in range(max_trackers)], dtype=np.int64)
+    actions[:, 0] = xs_s_search_action(max_trackers)
+    bases[:, 0] = 0
+    sensors[:, 0] = 0
+    valid[:, 0] = True
+    actions[:, 1] = xs_x_search_action(max_trackers)
+    bases[:, 1] = 0
+    sensors[:, 1] = 1
+    valid[:, 1] = x_free
+    s_cols = slice(2, 2 + max_trackers)
+    x_cols = slice(2 + max_trackers, 2 + 2 * max_trackers)
+    actions[:, s_cols] = s_track_by_target[target_order]
+    bases[:, s_cols] = ordered_bases
+    sensors[:, s_cols] = 0
+    valid[:, s_cols] = ordered_valid & s_free[:, None] & (ordered_ranges > 10_000_000.0) & (ordered_ranges < 184_000_000.0)
+    actions[:, x_cols] = x_track_by_target[target_order]
+    bases[:, x_cols] = ordered_bases
+    sensors[:, x_cols] = 1
+    valid[:, x_cols] = ordered_valid & x_free[:, None] & (ordered_ranges > 5_000_000.0) & (ordered_ranges < 100_000_000.0)
+    return PhysicalActionTemplate(actions=actions, bases=bases, sensors=sensors, valid=valid)
+
+
+def physical_action_table_from_template(template: PhysicalActionTemplate, live_pos: list[int], selected: list[set[int]]):
+    from perf_fast_planner import BatchedPhysicalActionTable
+
+    idx = np.asarray(live_pos, dtype=np.int64)
+    actions = template.actions[idx]
+    bases = template.bases[idx]
+    sensors = template.sensors[idx]
+    valid = template.valid[idx].copy()
+    for row, pos in enumerate(live_pos):
+        for base in selected[pos]:
+            valid[row, bases[row] == int(base)] = False
     return BatchedPhysicalActionTable(actions=actions, bases=bases, sensors=sensors, valid=valid)
 
 
@@ -1201,6 +1271,17 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
             "graph_root_tokenize_batch",
             lambda: tokenize_packed_root_fast(adapt, packed, MAXT, TOKEN_DIM),
         )
+        physical_template = (
+            time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "graph_physical_action_template",
+                lambda: physical_action_template_from_packed(packed, MAXT),
+            )
+            if bool(getattr(args, "cached_action_table", False))
+            else None
+        )
         sync(device)
         t0 = time.perf_counter()
         with torch.inference_mode():
@@ -1243,7 +1324,9 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                 profile_enabled,
                 stage_buckets,
                 "graph_physical_action_table",
-                lambda: physical_action_table_from_packed(packed, live_pos, selected, MAXT),
+                lambda: physical_action_table_from_template(physical_template, live_pos, selected)
+                if physical_template is not None
+                else physical_action_table_from_packed(packed, live_pos, selected, MAXT),
             )
             sync(device)
             t0 = time.perf_counter()
@@ -1434,6 +1517,8 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--skip-graph", action="store_true")
     parser.add_argument("--paired-heads", action="store_true", help="Use inference-only paired policy/Q MLP head execution.")
+    parser.add_argument("--direct-couplers", action="store_true", help="Call one-layer TransformerEncoder couplers through their layer directly.")
+    parser.add_argument("--cached-action-table", action="store_true", help="Cache per-window physical action ordering/layout in the graph path.")
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--profile-cpu-top", type=int, default=0, help="Record top cumulative cProfile functions for each benchmark path.")
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
@@ -1465,6 +1550,7 @@ def main() -> None:
         use_cuda_graph=True,
         use_gpu_select=True,
         use_paired_heads=bool(args.paired_heads),
+        use_direct_couplers=bool(args.direct_couplers),
     )
     batched = BatchedActionAttentionScorer(
         batch_model,

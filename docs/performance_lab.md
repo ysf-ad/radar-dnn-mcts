@@ -1940,6 +1940,60 @@ This suggests the separate policy/Q MLP launches are not the dominant source of
 score replay latency once CUDA graphs are active. The action self-attention and
 surrounding tensor staging remain the higher-value targets.
 
+Two additional exact inference switches were tested:
+
+```text
+--direct-couplers
+--cached-action-table
+```
+
+`--direct-couplers` bypasses the outer `TransformerEncoder` wrapper for the
+one-layer sensor/action couplers and calls the contained
+`TransformerEncoderLayer` directly. A direct cached-score equivalence check was
+exact:
+
+```text
+score shape:       (1, 101, 2)
+max_abs_diff:      0.0
+allclose:          true
+```
+
+The direct-coupler headline was a small improvement on the 64-env, 20-window
+graph path:
+
+```text
+previous graph path after rebuild:  ~829.6 env-windows/s
+direct couplers:                    ~833.0 env-windows/s
+reward delta:                       0.0
+```
+
+`--cached-action-table` moves per-window physical action sorting/layout out of
+the per-decision loop. The action order is fixed from the root state, and each
+decision only masks targets already selected in the current window. This was
+also reward-equivalent:
+
+```text
+16 envs x 5 windows: reward delta graph minus serial = 0.0
+64 envs x 20 windows: reward delta graph minus serial = 0.0
+```
+
+The profiled physical table stage improved substantially:
+
+```text
+old graph_physical_action_table:       ~0.34-0.39 ms per decision
+cached graph_physical_action_table:    ~0.06 ms per decision
+one-time graph_physical_action_template: ~0.25 ms per window
+```
+
+The best measured combination in this pass was direct couplers plus cached
+action table:
+
+```text
+graph throughput:          ~859.4 env-windows/s
+planning ms/env-action:    ~0.0342 ms
+reward delta:              0.0
+```
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer
