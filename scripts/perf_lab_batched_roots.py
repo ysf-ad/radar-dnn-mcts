@@ -97,14 +97,17 @@ def main() -> None:
         fast_actions = batcher.best_actions(obs_batch).astype(np.int64).tolist()
         fast_gpu_actions = batcher.best_actions_torch(obs_batch).astype(np.int64).tolist()
         prepared = batcher.prepare_root_batch(obs_batch)
+        device_prepared = batcher.prepared_to_device(prepared)
         fast_prepared_actions = batcher.best_actions_prepared_torch(prepared).astype(np.int64).tolist()
         fast_prepared_graph_actions = batcher.best_actions_prepared_graph(prepared).astype(np.int64).tolist()
+        fast_device_prepared_actions = batcher.best_actions_prepared_device_graph(device_prepared).astype(np.int64).tolist()
 
         seq_times = []
         batch_times = []
         batch_gpu_times = []
         prepared_times = []
         prepared_graph_times = []
+        device_prepared_graph_times = []
         for i in range(int(args.warmup) + int(args.iters)):
             sync(device)
             t0 = time.perf_counter()
@@ -137,18 +140,26 @@ def main() -> None:
             _ = batcher.best_actions_prepared_graph(prepared)
             sync(device)
             prepared_graph_ms = (time.perf_counter() - t4) * 1000.0
+
+            sync(device)
+            t5 = time.perf_counter()
+            _ = batcher.best_actions_prepared_device_graph(device_prepared)
+            sync(device)
+            device_prepared_graph_ms = (time.perf_counter() - t5) * 1000.0
             if i >= int(args.warmup):
                 seq_times.append(seq_ms)
                 batch_times.append(batch_ms)
                 batch_gpu_times.append(batch_gpu_ms)
                 prepared_times.append(prepared_ms)
                 prepared_graph_times.append(prepared_graph_ms)
+                device_prepared_graph_times.append(device_prepared_graph_ms)
 
         seq = stats(seq_times)
         bat = stats(batch_times)
         bat_gpu = stats(batch_gpu_times)
         prep = stats(prepared_times)
         prep_graph = stats(prepared_graph_times)
+        device_prep_graph = stats(device_prepared_graph_times)
         report["batch_sizes"].append(
             {
                 "batch": int(batch_size),
@@ -156,20 +167,24 @@ def main() -> None:
                 "gpu_actions_match": base_actions == fast_gpu_actions,
                 "prepared_actions_match": base_actions == fast_prepared_actions,
                 "prepared_graph_actions_match": base_actions == fast_prepared_graph_actions,
+                "device_prepared_graph_actions_match": base_actions == fast_device_prepared_actions,
                 "sequential_loop": seq,
                 "batched_score": bat,
                 "batched_score_gpu_select": bat_gpu,
                 "prepared_gpu_select": prep,
                 "prepared_cuda_graph": prep_graph,
+                "device_prepared_cuda_graph": device_prep_graph,
                 "speedup_mean": float(seq["mean_ms"] / max(bat["mean_ms"], 1e-12)),
                 "gpu_select_speedup_mean": float(seq["mean_ms"] / max(bat_gpu["mean_ms"], 1e-12)),
                 "prepared_speedup_mean": float(seq["mean_ms"] / max(prep["mean_ms"], 1e-12)),
                 "prepared_graph_speedup_mean": float(seq["mean_ms"] / max(prep_graph["mean_ms"], 1e-12)),
+                "device_prepared_graph_speedup_mean": float(seq["mean_ms"] / max(device_prep_graph["mean_ms"], 1e-12)),
                 "states_per_second_sequential": float(batch_size / max(seq["mean_ms"], 1e-12) * 1000.0),
                 "states_per_second_batched": float(batch_size / max(bat["mean_ms"], 1e-12) * 1000.0),
                 "states_per_second_batched_gpu_select": float(batch_size / max(bat_gpu["mean_ms"], 1e-12) * 1000.0),
                 "states_per_second_prepared_gpu_select": float(batch_size / max(prep["mean_ms"], 1e-12) * 1000.0),
                 "states_per_second_prepared_cuda_graph": float(batch_size / max(prep_graph["mean_ms"], 1e-12) * 1000.0),
+                "states_per_second_device_prepared_cuda_graph": float(batch_size / max(device_prep_graph["mean_ms"], 1e-12) * 1000.0),
             }
         )
 

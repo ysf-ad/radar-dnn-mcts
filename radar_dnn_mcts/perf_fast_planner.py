@@ -68,6 +68,18 @@ class PreparedBatchedRootBatch:
     count: int
 
 
+@dataclass
+class DevicePreparedBatchedRootBatch:
+    tokens: torch.Tensor
+    slots: torch.Tensor
+    actions: torch.Tensor
+    flat_indices: torch.Tensor
+    valid: torch.Tensor
+    count: int
+    graph: object | None = None
+    graph_best: torch.Tensor | None = None
+
+
 def physical_action_arrays(obs: dict, selected: Iterable[int] | None = None, max_trackers: int = MAXT):
     """Return candidate action ids and score-table indices as NumPy arrays.
 
@@ -1073,6 +1085,66 @@ class BatchedActionAttentionScorer:
         static_valid.copy_(torch.from_numpy(np.ascontiguousarray(prepared.valid)), non_blocking=False)
         cache["graph"].replay()
         return cache["static_best"].cpu().numpy().astype(np.int64, copy=False)
+
+    def prepared_to_device(self, prepared: PreparedBatchedRootBatch) -> DevicePreparedBatchedRootBatch:
+        """Move a prepared root batch to persistent device tensors."""
+        return DevicePreparedBatchedRootBatch(
+            tokens=torch.from_numpy(np.ascontiguousarray(prepared.tokens)).to(self.device, dtype=torch.float32),
+            slots=torch.from_numpy(np.ascontiguousarray(prepared.slots)).to(self.device, dtype=torch.float32),
+            actions=torch.from_numpy(np.ascontiguousarray(prepared.actions)).to(self.device, dtype=torch.long),
+            flat_indices=torch.from_numpy(np.ascontiguousarray(prepared.flat_indices)).to(self.device, dtype=torch.long),
+            valid=torch.from_numpy(np.ascontiguousarray(prepared.valid)).to(self.device, dtype=torch.bool),
+            count=int(prepared.count),
+        )
+
+    def prepare_root_batch_device(self, observations: list[dict], **kwargs) -> DevicePreparedBatchedRootBatch:
+        """Precompute root-batch inputs and keep them resident on the scoring device."""
+        return self.prepared_to_device(self.prepare_root_batch(observations, **kwargs))
+
+    def _best_actions_from_device_tensors(self, prepared: DevicePreparedBatchedRootBatch) -> torch.Tensor:
+        n = int(prepared.count)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
+            score_t = self._combined_scores_from_tokens(prepared.tokens, prepared.slots).float()
+        score_t[:, 0, :] += self.search_score_bias
+        flat_scores = score_t.reshape(n, -1)
+        candidate_scores = torch.gather(flat_scores, 1, prepared.flat_indices)
+        candidate_scores = candidate_scores.masked_fill(~(prepared.valid & torch.isfinite(candidate_scores)), -torch.inf)
+        idx = torch.argmax(candidate_scores, dim=1)
+        best = torch.gather(prepared.actions, 1, idx[:, None]).squeeze(1)
+        has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
+        return torch.where(has_valid, best, torch.full_like(best, -1))
+
+    def best_actions_prepared_device(self, prepared: DevicePreparedBatchedRootBatch) -> np.ndarray:
+        """Score a device-resident prepared batch without rebuilding input tensors."""
+        n = int(prepared.count)
+        if n <= 0:
+            return np.empty((0,), dtype=np.int64)
+        with torch.inference_mode():
+            best = self._best_actions_from_device_tensors(prepared)
+            return best.cpu().numpy().astype(np.int64, copy=False)
+
+    def best_actions_prepared_device_graph(self, prepared: DevicePreparedBatchedRootBatch) -> np.ndarray:
+        """Replay a CUDA Graph over a fixed device-resident prepared batch."""
+        n = int(prepared.count)
+        if n <= 0:
+            return np.empty((0,), dtype=np.int64)
+        if not self.use_cuda_graph or self.device.type != "cuda":
+            return self.best_actions_prepared_device(prepared)
+        try:
+            if prepared.graph is None or prepared.graph_best is None:
+                with torch.inference_mode():
+                    for _ in range(3):
+                        _ = self._best_actions_from_device_tensors(prepared)
+                    torch.cuda.synchronize(self.device)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        graph_best = self._best_actions_from_device_tensors(prepared)
+                prepared.graph = graph
+                prepared.graph_best = graph_best
+            prepared.graph.replay()
+            return prepared.graph_best.cpu().numpy().astype(np.int64, copy=False)
+        except Exception:
+            return self.best_actions_prepared_device(prepared)
 
     def topk_root_proposals(self, observations: list[dict], k: int = 8, **kwargs) -> BatchedRootProposals:
         result = self.score_batch(observations, **kwargs)

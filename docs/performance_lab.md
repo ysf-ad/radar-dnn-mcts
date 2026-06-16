@@ -1186,6 +1186,35 @@ the prepared token, slot, action-index, and validity arrays into static GPU
 buffers before replay. That is why batch 32 benefits strongly from lower launch
 overhead, while batch 128 is closer: larger transfer/model work dominates.
 
+For repeated scoring of the exact same prepared frontier, the fastest path is
+to keep the prepared batch resident on the GPU with
+`prepared_to_device(...)` / `best_actions_prepared_device_graph(...)`. This
+captures the same model-forward and selection graph, but avoids repeated H2D
+copies of the prepared arrays:
+
+```text
+script: scripts/perf_lab_batched_roots.py --cuda-graph
+device=cuda, initial_targets=40, arrival_rate=3, seed=916,
+warmup=8, iterations=30
+
+batch 32:
+    copied prepared CUDA graph:       ~1.73 ms, ~18,534 states/sec
+    device-resident CUDA graph:       ~1.58 ms, ~20,209 states/sec
+    sequential speedup:               ~71.6x
+    selected actions match:           true
+
+batch 128:
+    copied prepared CUDA graph:       ~13.93 ms mean, ~8.38 ms p50
+    device-resident CUDA graph:       ~12.96 ms mean, ~7.25 ms p50
+    sequential speedup:               ~35.3x mean
+    selected actions match:           true
+```
+
+This is the right interface for MCTS/frontier code that revisits a fixed batch
+of candidate roots or leaves. For changing observations, the normal prepared
+path is still needed because the tokens, slots, validity masks, and action
+tables must be rebuilt.
+
 The staged profiler makes the bottleneck explicit. For batch 128, the full path
 spent about `5.8 ms` in tokenization and `3.6-4.0 ms` in slot-feature
 construction before the GPU model forward. The prepared path removes that
