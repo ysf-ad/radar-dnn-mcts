@@ -2213,6 +2213,24 @@ reward delta:                                  0.0
 executed actions delta:                        0
 ```
 
+The graph path now also maintains the per-window slot/context matrix
+incrementally. Only the first four slot features change inside a scheduling
+window (`elapsed`, `search_count`, `track_count`, and `last_action_is_search`);
+the other slot features come from the root state. Updating those four columns
+after each executed action avoids rebuilding slot rows from Python lists every
+decision:
+
+```text
+slot_template.copy()
+    -> update columns 0..3 after each action
+    -> score graph consumes current slot rows
+```
+
+This is a small cleanup, not a headline speedup. In the synchronized 64-env
+profile, `graph_slot_context_update` dropped from roughly `0.12 ms` to
+`0.05 ms` per decision, while the clean 64-env, 20-window headline stayed around
+`900 env-windows/s` with identical reward and executed action count.
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer

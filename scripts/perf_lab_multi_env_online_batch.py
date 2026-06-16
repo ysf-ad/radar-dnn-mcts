@@ -1332,8 +1332,8 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         sync(device)
         encode_times.append((time.perf_counter() - t0) * 1000.0)
 
-        full_slots = make_live_slots(slot_template, list(range(len(root_env_ids))), elapsed, search_count, track_count, last, float(args.window_ms))
-        full_slot_t = torch.from_numpy(full_slots).to(device, dtype=torch.float32)
+        current_slots = slot_template.copy()
+        full_slot_t = torch.from_numpy(current_slots).to(device, dtype=torch.float32)
         sync(device)
         t0 = time.perf_counter()
         graph_replay = _build_score_graph(planner, score_graph_cache, cls_out, tok_out, selected_t_all, token_active, full_slot_t)
@@ -1345,7 +1345,6 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         prealloc_action_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.long)
         prealloc_flat_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.long)
         prealloc_valid_t = torch.empty((len(root_env_ids), table_width), device=device, dtype=torch.bool)
-        all_root_pos = list(range(len(root_env_ids)))
         prealloc_full_slot_t = torch.empty((len(root_env_ids), slot_template.shape[1]), device=device, dtype=torch.float32)
         live_pos_tensor_cache: dict[tuple[int, ...], torch.Tensor] = {}
         depth = 0
@@ -1355,7 +1354,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                 profile_enabled,
                 stage_buckets,
                 "graph_slot_context_update",
-                lambda: make_live_slots(slot_template, live_pos, elapsed, search_count, track_count, last, float(args.window_ms)),
+                lambda: current_slots if len(live_pos) == len(root_env_ids) else current_slots[np.asarray(live_pos, dtype=np.int64)].copy(),
             )
             physical = time_stage(
                 device,
@@ -1389,16 +1388,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                     graph_replay_rounds += 1
                 elif graph_replay is not None and bool(getattr(args, "padded_live_graph", False)):
                     def padded_graph_score_path():
-                        all_slots = make_live_slots(
-                            slot_template,
-                            all_root_pos,
-                            elapsed,
-                            search_count,
-                            track_count,
-                            last,
-                            float(args.window_ms),
-                        )
-                        prealloc_full_slot_t.copy_(torch.from_numpy(all_slots), non_blocking=False)
+                        prealloc_full_slot_t.copy_(torch.from_numpy(current_slots), non_blocking=False)
                         key = tuple(live_pos)
                         pos_t = live_pos_tensor_cache.get(key)
                         if pos_t is None:
@@ -1537,6 +1527,10 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                     elapsed[pos] += float(dt)
                     executed[env_idx] += 1
                     last[pos] = int(base)
+                    current_slots[pos, 0] = float(elapsed[pos]) / float(args.window_ms)
+                    current_slots[pos, 1] = float(search_count[pos]) / 20.0
+                    current_slots[pos, 2] = float(track_count[pos]) / 100.0
+                    current_slots[pos, 3] = 1.0 if int(last[pos]) == 0 else 0.0
                     if not eng.term_buf[0] and elapsed[pos] < float(args.window_ms):
                         next_ids.append(pos)
                 return next_ids
