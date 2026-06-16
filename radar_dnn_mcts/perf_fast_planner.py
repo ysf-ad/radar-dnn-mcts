@@ -892,6 +892,26 @@ class BatchedActionAttentionScorer:
                 out[i] = int(actions[int(np.nanargmax(vals))])
         return out
 
+    def best_actions_torch(self, observations: list[dict], **kwargs) -> np.ndarray:
+        """Return best root actions while keeping gather/argmax on the device."""
+        score_t, obs2, selected = self._score_dense_torch(observations, **kwargs)
+        n = len(observations)
+        if n <= 0:
+            return np.empty((0,), dtype=np.int64)
+        physical = physical_action_table_batch(obs2, selected=selected, max_trackers=MAXT)
+        device = score_t.device
+        actions_t = torch.as_tensor(physical.actions, device=device, dtype=torch.long)
+        flat_t = torch.as_tensor(physical.bases * 2 + physical.sensors, device=device, dtype=torch.long)
+        valid_t = torch.as_tensor(physical.valid, device=device, dtype=torch.bool)
+        flat_scores = score_t.reshape(n, -1)
+        candidate_scores = torch.gather(flat_scores, 1, flat_t)
+        candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
+        idx = torch.argmax(candidate_scores, dim=1)
+        best = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
+        has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
+        best = torch.where(has_valid, best, torch.full_like(best, -1))
+        return best.cpu().numpy().astype(np.int64, copy=False)
+
     def topk_root_proposals(self, observations: list[dict], k: int = 8, **kwargs) -> BatchedRootProposals:
         result = self.score_batch(observations, **kwargs)
         n = len(observations)

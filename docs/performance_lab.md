@@ -1103,6 +1103,33 @@ the Python action-to-index map because the cursor walks a sorted cached root
 action table exactly once, so duplicates are impossible in that benchmarked
 path. Duplicate-aware modes still keep the map.
 
+## Batched Root Scoring Throughput
+
+`BatchedActionAttentionScorer.best_actions_torch(...)` keeps batched score
+gather and `argmax` on the GPU and returns only the selected action ids. This is
+the throughput-oriented counterpart to the low-latency CUDA Graph planner:
+single online windows are sequential, but independent root states and rollout
+branches can be grouped into one large model call.
+
+`perf_lab_batched_roots.py` compares sequential root decisions against batched
+scoring on the same observation family:
+
+```text
+device=cuda, initial_targets=40, arrival_rate=3, seed=916
+
+batch  sequential   batched GPU-select   speedup   GPU-select throughput
+1        3.744 ms       4.082 ms          0.92x       245 states/sec
+8       29.318 ms       5.161 ms          5.68x     1,550 states/sec
+32     112.302 ms       7.080 ms         15.86x     4,520 states/sec
+128    586.699 ms      47.953 ms         12.23x     2,669 states/sec
+```
+
+All batched GPU-selected actions matched the sequential reference. The useful
+operating range starts once there are enough independent roots to amortize
+tokenization, model launch, and action-table construction. This is the path to
+using the GPU for evaluation sweeps, batched root expansion, and MCTS rollout
+frontiers.
+
 ## CUDA Graph Planner Replay
 
 The online fast planner still had a different bottleneck from root expansion:
