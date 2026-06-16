@@ -2627,6 +2627,29 @@ score calls. In AMP mode it was not exact (`max_abs` around `8e-3` to `1.6e-2`)
 and did not reliably beat eager execution in the scripted benchmark, so it is
 also rejected as an online planner path.
 
+`profile_score_kernels.py` adds a kernel-level Torch profiler view of the cached
+score body. On the trained AMP checkpoint at the 64-prefix shape, the top CUDA
+costs are:
+
+```text
+scaled dot-product attention: ~8.18 ms / 8 active calls
+linear/addmm stack:           ~4.80 ms / 8 active calls
+safe softmax:                 ~3.96 ms / 8 active calls
+layer norm:                   ~3.33 ms / 8 active calls
+autocast copy/to kernels:     ~2.58-2.92 ms / 8 active calls
+bmm:                          ~2.34 ms / 8 active calls
+```
+
+This confirms the remaining bottleneck is not a single Python loop. It is a
+mix of real action self-attention work, many small MLP/LayerNorm launches, and
+autocast conversion kernels. A custom fused inference module would need to
+attack those groups directly.
+
+Lower-precision model conversion was checked as a way to reduce autocast copies.
+Pure FP16 is not drop-in because the invalid-action sentinel `-1e9` overflows
+half precision. BF16 runs faster in the score microbenchmark, but changes scores
+and argmax decisions substantially. Neither is an exact online replacement.
+
 The same labs now also expose `--matmul-precision`. In the isolated score-body
 profile, `--matmul-precision high` improved the mean cached score call:
 
