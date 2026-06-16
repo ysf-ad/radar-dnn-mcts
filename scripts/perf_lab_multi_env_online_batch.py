@@ -182,7 +182,7 @@ def pack_root_observations(observations: list[dict], max_trackers: int) -> Packe
     )
 
 
-def pack_root_envs_direct(envs, root_env_ids: list[int], search_debt: list[float], env_cfg: dict, max_trackers: int) -> PackedRootObs:
+def pack_root_envs_direct(envs, root_env_ids: list[int], search_debt: list[float], env_cfg: dict, max_trackers: int, aux_vec=None) -> PackedRootObs:
     from pufferlib.ocean.radarxs import binding
     from pufferlib.ocean.radarxs.engine import FEATURES_PER_TRACKER, GRID_SIZE, NO_TARGET
 
@@ -240,7 +240,23 @@ def pack_root_envs_direct(envs, root_env_ids: list[int], search_debt: list[float
     s_busy_ms = np.zeros((n,), dtype=np.float32)
     x_busy_ms = np.zeros((n,), dtype=np.float32)
     enable_x_band = np.zeros((n,), dtype=np.float32)
-    if hasattr(binding, "vec_aux"):
+    if hasattr(binding, "vec_aux_arrays") and hasattr(binding, "vec_view_firsts"):
+        view = None
+        try:
+            use_existing_view = aux_vec is not None and len(root_env_ids) == len(envs) and all(int(v) == idx for idx, v in enumerate(root_env_ids))
+            if use_existing_view:
+                view = aux_vec
+            else:
+                view = binding.vec_view_firsts(*[envs[i].env for i in root_env_ids])
+            aux = binding.vec_aux_arrays(view)
+            s_busy_ms = np.asarray(aux["s_band_busy_ms"], dtype=np.float32)
+            x_busy_ms = np.asarray(aux["x_band_busy_ms"], dtype=np.float32)
+            enable_x_band = np.asarray(aux["enable_x_band"], dtype=np.float32)
+            ranges = np.asarray(aux["target_range"], dtype=np.float32)
+        finally:
+            if view is not None and view is not aux_vec and hasattr(binding, "vec_release"):
+                binding.vec_release(view)
+    elif hasattr(binding, "vec_aux"):
         for row, env_idx in enumerate(root_env_ids):
             try:
                 aux = binding.vec_aux(envs[env_idx].env)
@@ -1250,7 +1266,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                 profile_enabled,
                 stage_buckets,
                 "graph_root_pack_direct",
-                lambda: pack_root_envs_direct(envs, root_env_ids, search_debt, planner.env_cfg, MAXT),
+                lambda: pack_root_envs_direct(envs, root_env_ids, search_debt, planner.env_cfg, MAXT, aux_vec=env_vec),
             )
         else:
             obs2 = time_stage(

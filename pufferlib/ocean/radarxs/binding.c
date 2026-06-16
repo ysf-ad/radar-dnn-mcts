@@ -409,6 +409,81 @@ static PyObject* radarxs_vec_aux_all(PyObject* self, PyObject* args) {
     return list;
 }
 
+static PyObject* radarxs_vec_aux_arrays(PyObject* self, PyObject* args) {
+    if (PyTuple_Size(args) < 1) {
+        PyErr_SetString(PyExc_TypeError, "expected vec env handle");
+        return NULL;
+    }
+    PyObject* handle_obj = PyTuple_GetItem(args, 0);
+    if (!PyObject_TypeCheck(handle_obj, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "vec env handle must be an integer");
+        return NULL;
+    }
+    RadarxsVecEnv* vec = (RadarxsVecEnv*)PyLong_AsVoidPtr(handle_obj);
+    if (!vec || vec->num_envs <= 0 || !vec->envs || !vec->envs[0]) {
+        PyErr_SetString(PyExc_ValueError, "invalid vec env handle");
+        return NULL;
+    }
+    int n = vec->num_envs;
+    int max_trackers = vec->envs[0]->max_trackers;
+    npy_intp one_dim[1] = {n};
+    npy_intp range_dim[2] = {n, max_trackers};
+    PyObject* s_busy_obj = PyArray_SimpleNew(1, one_dim, NPY_FLOAT32);
+    PyObject* x_busy_obj = PyArray_SimpleNew(1, one_dim, NPY_FLOAT32);
+    PyObject* enable_obj = PyArray_SimpleNew(1, one_dim, NPY_FLOAT32);
+    PyObject* ranges_obj = PyArray_SimpleNew(2, range_dim, NPY_FLOAT32);
+    if (!s_busy_obj || !x_busy_obj || !enable_obj || !ranges_obj) {
+        Py_XDECREF(s_busy_obj);
+        Py_XDECREF(x_busy_obj);
+        Py_XDECREF(enable_obj);
+        Py_XDECREF(ranges_obj);
+        return NULL;
+    }
+    float* s_busy = (float*)PyArray_DATA((PyArrayObject*)s_busy_obj);
+    float* x_busy = (float*)PyArray_DATA((PyArrayObject*)x_busy_obj);
+    float* enable = (float*)PyArray_DATA((PyArrayObject*)enable_obj);
+    float* ranges = (float*)PyArray_DATA((PyArrayObject*)ranges_obj);
+    for (int i = 0; i < n; i++) {
+        Radarxs* env = vec->envs[i];
+        if (!env || env->max_trackers != max_trackers) {
+            Py_DECREF(s_busy_obj);
+            Py_DECREF(x_busy_obj);
+            Py_DECREF(enable_obj);
+            Py_DECREF(ranges_obj);
+            PyErr_SetString(PyExc_ValueError, "invalid env or mismatched max_trackers in vector");
+            return NULL;
+        }
+        s_busy[i] = (float)env->s_band_t_until_free;
+        x_busy[i] = (float)env->x_band_t_until_free;
+        enable[i] = (float)env->enable_x_band;
+        for (int j = 0; j < max_trackers; j++) {
+            Target* target = &env->targets[j];
+            ranges[i * max_trackers + j] = sqrtf(
+                target->x * target->x +
+                target->y * target->y +
+                target->z * target->z
+            );
+        }
+    }
+    PyObject* dict = PyDict_New();
+    if (!dict) {
+        Py_DECREF(s_busy_obj);
+        Py_DECREF(x_busy_obj);
+        Py_DECREF(enable_obj);
+        Py_DECREF(ranges_obj);
+        return NULL;
+    }
+    PyDict_SetItemString(dict, "s_band_busy_ms", s_busy_obj);
+    PyDict_SetItemString(dict, "x_band_busy_ms", x_busy_obj);
+    PyDict_SetItemString(dict, "enable_x_band", enable_obj);
+    PyDict_SetItemString(dict, "target_range", ranges_obj);
+    Py_DECREF(s_busy_obj);
+    Py_DECREF(x_busy_obj);
+    Py_DECREF(enable_obj);
+    Py_DECREF(ranges_obj);
+    return dict;
+}
+
 static int radarxs_decode_physical_action(Radarxs* env, int raw_action, int* logical_action, int* requested_sensor) {
     int s_search_action = env->max_trackers + 3;
     int x_search_action = env->max_trackers + 4;
@@ -946,6 +1021,7 @@ static PyObject* radarxs_vec_view_firsts(PyObject* self, PyObject* args) {
     {"vec_restore_many", radarxs_vec_restore_many, METH_VARARGS, "Restore first N radar envs from N snapshot dicts"}, \
     {"vec_aux", radarxs_vec_aux, METH_VARARGS, "Return sensor busy timers and target ranges for first radar env"}, \
     {"vec_aux_all", radarxs_vec_aux_all, METH_VARARGS, "Return sensor busy timers and target ranges for every radar env"}, \
+    {"vec_aux_arrays", radarxs_vec_aux_arrays, METH_VARARGS, "Return dense sensor busy timers and target ranges for every radar env"}, \
     {"vec_step_validated", radarxs_vec_step_validated, METH_VARARGS, "Step every env with Python-wrapper-compatible action validity"}, \
     {"vec_step_validated_into", radarxs_vec_step_validated_into, METH_VARARGS, "Step first N envs and write dt/executed into NumPy arrays"}, \
     {"vec_restore_step_validated_into", radarxs_vec_restore_step_validated_into, METH_VARARGS, "Restore first N envs, assign actions, step, and write dt/executed"}, \

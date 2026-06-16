@@ -2231,6 +2231,33 @@ profile, `graph_slot_context_update` dropped from roughly `0.12 ms` to
 `0.05 ms` per decision, while the clean 64-env, 20-window headline stayed around
 `900 env-windows/s` with identical reward and executed action count.
 
+Direct root packing now uses a dense C aux-array path for sensor busy timers,
+X-band availability, and target ranges. The previous direct pack path still
+called `vec_aux` once per environment, which rebuilt Python dictionaries and
+range lists. The new binding returns dense NumPy arrays in one call:
+
+```text
+vec_aux_arrays(vec)
+    -> s_band_busy_ms [env]
+    -> x_band_busy_ms [env]
+    -> enable_x_band [env]
+    -> target_range [env, target]
+```
+
+The Python root packer reuses the existing batch-step vector handle when the
+whole environment batch is still live, and falls back to a temporary vector view
+or old `vec_aux` path when needed. A direct comparison against the old per-env
+aux dict path matched exactly:
+
+```text
+sample shape: 4 x 100 target ranges
+max abs diff: 0.0
+```
+
+On the trained-checkpoint 64-env, 20-window clean benchmark, the recommended
+graph path improved from roughly `902` to `929 env-windows/s`, again with
+identical reward and executed action count.
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer
