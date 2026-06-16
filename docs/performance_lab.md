@@ -2646,9 +2646,15 @@ autocast conversion kernels. A custom fused inference module would need to
 attack those groups directly.
 
 Lower-precision model conversion was checked as a way to reduce autocast copies.
-Pure FP16 is not drop-in because the invalid-action sentinel `-1e9` overflows
-half precision. BF16 runs faster in the score microbenchmark, but changes scores
-and argmax decisions substantially. Neither is an exact online replacement.
+The fast planner now uses a dtype-safe invalid-action sentinel, preserving
+`-1e9` for the current float32/AMP path while using the finite FP16 minimum only
+when a score tensor is actually half precision. That makes FP16 score-body
+experiments runnable instead of failing on mask overflow.
+
+FP16 still is not promoted as the online path: in a 64-prefix score probe it
+matched the sampled argmax but not full scores, and it was not faster in that
+run. BF16 runs faster in the score microbenchmark, but changes scores and argmax
+decisions substantially. Neither is an exact online replacement.
 
 The same labs now also expose `--matmul-precision`. In the isolated score-body
 profile, `--matmul-precision high` improved the mean cached score call:

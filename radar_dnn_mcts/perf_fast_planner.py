@@ -184,6 +184,10 @@ def _maybe_manual_encoder(module: nn.Module, x: torch.Tensor, src_key_padding_ma
     return module(x, src_key_padding_mask=src_key_padding_mask)
 
 
+def _invalid_action_score(dtype: torch.dtype) -> float:
+    return float(torch.finfo(dtype).min) if dtype == torch.float16 else -1e9
+
+
 def physical_action_arrays(obs: dict, selected: Iterable[int] | None = None, max_trackers: int = MAXT):
     """Return candidate action ids and score-table indices as NumPy arrays.
 
@@ -517,7 +521,7 @@ class FastActionAttentionPlanner:
         else:
             residual = model.action_policy_residual(action_ctx).reshape(bsz, rows, 2)
             q_residual = model.action_q_residual(action_ctx).reshape(bsz, rows, 2)
-        scores = (base_scores + residual).masked_fill(~valid, -1e9)
+        scores = (base_scores + residual).masked_fill(~valid, _invalid_action_score(base_scores.dtype))
         q = (base_q + q_residual).masked_fill(~valid, 0.0)
         return self.policy_weight * scores + self.q_weight * q
 
@@ -592,7 +596,7 @@ class FastActionAttentionPlanner:
         combined[:, 0, :] += self.q_weight * (type_q[:, :, 0] + q_residual[:, 0, :])
         combined[:, 1:, :] = self.policy_weight * (type_logits[:, None, :, 1] + target_logits + residual)[:, 1:, :]
         combined[:, 1:, :] += self.q_weight * (type_q[:, None, :, 1] + target_q + q_residual)[:, 1:, :]
-        return combined.masked_fill(~valid, -1e9)
+        return combined.masked_fill(~valid, _invalid_action_score(combined.dtype))
 
     def score_slots_from_encoded(self, cls_out, tok_out, selected_t, token_active, slot_t):
         """Score many slot/selected contexts against one cached target encoding.
@@ -974,7 +978,7 @@ class BatchedActionAttentionScorer:
         combined[:, 0, :] += self.q_weight * (type_q[:, :, 0] + q_residual[:, 0, :])
         combined[:, 1:, :] = self.policy_weight * (type_logits[:, None, :, 1] + target_logits + residual)[:, 1:, :]
         combined[:, 1:, :] += self.q_weight * (type_q[:, None, :, 1] + target_q + q_residual)[:, 1:, :]
-        return combined.masked_fill(~valid, -1e9)
+        return combined.masked_fill(~valid, _invalid_action_score(combined.dtype))
 
     def _score_dense(
         self,
