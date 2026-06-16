@@ -26,6 +26,7 @@ python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached_cursor
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached_cursor_bulk
+python scripts\perf_lab_attention_backend_variants.py --device cuda --envs 64
 ```
 
 ## First Findings
@@ -1811,6 +1812,23 @@ At this point a custom CUDA kernel for selection is unlikely to be the next
 large win; the selector is around `0.14 ms` in the profiled graph path, while
 `graph_score_replay` remains much larger. A fused selection kernel can still be
 revisited later, but the next high-leverage target is model replay itself.
+
+`perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
+the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
+101 target rows), all tested backends were bit-exact versus default. The longer
+run showed only noise-level differences:
+
+```text
+default:            ~2.318 ms cached score
+mem_efficient_only: ~2.299 ms cached score
+math_only:          ~2.327 ms cached score
+flash_only:         ~2.329 ms cached score
+cudnn_only:         ~2.342 ms cached score
+```
+
+The best case was less than 1% faster than default, so no attention backend is
+forced. The model path should stay on PyTorch defaults unless a future runtime
+or model shape changes this result.
 
 Mixed precision was also tested on the current direct-pack/fast-step path and
 rejected on this Windows/CUDA/PyTorch stack:
