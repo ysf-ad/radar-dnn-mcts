@@ -16,10 +16,8 @@ venv/
 build/
 dist/
 
-checkpoints/*
-!checkpoints/README.md
-results/*
-!results/README.md
+checkpoints/
+results/
 
 *.pt
 *.pth
