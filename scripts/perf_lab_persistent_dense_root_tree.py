@@ -44,6 +44,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=916)
     parser.add_argument("--capacity", type=int, default=512)
     parser.add_argument("--proposal-mode", choices=["recompute", "cached", "cached_cursor", "cached_cursor_bulk"], default="recompute")
+    parser.add_argument("--maintain-action-index", action="store_true", help="Keep the Python action->index map even for cursor-bulk mode.")
     parser.add_argument("--select-every-wave", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("perf_lab_persistent_dense_root_tree.json"))
     args = parser.parse_args()
@@ -77,7 +78,8 @@ def main() -> None:
         batch_size=search_batch_size,
         budget_ms=200.0,
     )
-    tree = PersistentDenseRootTree(search, capacity=int(args.capacity))
+    maintain_action_index = bool(args.maintain_action_index or str(args.proposal_mode) != "cached_cursor_bulk")
+    tree = PersistentDenseRootTree(search, capacity=int(args.capacity), maintain_action_index=maintain_action_index)
     sync(device)
     setup_ms = (time.perf_counter() - t_setup) * 1000.0
 
@@ -94,6 +96,7 @@ def main() -> None:
         "search_batch_size": int(search_batch_size),
         "capacity": int(args.capacity),
         "proposal_mode": str(args.proposal_mode),
+        "maintain_action_index": bool(maintain_action_index),
         "select_every_wave": bool(args.select_every_wave),
         "one_time_setup_ms": float(setup_ms),
     }
@@ -112,7 +115,7 @@ def main() -> None:
         for i in range(int(args.warmup) + int(args.iters)):
             # Use a fresh dense tree per iteration so every timing run has the
             # same root and same number of updates.
-            tree = PersistentDenseRootTree(search, capacity=int(args.capacity))
+            tree = PersistentDenseRootTree(search, capacity=int(args.capacity), maintain_action_index=maintain_action_index)
             iter_reward = 0.0
 
             sync(device)

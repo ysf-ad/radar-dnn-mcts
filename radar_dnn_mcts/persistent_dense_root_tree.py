@@ -29,11 +29,12 @@ class PersistentDenseRootTree:
     proposals and exact C branch simulation to ``PersistentRootSearch``.
     """
 
-    def __init__(self, search: PersistentRootSearch, capacity: int = 256):
+    def __init__(self, search: PersistentRootSearch, capacity: int = 256, maintain_action_index: bool = True):
         self.search = search
         self.capacity = int(capacity)
         if self.capacity <= 0:
             raise ValueError("capacity must be positive")
+        self.maintain_action_index = bool(maintain_action_index)
 
         self.actions = np.full((self.capacity,), -1, dtype=np.int32)
         self.prior_scores = np.full((self.capacity,), -np.inf, dtype=np.float32)
@@ -76,7 +77,8 @@ class PersistentDenseRootTree:
                     continue
                 idx = self.size
                 self.size += 1
-                self._action_to_index[action] = idx
+                if self.maintain_action_index:
+                    self._action_to_index[action] = idx
                 self.actions[idx] = action
                 self.valid[idx] = True
                 inserted += 1
@@ -147,8 +149,9 @@ class PersistentDenseRootTree:
         self.executed[start:stop] = executed[:take]
         self.valid[start:stop] = True
         indices[:take] = idx
-        for action, action_idx in zip(actions[:take].tolist(), idx.tolist()):
-            self._action_to_index[int(action)] = int(action_idx)
+        if self.maintain_action_index:
+            for action, action_idx in zip(actions[:take].tolist(), idx.tolist()):
+                self._action_to_index[int(action)] = int(action_idx)
         self.size = stop
         self._prior_dirty = True
         return DenseRootTreeUpdate(
@@ -166,6 +169,8 @@ class PersistentDenseRootTree:
 
     def expand_root_cached(self, top_k: int, only_new: bool = True) -> DenseRootTreeUpdate:
         exclude = set(self._action_to_index) if only_new else None
+        if only_new and not self.maintain_action_index:
+            raise RuntimeError("expand_root_cached(only_new=True) requires maintain_action_index=True")
         actions, scores = self.search.propose_cached(top_k=int(top_k), exclude=exclude)
         if actions.size == 0:
             empty_sim = BranchStepResult(

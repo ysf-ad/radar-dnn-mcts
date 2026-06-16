@@ -898,6 +898,24 @@ cached prior + Q:
 The selected action, unique action count, visit count, and reward sum matched
 the uncached selector runs.
 
+Cursor-bulk expansion can also skip the Python action-to-index map. The cursor
+walks a sorted root action table once, so actions are unique by construction and
+no duplicate-aware exclusion is needed. The default benchmark now disables map
+maintenance for `cached_cursor_bulk`, while duplicate-aware modes keep it.
+
+```text
+cached_cursor_bulk with action map:
+    dense tree update:  ~0.035 ms
+    combined iteration: ~0.265 ms
+
+cached_cursor_bulk without action map:
+    dense tree update:  ~0.022 ms
+    combined iteration: ~0.238 ms
+```
+
+Selection and reward outputs matched. This is a root-only specialization; the
+generic duplicate-aware tree update still maintains the map.
+
 ## Cached Action-Attention Internals
 
 `profile_cached_action_attention_internals.py` splits the cached action-attention scoring path into stage timings. After the combined policy/Q scoring path, a full cached score pass is roughly 2.2-2.6 ms on CUDA across prefix batches from 1 to 64:
