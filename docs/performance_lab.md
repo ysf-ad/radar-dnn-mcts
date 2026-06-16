@@ -1984,10 +1984,13 @@ one-time graph_physical_action_template: ~0.25 ms per window
 ```
 
 The cached action table path now also has `--gpu-action-template`, which keeps
-the fixed per-window action IDs and score indices resident on GPU. Each
-decision still refreshes the changing validity mask, but avoids repeatedly
-uploading the large action/index tables. The smoke and 64-env runs preserved
-reward parity:
+the fixed per-window action IDs and score indices resident on GPU. It can be
+paired with `--gpu-valid-mask`, which derives the per-decision validity mask on
+GPU from the fixed action base indices and the current selected-target mask.
+This avoids rebuilding and uploading the changing validity mask from CPU each
+decision.
+
+The smoke and 64-env runs preserved reward parity:
 
 ```text
 16 envs x 5 windows:  reward delta graph minus serial = 0.0
@@ -1997,21 +2000,36 @@ reward parity:
 The best measured command in this pass was:
 
 ```bash
-python scripts/perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --cached-action-table --gpu-action-template
+python scripts/perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --cached-action-table --gpu-action-template --gpu-valid-mask
 ```
 
 Result:
 
 ```text
-graph throughput:          ~944.8 env-windows/s
-planning ms/env-action:    ~0.0308 ms
+graph throughput:          ~954.0 env-windows/s
+planning ms/env-action:    ~0.0307 ms
 reward delta:              0.0
 ```
 
 This is the strongest end-to-end result so far in the current clean repo. The
-synchronized profile still shows `graph_score_replay` around `3.0 ms` under
-heavy profiling, so the model replay itself remains the next target. The
-template optimization mainly removes repeated tensor staging around selection.
+synchronized profile is useful for bottleneck ranking, but it inserts many CUDA
+synchronizations and should not be used as the headline latency number. On the
+64-env, 10-window profiled graph path, the largest per-decision stages were:
+
+```text
+graph_score_replay:             ~1.73 ms mean
+graph_env_step_batch:           ~1.09 ms mean
+graph_root_pack_direct:         ~0.83 ms mean
+graph_root_tokenize_batch:      ~0.62 ms mean
+graph_action_template_h2d:      ~0.38 ms mean, once per root/window
+graph_physical_action_template: ~0.34 ms mean, once per root/window
+graph_action_tensor_prep_h2d:   ~0.18 ms mean
+graph_decision_select_device:   ~0.15 ms mean
+```
+
+The next high-value targets are model replay, environment stepping, and root
+packing/tokenization. The action-template and validity-mask optimizations mainly
+remove repeated tensor staging around selection.
 
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
