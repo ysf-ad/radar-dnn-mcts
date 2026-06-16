@@ -1282,6 +1282,21 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
             if bool(getattr(args, "cached_action_table", False))
             else None
         )
+        gpu_action_template = None
+        if physical_template is not None and bool(getattr(args, "gpu_action_template", False)):
+            def upload_action_template():
+                actions_t = torch.from_numpy(physical_template.actions).to(device, dtype=torch.long)
+                flat_t = torch.from_numpy(physical_template.bases * 2 + physical_template.sensors).to(device, dtype=torch.long)
+                valid_t = torch.empty_like(torch.from_numpy(physical_template.valid).to(device, dtype=torch.bool))
+                return actions_t, flat_t, valid_t
+
+            gpu_action_template = time_stage(
+                device,
+                profile_enabled,
+                stage_buckets,
+                "graph_action_template_h2d",
+                upload_action_template,
+            )
         sync(device)
         t0 = time.perf_counter()
         with torch.inference_mode():
@@ -1362,6 +1377,10 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                     raw_rounds += 1
                 score_t[:, 0, :] += planner.search_score_bias
                 def action_tensor_prep():
+                    if gpu_action_template is not None and len(live_pos) == len(root_env_ids):
+                        actions_t, flat_t, valid_t = gpu_action_template
+                        valid_t.copy_(torch.from_numpy(physical.valid), non_blocking=False)
+                        return actions_t, flat_t, valid_t
                     if len(live_pos) == len(root_env_ids):
                         prealloc_action_t.copy_(torch.from_numpy(physical.actions), non_blocking=False)
                         prealloc_flat_t.copy_(torch.from_numpy(physical.bases * 2 + physical.sensors), non_blocking=False)
@@ -1519,6 +1538,7 @@ def main() -> None:
     parser.add_argument("--paired-heads", action="store_true", help="Use inference-only paired policy/Q MLP head execution.")
     parser.add_argument("--direct-couplers", action="store_true", help="Call one-layer TransformerEncoder couplers through their layer directly.")
     parser.add_argument("--cached-action-table", action="store_true", help="Cache per-window physical action ordering/layout in the graph path.")
+    parser.add_argument("--gpu-action-template", action="store_true", help="Keep cached action IDs and score indices resident on GPU.")
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--profile-cpu-top", type=int, default=0, help="Record top cumulative cProfile functions for each benchmark path.")
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")

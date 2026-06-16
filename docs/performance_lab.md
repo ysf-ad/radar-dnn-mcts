@@ -1994,6 +1994,36 @@ planning ms/env-action:    ~0.0342 ms
 reward delta:              0.0
 ```
 
+The cached action table path now also has `--gpu-action-template`, which keeps
+the fixed per-window action IDs and score indices resident on GPU. Each
+decision still refreshes the changing validity mask, but avoids repeatedly
+uploading the large action/index tables. The smoke and 64-env runs preserved
+reward parity:
+
+```text
+16 envs x 5 windows:  reward delta graph minus serial = 0.0
+64 envs x 20 windows: reward delta graph minus serial = 0.0
+```
+
+The best measured command in this pass was:
+
+```bash
+python scripts/perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --direct-couplers --cached-action-table --gpu-action-template
+```
+
+Result:
+
+```text
+graph throughput:          ~930.5 env-windows/s
+planning ms/env-action:    ~0.0311 ms
+reward delta:              0.0
+```
+
+This is the strongest end-to-end result so far in the current clean repo. The
+synchronized profile still shows `graph_score_replay` around `3.0 ms` under
+heavy profiling, so the model replay itself remains the next target. The
+template optimization mainly removes repeated tensor staging around selection.
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer
