@@ -879,11 +879,9 @@ def run_batched_cached(planner, envs, args, device: torch.device) -> dict:
 
                 def select_actions():
                     candidate_scores = torch.gather(score_t.reshape(len(live_pos), -1), 1, flat_t)
-                    candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
+                    candidate_scores = candidate_scores.masked_fill(~valid_t, -torch.inf)
                     idx = torch.argmax(candidate_scores, dim=1)
-                    best = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
-                    has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
-                    return torch.where(has_valid, best, torch.full_like(best, -1))
+                    return torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
 
                 best = time_stage(device, profile_enabled, stage_buckets, "decision_select_device", select_actions)
                 actions = time_stage(
@@ -1197,11 +1195,9 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
 
                 def select_actions():
                     candidate_scores = torch.gather(score_t.reshape(len(live_pos), -1), 1, flat_t)
-                    candidate_scores = candidate_scores.masked_fill(~(valid_t & torch.isfinite(candidate_scores)), -torch.inf)
+                    candidate_scores = candidate_scores.masked_fill(~valid_t, -torch.inf)
                     idx = torch.argmax(candidate_scores, dim=1)
-                    best = torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
-                    has_valid = torch.any(torch.isfinite(candidate_scores), dim=1)
-                    return torch.where(has_valid, best, torch.full_like(best, -1))
+                    return torch.gather(actions_t, 1, idx[:, None]).squeeze(1)
 
                 best = time_stage(device, profile_enabled, stage_buckets, "graph_decision_select_device", select_actions)
                 actions = time_stage(

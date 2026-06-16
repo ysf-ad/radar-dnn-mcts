@@ -1776,6 +1776,42 @@ inside graph replay moved the transfer into the replay stage and reduced the
 64-env long-run throughput, so the graph path keeps the explicit `graph_slot_h2d`
 stage.
 
+The selector was then simplified to the minimum valid-action path. Because the
+dense candidate table always includes at least one valid search action and model
+scores are finite for valid actions, the selector no longer needs per-row
+`isfinite`, `any`, and fallback `where` checks:
+
+```text
+candidate_scores = gather(score, flat_indices)
+candidate_scores = mask_invalid(candidate_scores, -inf)
+idx = argmax(candidate_scores)
+action = gather(actions, idx)
+```
+
+This is still pure PyTorch, but it removes several small kernels from every
+decision depth. The 64-env profiled run showed:
+
+```text
+raw cached decision_select_device:   ~0.56 ms -> ~0.13 ms
+graph decision_select_device:        ~0.60 ms -> ~0.14 ms
+reward delta:                         0.0
+```
+
+The 64-env, 20-window long run with reusable graph, action buffers, and minimal
+selector measured:
+
+```text
+cached root graph throughput: ~911.3 env-windows/s
+planning round:               ~2.00 ms
+planning ms per env-action:   ~0.0313 ms
+reward delta:                 0.0
+```
+
+At this point a custom CUDA kernel for selection is unlikely to be the next
+large win; the selector is around `0.14 ms` in the profiled graph path, while
+`graph_score_replay` remains much larger. A fused selection kernel can still be
+revisited later, but the next high-leverage target is model replay itself.
+
 Mixed precision was also tested on the current direct-pack/fast-step path and
 rejected on this Windows/CUDA/PyTorch stack:
 
