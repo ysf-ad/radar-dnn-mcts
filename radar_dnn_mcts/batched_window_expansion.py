@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -67,8 +69,10 @@ class BatchedWindowExpansionScorer:
         planner: FastActionAttentionPlanner,
         obs: dict,
         budget_ms: float = 200.0,
+        profile_values: dict[str, list[float]] | None = None,
     ):
         self.planner = planner
+        self._profile_values = profile_values
         self.env_cfg = dict(planner.env_cfg)
         self.obs = attach_env_obs(obs, self.env_cfg, True, True)
         self.budget_ms = float(budget_ms)
@@ -90,6 +94,23 @@ class BatchedWindowExpansionScorer:
         self._root_sensors_dev = torch.as_tensor(self._root_sensors, device=self.planner.device, dtype=torch.long)
         self._root_flat_indices_dev = torch.as_tensor(self._root_flat_indices, device=self.planner.device, dtype=torch.long)
         self._slot_template = slot_features(self.obs, 0.0, 0, 0, -1, self.budget_ms).astype(np.float32, copy=True)
+        if not hasattr(planner, "_prefix_score_graph_cache"):
+            planner._prefix_score_graph_cache = {}
+        self._prefix_score_graph_cache: dict[tuple, dict[str, object]] = planner._prefix_score_graph_cache
+
+    def _profile_start(self) -> float:
+        if self._profile_values is None:
+            return 0.0
+        if self.planner.device.type == "cuda":
+            torch.cuda.synchronize(self.planner.device)
+        return time.perf_counter()
+
+    def _profile_end(self, name: str, start: float) -> None:
+        if self._profile_values is None:
+            return
+        if self.planner.device.type == "cuda":
+            torch.cuda.synchronize(self.planner.device)
+        self._profile_values[name].append((time.perf_counter() - start) * 1000.0)
 
     def _selected_masks(self, prefixes: list[BranchPrefix]) -> torch.Tensor:
         selected_t, _valid_t = self._prefix_selected_and_valid(prefixes)
@@ -135,6 +156,90 @@ class BatchedWindowExpansionScorer:
             slots[:, 3] = (last_action == 0).astype(np.float32)
         return torch.from_numpy(slots).to(self.planner.device, dtype=torch.float32)
 
+    def _score_slots(self, selected_t: torch.Tensor, slot_t: torch.Tensor) -> torch.Tensor:
+        graph_pack = self._build_prefix_score_graph(selected_t, slot_t)
+        if graph_pack is not None:
+            static_selected = graph_pack["static_selected"]
+            static_slot = graph_pack["static_slot"]
+            static_score = graph_pack["static_score"]
+            static_selected.copy_(selected_t, non_blocking=False)
+            static_slot.copy_(slot_t, non_blocking=False)
+            graph_pack["graph"].replay()
+            return static_score
+        return self._score_slots_raw(selected_t, slot_t)
+
+    def _score_slots_raw(self, selected_t: torch.Tensor, slot_t: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.planner.use_amp):
+            return self.planner.score_slots_from_encoded(
+                self.cls_out,
+                self.tok_out,
+                selected_t,
+                self.token_active,
+                slot_t,
+            ).float()
+
+    def _build_prefix_score_graph(self, selected_t: torch.Tensor, slot_t: torch.Tensor):
+        if not bool(getattr(self.planner, "use_cuda_graph", False)) or self.planner.device.type != "cuda":
+            return None
+        key = (
+            tuple(selected_t.shape),
+            tuple(slot_t.shape),
+            tuple(self.cls_out.shape),
+            tuple(self.tok_out.shape),
+            tuple(self.token_active.shape),
+            str(selected_t.dtype),
+            str(slot_t.dtype),
+            bool(self.planner.use_amp),
+        )
+        try:
+            cache = self._prefix_score_graph_cache.get(key)
+            if cache is None:
+                static_cls = torch.empty_like(self.cls_out)
+                static_tok = torch.empty_like(self.tok_out)
+                static_active = torch.empty_like(self.token_active)
+                static_selected = torch.empty_like(selected_t)
+                static_slot = torch.empty_like(slot_t)
+                static_cls.copy_(self.cls_out, non_blocking=False)
+                static_tok.copy_(self.tok_out, non_blocking=False)
+                static_active.copy_(self.token_active, non_blocking=False)
+                static_selected.copy_(selected_t, non_blocking=False)
+                static_slot.copy_(slot_t, non_blocking=False)
+
+                def compute_score() -> torch.Tensor:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.planner.use_amp):
+                        return self.planner.score_slots_from_encoded(
+                            static_cls,
+                            static_tok,
+                            static_selected,
+                            static_active,
+                            static_slot,
+                        ).float()
+
+                with torch.inference_mode():
+                    for _ in range(3):
+                        _ = compute_score()
+                    torch.cuda.synchronize(self.planner.device)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        static_score = compute_score()
+                cache = {
+                    "graph": graph,
+                    "static_cls": static_cls,
+                    "static_tok": static_tok,
+                    "static_active": static_active,
+                    "static_selected": static_selected,
+                    "static_slot": static_slot,
+                    "static_score": static_score,
+                }
+                self._prefix_score_graph_cache[key] = cache
+            else:
+                cache["static_cls"].copy_(self.cls_out, non_blocking=False)
+                cache["static_tok"].copy_(self.tok_out, non_blocking=False)
+                cache["static_active"].copy_(self.token_active, non_blocking=False)
+            return cache
+        except Exception:
+            return None
+
     def score_prefixes(self, prefixes: Iterable[BranchPrefix]) -> BranchExpansionResult:
         prefix_list = list(prefixes)
         if not prefix_list:
@@ -148,19 +253,21 @@ class BatchedWindowExpansionScorer:
                 score_tables=np.empty((0, MAXT + 1, 2), dtype=np.float32),
             )
         with torch.inference_mode():
+            t0 = self._profile_start()
             selected_t, valid_t = self._prefix_selected_and_valid(prefix_list)
+            self._profile_end("scorer_selected_valid", t0)
+            t0 = self._profile_start()
             slot_t = self._slots(prefix_list)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.planner.use_amp):
-                score_t = self.planner.score_slots_from_encoded(
-                    self.cls_out,
-                    self.tok_out,
-                    selected_t,
-                    self.token_active,
-                    slot_t,
-                )
+            self._profile_end("scorer_slots", t0)
+            t0 = self._profile_start()
+            score_t = self._score_slots(selected_t, slot_t)
+            self._profile_end("scorer_score_slots", t0)
+            t0 = self._profile_start()
             score_tables = score_t.float().cpu().numpy()
+            self._profile_end("scorer_score_d2h", t0)
         score_tables[:, 0, :] += self.planner.search_score_bias
 
+        t0 = self._profile_start()
         actions_t, bases_t, sensors_t = self._physical_tables_for_prefixes(prefix_list)
         rows = np.arange(len(prefix_list), dtype=np.int64)[:, None]
         vals = score_tables[rows, bases_t, sensors_t]
@@ -172,6 +279,7 @@ class BatchedWindowExpansionScorer:
         out_actions = np.where(out_valid, actions_t[row1, pick], -1).astype(np.int64, copy=False)
         out_bases = np.where(out_valid, bases_t[row1, pick], -1).astype(np.int64, copy=False)
         out_sensors = np.where(out_valid, sensors_t[row1, pick], -1).astype(np.int64, copy=False)
+        self._profile_end("scorer_cpu_select", t0)
         return BranchExpansionResult(
             actions=out_actions,
             scores=out_scores,
@@ -214,14 +322,7 @@ class BatchedWindowExpansionScorer:
         with torch.inference_mode():
             selected_t, valid_np = self._prefix_selected_and_valid(prefix_list)
             slot_t = self._slots(prefix_list)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.planner.use_amp):
-                score_t = self.planner.score_slots_from_encoded(
-                    self.cls_out,
-                    self.tok_out,
-                    selected_t,
-                    self.token_active,
-                    slot_t,
-                ).float()
+            score_t = self._score_slots(selected_t, slot_t)
             score_t[:, 0, :] += self.planner.search_score_bias
             flat_scores = score_t.reshape(len(prefix_list), -1)
             actions_dev = self._root_actions_dev.expand(len(prefix_list), -1)
@@ -268,28 +369,30 @@ class BatchedWindowExpansionScorer:
                 valid=empty_bool,
                 count=0,
             )
+        t0 = self._profile_start()
         selected_t, valid_np = self._prefix_selected_and_valid(prefix_list)
+        self._profile_end("prepare_selected_valid", t0)
+        t0 = self._profile_start()
+        slots = self._slots(prefix_list)
+        valid = torch.as_tensor(valid_np, device=self.planner.device, dtype=torch.bool)
+        self._profile_end("prepare_slots_valid_h2d", t0)
         return DevicePreparedPrefixBatch(
             selected=selected_t,
-            slots=self._slots(prefix_list),
+            slots=slots,
             actions=self._root_actions_dev.expand(n, -1),
             flat_indices=self._root_flat_indices_dev.expand(n, -1),
             bases=self._root_bases_dev.expand(n, -1),
             sensors=self._root_sensors_dev.expand(n, -1),
-            valid=torch.as_tensor(valid_np, device=self.planner.device, dtype=torch.bool),
+            valid=valid,
             count=int(n),
         )
 
-    def _best_from_prepared_device(self, prepared: DevicePreparedPrefixBatch):
+    def _best_from_prepared_device(self, prepared: DevicePreparedPrefixBatch, use_prefix_graph: bool = True):
         n = int(prepared.count)
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.planner.use_amp):
-            score_t = self.planner.score_slots_from_encoded(
-                self.cls_out,
-                self.tok_out,
-                prepared.selected,
-                self.token_active,
-                prepared.slots,
-            ).float()
+        if use_prefix_graph:
+            score_t = self._score_slots(prepared.selected, prepared.slots)
+        else:
+            score_t = self._score_slots_raw(prepared.selected, prepared.slots)
         score_t[:, 0, :] += self.planner.search_score_bias
         flat_scores = score_t.reshape(n, -1)
         candidate_scores = torch.gather(flat_scores, 1, prepared.flat_indices)
@@ -320,13 +423,22 @@ class BatchedWindowExpansionScorer:
                 score_tables=np.empty((0, 0, 0), dtype=np.float32),
             )
         with torch.inference_mode():
+            t0 = self._profile_start()
             best_actions, best_scores, best_bases, best_sensors, has_valid = self._best_from_prepared_device(prepared)
+            self._profile_end("prepared_best_device", t0)
+            t0 = self._profile_start()
+            actions = best_actions.cpu().numpy().astype(np.int64, copy=False)
+            scores = best_scores.cpu().numpy().astype(np.float32, copy=False)
+            bases = best_bases.cpu().numpy().astype(np.int64, copy=False)
+            sensors = best_sensors.cpu().numpy().astype(np.int64, copy=False)
+            valid = has_valid.cpu().numpy().astype(bool, copy=False)
+            self._profile_end("prepared_d2h", t0)
             return BranchExpansionResult(
-                actions=best_actions.cpu().numpy().astype(np.int64, copy=False),
-                scores=best_scores.cpu().numpy().astype(np.float32, copy=False),
-                bases=best_bases.cpu().numpy().astype(np.int64, copy=False),
-                sensors=best_sensors.cpu().numpy().astype(np.int64, copy=False),
-                valid=has_valid.cpu().numpy().astype(bool, copy=False),
+                actions=actions,
+                scores=scores,
+                bases=bases,
+                sensors=sensors,
+                valid=valid,
                 score_tables=np.empty((0, 0, 0), dtype=np.float32),
             )
 
@@ -338,7 +450,7 @@ class BatchedWindowExpansionScorer:
             if prepared.graph is None:
                 with torch.inference_mode():
                     for _ in range(3):
-                        _ = self._best_from_prepared_device(prepared)
+                        _ = self._best_from_prepared_device(prepared, use_prefix_graph=False)
                     torch.cuda.synchronize(self.planner.device)
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
@@ -348,7 +460,7 @@ class BatchedWindowExpansionScorer:
                             graph_best_bases,
                             graph_best_sensors,
                             graph_has_valid,
-                        ) = self._best_from_prepared_device(prepared)
+                        ) = self._best_from_prepared_device(prepared, use_prefix_graph=False)
                 prepared.graph = graph
                 prepared.graph_best_actions = graph_best_actions
                 prepared.graph_best_scores = graph_best_scores
@@ -373,12 +485,16 @@ class BatchedWindowExpansionScorer:
             return []
         scored = self.score_prefixes(prefix_list)
         if int(top_k) == 1:
-            return [
+            t0 = self._profile_start()
+            out = [
                 prefix_after_action(self.obs, prefix, int(scored.actions[row]), float(scored.scores[row]))
                 for row, prefix in enumerate(prefix_list)
                 if bool(scored.valid[row]) and int(scored.actions[row]) >= 0
             ]
+            self._profile_end("expand_child_build_top1", t0)
+            return out
         out: list[BranchPrefix] = []
+        t0 = self._profile_start()
         for row, prefix in enumerate(prefix_list):
             actions, bases, sensors = physical_action_arrays(self.obs, selected=prefix.selected, max_trackers=MAXT)
             if actions.size == 0:
@@ -396,6 +512,7 @@ class BatchedWindowExpansionScorer:
             order = part[np.argsort(-row_vals[part])]
             for idx in order:
                 out.append(prefix_after_action(self.obs, prefix, int(row_actions[idx]), float(row_vals[idx])))
+        self._profile_end("expand_child_build_topk", t0)
         return out
 
     def expand_prefixes_top1_device(self, prefixes: Iterable[BranchPrefix]) -> list[BranchPrefix]:
@@ -410,11 +527,13 @@ class BatchedWindowExpansionScorer:
             return []
         prepared = self.prepare_prefixes_device(prefix_list)
         scored = self.score_prepared_prefixes_device(prepared)
+        t0 = self._profile_start()
         out: list[BranchPrefix] = []
         for row, prefix in enumerate(prefix_list):
             if not bool(scored.valid[row]):
                 continue
             out.append(prefix_after_action(self.obs, prefix, int(scored.actions[row]), float(scored.scores[row])))
+        self._profile_end("expand_child_build_top1", t0)
         return out
 
 
@@ -434,19 +553,66 @@ class BatchedBeamWindowPlanner:
         self.branch_top_k = int(branch_top_k)
         self.max_depth = int(max_depth)
         self.use_top1_device = bool(use_top1_device)
+        self.profile_enabled = False
+        self._profile_values: dict[str, list[float]] = defaultdict(list)
+
+    def set_profile_enabled(self, enabled: bool = True) -> None:
+        self.profile_enabled = bool(enabled)
+
+    def reset_profile(self) -> None:
+        self._profile_values.clear()
+
+    def profile_summary(self) -> dict[str, dict[str, float]]:
+        out: dict[str, dict[str, float]] = {}
+        for name, values in self._profile_values.items():
+            arr = np.asarray(values, dtype=np.float64)
+            if arr.size == 0:
+                continue
+            out[name] = {
+                "calls": int(arr.size),
+                "total_ms": float(arr.sum()),
+                "mean_ms": float(arr.mean()),
+                "p50_ms": float(np.percentile(arr, 50)),
+                "p90_ms": float(np.percentile(arr, 90)),
+                "p99_ms": float(np.percentile(arr, 99)),
+            }
+        return dict(sorted(out.items(), key=lambda kv: kv[1]["total_ms"], reverse=True))
+
+    def _profile_start(self) -> float:
+        if not self.profile_enabled:
+            return 0.0
+        if self.planner.device.type == "cuda":
+            torch.cuda.synchronize(self.planner.device)
+        return time.perf_counter()
+
+    def _profile_end(self, name: str, start: float) -> None:
+        if not self.profile_enabled:
+            return
+        if self.planner.device.type == "cuda":
+            torch.cuda.synchronize(self.planner.device)
+        self._profile_values[name].append((time.perf_counter() - start) * 1000.0)
 
     def plan(self, obs, budget_ms=200):
-        scorer = BatchedWindowExpansionScorer(self.planner, obs, budget_ms=float(budget_ms))
+        t_plan = self._profile_start()
+        t0 = self._profile_start()
+        profile_values = self._profile_values if self.profile_enabled else None
+        scorer = BatchedWindowExpansionScorer(self.planner, obs, budget_ms=float(budget_ms), profile_values=profile_values)
+        self._profile_end("beam_scorer_init", t0)
         frontier = [BranchPrefix()]
         best = frontier[0]
         for _depth in range(max(1, self.max_depth)):
+            t0 = self._profile_start()
             live = [p for p in frontier if float(p.elapsed_ms) < float(budget_ms)]
+            self._profile_end("beam_live_filter", t0)
             if not live:
                 break
+            t0 = self._profile_start()
             if self.use_top1_device and int(self.branch_top_k) == 1:
                 children = scorer.expand_prefixes_top1_device(live)
             else:
                 children = scorer.expand_prefixes(live, top_k=max(1, self.branch_top_k))
+            self._profile_end("beam_expand_prefixes", t0)
+            t0 = self._profile_start()
             children = [p for p in children if p.actions]
             if not children:
                 break
@@ -455,8 +621,12 @@ class BatchedBeamWindowPlanner:
             if frontier and float(frontier[0].score_sum) >= float(best.score_sum):
                 best = frontier[0]
             if best.actions and float(best.elapsed_ms) >= float(budget_ms):
+                self._profile_end("beam_filter_sort_prune", t0)
                 break
-        return list(best.actions) if best.actions else [int(MAXT) + 3]
+            self._profile_end("beam_filter_sort_prune", t0)
+        out = list(best.actions) if best.actions else [int(MAXT) + 3]
+        self._profile_end("beam_plan_total", t_plan)
+        return out
 
 
 def prefix_after_action(obs: dict, prefix: BranchPrefix, action: int, score_delta: float = 0.0) -> BranchPrefix:

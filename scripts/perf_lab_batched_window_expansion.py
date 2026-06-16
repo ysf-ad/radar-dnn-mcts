@@ -61,6 +61,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--prefix-batches", default="1,4,8,16,32,64")
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
@@ -88,7 +89,14 @@ def main() -> None:
     eng.reset(seed=args.seed)
     obs = get_obs(eng, 0.0)
     model = ActionAttentionFactorizedNet(48, 4, 2).eval()
-    planner = FastActionAttentionPlanner(model, env_cfg, device=device, use_amp=bool(args.amp), use_compile=bool(args.compile))
+    planner = FastActionAttentionPlanner(
+        model,
+        env_cfg,
+        device=device,
+        use_amp=bool(args.amp),
+        use_compile=bool(args.compile),
+        use_cuda_graph=bool(args.cuda_graph),
+    )
     scorer = BatchedWindowExpansionScorer(planner, obs, budget_ms=200.0)
 
     max_prefixes = max(int(x) for x in str(args.prefix_batches).split(",") if x.strip())
@@ -99,6 +107,7 @@ def main() -> None:
         "cuda_available": bool(torch.cuda.is_available()),
         "amp": bool(args.amp),
         "compile": bool(args.compile),
+        "cuda_graph": bool(args.cuda_graph),
         "prefix_batches": [],
     }
 

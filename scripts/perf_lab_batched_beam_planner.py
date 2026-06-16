@@ -30,10 +30,16 @@ def stats(values):
     }
 
 
-def bench_plan(planner, obs, device, iters: int, warmup: int):
+def bench_plan(planner, obs, device, iters: int, warmup: int, profile: bool = False):
     times = []
     last_plan = None
+    if profile and hasattr(planner, "reset_profile"):
+        planner.reset_profile()
+    if hasattr(planner, "set_profile_enabled"):
+        planner.set_profile_enabled(False)
     for i in range(int(warmup) + int(iters)):
+        if hasattr(planner, "set_profile_enabled"):
+            planner.set_profile_enabled(bool(profile and i >= int(warmup)))
         sync(device)
         t0 = time.perf_counter()
         last_plan = planner.plan(obs, budget_ms=200)
@@ -41,7 +47,10 @@ def bench_plan(planner, obs, device, iters: int, warmup: int):
         dt_ms = (time.perf_counter() - t0) * 1000.0
         if i >= int(warmup):
             times.append(dt_ms)
-    return last_plan, stats(times)
+    if hasattr(planner, "set_profile_enabled"):
+        planner.set_profile_enabled(False)
+    profile_summary = planner.profile_summary() if profile and hasattr(planner, "profile_summary") else {}
+    return last_plan, stats(times), profile_summary
 
 
 def main() -> None:
@@ -49,6 +58,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--profile", action="store_true")
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--beam-widths", default="1,4,8,16")
@@ -78,18 +89,27 @@ def main() -> None:
     eng.reset(seed=args.seed)
     obs = get_obs(eng, 0.0)
     model = ActionAttentionFactorizedNet(48, 4, 2).eval()
-    fast = FastActionAttentionPlanner(model, env_cfg, device=device, use_amp=bool(args.amp), use_compile=bool(args.compile))
+    fast = FastActionAttentionPlanner(
+        model,
+        env_cfg,
+        device=device,
+        use_amp=bool(args.amp),
+        use_compile=bool(args.compile),
+        use_cuda_graph=bool(args.cuda_graph),
+    )
 
-    fast_plan, fast_stat = bench_plan(fast, obs, device, args.iters, args.warmup)
+    fast_plan, fast_stat, fast_profile = bench_plan(fast, obs, device, args.iters, args.warmup, profile=bool(args.profile))
     report = {
         "device": str(device),
         "cuda_available": bool(torch.cuda.is_available()),
         "amp": bool(args.amp),
         "compile": bool(args.compile),
+        "cuda_graph": bool(args.cuda_graph),
         "branch_top_k": int(args.branch_top_k),
         "max_depth": int(args.max_depth),
         "fast_plan": [int(x) for x in fast_plan],
         "fast_cached_planner": fast_stat,
+        "fast_profile": fast_profile,
         "beam_planners": [],
     }
 
@@ -103,7 +123,14 @@ def main() -> None:
                 max_depth=int(args.max_depth),
                 use_top1_device=bool(use_top1_device),
             )
-            beam_plan, beam_stat = bench_plan(beam, obs, device, args.iters, args.warmup)
+            beam_plan, beam_stat, beam_profile = bench_plan(
+                beam,
+                obs,
+                device,
+                args.iters,
+                args.warmup,
+                profile=bool(args.profile),
+            )
             report["beam_planners"].append(
                 {
                     "beam_width": int(beam_width),
@@ -114,6 +141,7 @@ def main() -> None:
                     "matches_fast_plan": [int(x) for x in beam_plan] == [int(x) for x in fast_plan],
                     "matches_fast_prefix": [int(x) for x in beam_plan] == [int(x) for x in fast_plan[: len(beam_plan)]],
                     "timing": beam_stat,
+                    "profile": beam_profile,
                     "relative_to_fast_mean": float(beam_stat["mean_ms"] / max(fast_stat["mean_ms"], 1e-12)),
                 }
             )

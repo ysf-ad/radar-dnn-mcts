@@ -1547,10 +1547,62 @@ window execution are not the limiting path in this configuration. For batched
 root/frontier workloads, the bottleneck shifts to CPU preprocessing unless the
 prepared-batch path is used.
 
+## Beam Prefix Graph Profile
+
+The batched beam path now has an optional profiler:
+
+```text
+python scripts/perf_lab_batched_beam_planner.py --device cuda --cuda-graph --profile
+```
+
+This exposes wall-clock timing plus internal beam stages:
+
+- `beam_scorer_init`: root observation attach, tokenization, and transformer encoding
+- `beam_expand_prefixes`: total next-prefix expansion cost
+- `scorer_selected_valid`: selected-target mask and valid-action mask construction
+- `scorer_slots`: per-prefix slot/context feature construction
+- `scorer_score_slots`: neural policy/Q score replay
+- `scorer_score_d2h`: score table transfer back to CPU
+- `scorer_cpu_select`: valid-action argmax
+- `expand_child_build_top1/topk`: child prefix construction
+- `beam_filter_sort_prune`: beam sorting and pruning
+
+The profile exposed a graph-cache bug in dynamic prefix scoring. The prefix
+CUDA Graph cache was scoped to each per-window scorer, so every timed plan
+recaptured graphs and produced large `scorer_score_slots` p99 spikes. Moving the
+prefix graph cache to the long-lived planner and copying the root encoding into
+static graph buffers fixed this.
+
+Measured on CUDA with `initial_targets=60`, `arrival_rate=4`, `seed=916`,
+`max_depth=24`, and `branch_top_k=1`:
+
+```text
+Before reusable prefix graph cache:
+beam width 1: 107.95 ms/window
+beam width 4: 100.51 ms/window
+scorer_score_slots p50: ~0.30 ms, p99: ~80-88 ms
+
+After reusable prefix graph cache:
+fast one-pass planner: 14.25 ms/window
+beam width 1:          19.96 ms/window
+beam width 4:          21.42 ms/window
+beam width 8:          23.23 ms/window
+beam width 16:         22.88 ms/window
+scorer_score_slots p50: ~0.34 ms, p99: ~0.52-0.56 ms
+```
+
+The next latency opportunity is no longer CUDA Graph capture. It is the repeated
+per-depth prefix expansion loop: even after graph reuse, a 20-action window
+still performs roughly 160 score/selection substeps in the profiled benchmark.
+The one-pass fast planner remains the lower-latency deployment path; beam search
+is now close enough to be useful for offline/teacher generation and small online
+lookahead experiments.
+
 ## Next Work
 
 - Batch multiple environment windows during evaluation.
 - Expand `DenseRootSearchState` beyond the root into full batched tree tensors.
 - Replace Python node objects with dense tree tensors.
 - Use `BatchedRootBranchSimulator` for exact one-step branch expansion.
+- For online latency, prefer one-pass/low-depth planning unless a beam branch changes decisions enough to justify the extra ~6-9 ms/window.
 - Keep deeper simulator state transitions as the remaining hard part; either extend the C vector stepping path for deeper batched rollouts or build a PyTorch/JAX-compatible approximate rollout model.
