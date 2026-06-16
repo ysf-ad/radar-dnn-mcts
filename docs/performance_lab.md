@@ -1648,9 +1648,56 @@ clean graph+GPU-select planner is already `8-9 ms/window`, and the remaining
 selector work is partly the unavoidable CPU synchronization needed to update the
 next selected-target mask and window bookkeeping.
 
+## Multi-Environment Online Batching
+
+Single-window planning is sequential because each chosen action changes elapsed
+time, selected targets, search/track counts, and the next valid action set. The
+next useful parallelization level is therefore independent windows/environments:
+batch one decision depth across many environments, step each simulator, then
+batch the next decision depth.
+
+`perf_lab_multi_env_online_batch.py` compares three paths:
+
+- `serial_fast_graph_gpu_select`: current low-latency one-pass planner per env
+- `batched_multi_env_reencode`: batch every decision depth but re-tokenize and
+  re-encode roots each depth
+- `batched_multi_env_cached_root`: encode all environment roots once per window,
+  then batch only changing selected masks and slot/context features each depth
+
+The cached-root path is the useful one. It preserves the within-window decision
+dependency while using the GPU across independent envs. On CUDA with
+`initial_targets=60`, `arrival_rate=4`, `seed=916`, and 20 decisions/window:
+
+```text
+envs  windows  serial env-w/s  cached env-w/s  speedup  reward delta
+4     3          87.55           55.76          0.64x    0.0
+8     5          49.63           76.02          1.53x    0.0
+16    5          56.83          133.42          2.35x    0.0
+32    5          97.49          221.24          2.27x    0.0
+64    3          96.57          305.22          3.16x    0.0
+```
+
+The small-batch case loses because serial CUDA Graph replay is extremely fast
+for one environment. Once the batch reaches roughly 8+ environments, root-cache
+batching wins and the per-env neural planning cost drops sharply:
+
+```text
+8 envs:   0.483 ms/env-action
+16 envs:  0.227 ms/env-action
+32 envs:  0.103 ms/env-action
+64 envs:  0.053 ms/env-action
+```
+
+The naive re-encode path is included as a negative control. It matches reward,
+but spends about `6-10 ms` per batched decision round because it repeats the
+root transformer encode every depth. The cached-root path is the correct
+parallelization: encode target/context tokens once per environment window, then
+parallelize policy/Q scoring for all active environments at each decision depth.
+
 ## Next Work
 
-- Batch multiple environment windows during evaluation.
+- Promote cached-root multi-environment batching from benchmark script to a reusable evaluator/training data path.
+- Add fixed-shape CUDA Graph replay for cached-root multi-env decision rounds where batch size is stable.
 - Expand `DenseRootSearchState` beyond the root into full batched tree tensors.
 - Replace Python node objects with dense tree tensors.
 - Use `BatchedRootBranchSimulator` for exact one-step branch expansion.
