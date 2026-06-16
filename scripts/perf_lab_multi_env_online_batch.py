@@ -1941,6 +1941,8 @@ def main() -> None:
     parser.add_argument("--paired-heads", action="store_true", help="Use inference-only paired policy/Q MLP head execution.")
     parser.add_argument("--direct-couplers", action="store_true", help="Call one-layer TransformerEncoder couplers through their layer directly.")
     parser.add_argument("--manual-couplers", action="store_true", help="Use a manual exact single-layer TransformerEncoder path for couplers.")
+    parser.add_argument("--manual-sensor-coupler", action="store_true", help="Use the manual exact single-layer path only for the sensor coupler.")
+    parser.add_argument("--manual-action-coupler", action="store_true", help="Use the manual exact single-layer path only for the action-token coupler.")
     parser.add_argument("--cached-action-table", action="store_true", help="Cache per-window physical action ordering/layout in the graph path.")
     parser.add_argument("--gpu-action-template", action="store_true", help="Keep cached action IDs and score indices resident on GPU.")
     parser.add_argument("--gpu-valid-mask", action="store_true", help="Derive per-decision action validity from cached GPU bases and selected masks.")
@@ -2005,6 +2007,8 @@ def main() -> None:
         use_paired_heads=bool(args.paired_heads),
         use_direct_couplers=bool(args.direct_couplers),
         use_manual_couplers=bool(args.manual_couplers),
+        use_manual_sensor_coupler=bool(args.manual_sensor_coupler),
+        use_manual_action_coupler=bool(args.manual_action_coupler),
     )
     batched = BatchedActionAttentionScorer(
         batch_model,
@@ -2080,6 +2084,9 @@ def main() -> None:
         "active_sdp_state": active_sdp_state,
         "matmul_precision": str(args.matmul_precision) if str(args.matmul_precision) else None,
         "pinned_action_d2h_requested": bool(args.pinned_action_d2h),
+        "manual_couplers": bool(args.manual_couplers),
+        "manual_sensor_coupler": bool(args.manual_sensor_coupler),
+        "manual_action_coupler": bool(args.manual_action_coupler),
         "paths_requested": sorted(requested_paths),
         "envs": int(args.envs),
         "windows": int(args.windows),

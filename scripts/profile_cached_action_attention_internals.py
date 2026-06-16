@@ -76,6 +76,7 @@ def make_prefix_tensors(scorer, count: int):
 def profile_cached_scores(planner, scorer, selected_t, slot_t, iters: int, warmup: int):
     model = planner.model
     device = planner.device
+    amp_enabled = bool(getattr(planner, "use_amp", False)) and torch.device(device).type == "cuda"
     cls_out = scorer.cls_out
     tok_out = scorer.tok_out
     token_active = scorer.token_active
@@ -99,7 +100,7 @@ def profile_cached_scores(planner, scorer, selected_t, slot_t, iters: int, warmu
         bsz = int(slot_t.shape[0])
         rows = int(tok_out.shape[1])
 
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
             if record:
                 slot_emb = timed(device, buckets, "slot_projection", lambda: model.backbone.slot_proj(slot_t))
             else:

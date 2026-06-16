@@ -368,6 +368,8 @@ class FastActionAttentionPlanner:
         use_paired_heads: bool = False,
         use_direct_couplers: bool = False,
         use_manual_couplers: bool = False,
+        use_manual_sensor_coupler: bool = False,
+        use_manual_action_coupler: bool = False,
     ):
         dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = model.eval().to(dev)
@@ -385,6 +387,8 @@ class FastActionAttentionPlanner:
         self.use_paired_heads = bool(use_paired_heads)
         self.use_direct_couplers = bool(use_direct_couplers)
         self.use_manual_couplers = bool(use_manual_couplers)
+        self.use_manual_sensor_coupler = bool(use_manual_couplers or use_manual_sensor_coupler)
+        self.use_manual_action_coupler = bool(use_manual_couplers or use_manual_action_coupler)
         self.adapt = adapter()
         self.stats = FastPlannerStats(True, str(dev), self.use_amp, self.use_compile)
         self._row_is_search_cache: dict[tuple[int, str, int | None], torch.Tensor] = {}
@@ -450,7 +454,7 @@ class FastActionAttentionPlanner:
         cls_s = cls_out[:, None, :].expand(-1, 2, -1)
         slot_s = slot_emb[:, None, :].expand(-1, 2, -1)
         sensor_state = model.sensor_state_proj(torch.cat([cls_s, slot_s, sensor], dim=-1))
-        if self.use_manual_couplers:
+        if self.use_manual_sensor_coupler:
             coupled_sensor = _maybe_manual_encoder(model.sensor_coupler, sensor_state)
         elif self.use_direct_couplers:
             coupled_sensor = _maybe_direct_encoder(model.sensor_coupler, sensor_state)
@@ -489,7 +493,7 @@ class FastActionAttentionPlanner:
         valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
         action_ctx = model.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
         action_mask = ~valid.reshape(bsz, rows * 2)
-        if self.use_manual_couplers:
+        if self.use_manual_action_coupler:
             action_ctx = _maybe_manual_encoder(model.action_coupler, action_ctx, src_key_padding_mask=action_mask)
         elif self.use_direct_couplers:
             action_ctx = _maybe_direct_encoder(model.action_coupler, action_ctx, src_key_padding_mask=action_mask)
@@ -526,7 +530,7 @@ class FastActionAttentionPlanner:
         cls_s = cls_out[:, None, :].expand(-1, 2, -1)
         slot_s = slot_emb[:, None, :].expand(-1, 2, -1)
         sensor_state = model.sensor_state_proj(torch.cat([cls_s, slot_s, sensor], dim=-1))
-        if self.use_manual_couplers:
+        if self.use_manual_sensor_coupler:
             coupled_sensor = _maybe_manual_encoder(model.sensor_coupler, sensor_state)
         elif self.use_direct_couplers:
             coupled_sensor = _maybe_direct_encoder(model.sensor_coupler, sensor_state)
@@ -558,7 +562,7 @@ class FastActionAttentionPlanner:
         valid = (track_mask[:, :, None] | row_is_search).expand(-1, -1, 2)
         action_ctx = model.action_proj(target_ctx).reshape(bsz, rows * 2, -1)
         action_mask = ~valid.reshape(bsz, rows * 2)
-        if self.use_manual_couplers:
+        if self.use_manual_action_coupler:
             action_ctx = _maybe_manual_encoder(model.action_coupler, action_ctx, src_key_padding_mask=action_mask)
         elif self.use_direct_couplers:
             action_ctx = _maybe_direct_encoder(model.action_coupler, action_ctx, src_key_padding_mask=action_mask)

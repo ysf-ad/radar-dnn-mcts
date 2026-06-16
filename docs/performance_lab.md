@@ -1969,6 +1969,46 @@ This suggests the outer `TransformerEncoder` wrapper is not the bottleneck once
 CUDA graphs are active. The action self-attention kernels and surrounding
 tensor staging remain the higher-value targets.
 
+The internal cached-score profiler now wraps sectional timings in the same AMP
+context as the online planner. With the trained action-attention checkpoint at
+64 prefixes, the large score-body costs are the couplers and heads rather than
+context construction:
+
+```text
+sensor_coupling:       ~1.88 ms
+action_self_attention: ~1.71 ms
+residual_heads:        ~0.82 ms
+target_heads:          ~0.78 ms
+type_heads:            ~0.71 ms
+target_context_build:  ~0.20 ms
+```
+
+That made the next useful split clearer. The older `--manual-couplers` flag
+applied the manual exact TransformerEncoderLayer path to both the small sensor
+coupler and the large action-token coupler. The benchmark now also exposes
+`--manual-sensor-coupler` and `--manual-action-coupler` independently. The
+isolated action-coupler lab favored the manual exact layer:
+
+```text
+TransformerEncoder wrapper: ~1.61 ms
+manual exact layer:         ~1.52 ms
+max_abs_diff:               0.0
+```
+
+A sequential 64-env/10-window graph A/B then showed that action-only manual
+coupling is a modest online win while preserving behavior:
+
+```text
+default action coupler:       0.04160 ms/env-action
+manual action coupler only:   0.04012 ms/env-action
+score replay total:           367.62 ms -> 341.46 ms
+reward/actions:               identical
+```
+
+This is now a real opt-in candidate. It is not folded into the default yet
+because whole-run timing is still noisy and previous all-coupler runs were
+mixed; the useful path is specifically the action-token coupler.
+
 Two additional graph-path switches were tested:
 
 ```text
