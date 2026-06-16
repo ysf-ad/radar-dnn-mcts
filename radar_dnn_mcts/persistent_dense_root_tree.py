@@ -185,6 +185,27 @@ class PersistentDenseRootTree:
         result = self.search.simulate(actions)
         return self.append_new_from_wave(RootSearchWave(actions=actions, scores=scores, sim=result))
 
+    def expand_root_cached_cursor_bulk(self, total_k: int) -> DenseRootTreeUpdate:
+        """Expand many cached cursor actions in one simulator batch.
+
+        Root cursor actions are independent one-step branches from the same
+        root snapshot. Simulating them together exposes more parallel work to
+        the C vector environment and avoids per-wave restore/step/update
+        overhead in the performance lab root-search path.
+        """
+        actions, scores = self.propose_cached_cursor(top_k=int(total_k))
+        if actions.size == 0:
+            empty_sim = BranchStepResult(
+                rewards=np.empty((0,), dtype=np.float32),
+                dt_ms=np.empty((0,), dtype=np.float32),
+                executed=np.empty((0,), dtype=np.int32),
+                terminals=np.empty((0,), dtype=np.uint8),
+                observations=[],
+            )
+            return self.update_from_wave(RootSearchWave(actions=actions, scores=scores, sim=empty_sim))
+        result = self.search.simulate(actions)
+        return self.append_new_from_wave(RootSearchWave(actions=actions, scores=scores, sim=result))
+
     def q_values(self) -> np.ndarray:
         q = np.full((self.capacity,), -np.inf, dtype=np.float32)
         q[self.valid] = self.value_sums[self.valid] / np.maximum(self.visits[self.valid], 1)

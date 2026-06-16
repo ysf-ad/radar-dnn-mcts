@@ -24,6 +24,7 @@ python scripts\perf_lab_persistent_neural_exact_wave.py --device cuda --wave-siz
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached
 python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached_cursor
+python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached_cursor_bulk
 ```
 
 ## First Findings
@@ -785,6 +786,25 @@ cursor + bulk append + select every wave:
 ```
 
 The final-selection number is the root-expansion throughput lower bound for this workload. The select-every-wave number is closer to a tree-policy loop that needs a selection after each expansion.
+
+The cursor path can be pushed further when the waves are independent root
+branches. Instead of simulating eight `top_k` cursor waves separately, the
+`cached_cursor_bulk` mode requests `waves * top_k` actions from the cached
+root table and simulates them in one vectorized C call:
+
+```text
+waves=8, top_k=16:
+    cached cursor waves: ~0.80 ms, 58 unique actions
+    bulk cursor:         ~0.43 ms, 58 unique actions
+
+waves=8, top_k=32:
+    cached cursor waves: ~0.63 ms, 58 unique actions
+    bulk cursor:         ~0.50 ms, 58 unique actions
+```
+
+Rewards and selected actions matched in these paired runs. After bulk cursor
+expansion, the remaining cost is mostly the vectorized exact branch simulator
+rather than neural proposal or dense tree bookkeeping.
 
 ## Cached Action-Attention Internals
 

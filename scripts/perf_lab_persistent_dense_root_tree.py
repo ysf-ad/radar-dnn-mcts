@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument("--rate", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=916)
     parser.add_argument("--capacity", type=int, default=512)
-    parser.add_argument("--proposal-mode", choices=["recompute", "cached", "cached_cursor"], default="recompute")
+    parser.add_argument("--proposal-mode", choices=["recompute", "cached", "cached_cursor", "cached_cursor_bulk"], default="recompute")
     parser.add_argument("--select-every-wave", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("perf_lab_persistent_dense_root_tree.json"))
     args = parser.parse_args()
@@ -68,12 +68,13 @@ def main() -> None:
 
     sync(device)
     t_setup = time.perf_counter()
+    search_batch_size = int(args.top_k) * int(args.waves) if str(args.proposal_mode) == "cached_cursor_bulk" else int(args.top_k)
     search = PersistentRootSearch(
         planner,
         initial_targets=args.initial_targets,
         seed=args.seed,
         env_cfg=env_cfg,
-        batch_size=int(args.top_k),
+        batch_size=search_batch_size,
         budget_ms=200.0,
     )
     tree = PersistentDenseRootTree(search, capacity=int(args.capacity))
@@ -90,6 +91,7 @@ def main() -> None:
         "seed": int(args.seed),
         "waves_per_iteration": int(args.waves),
         "top_k": int(args.top_k),
+        "search_batch_size": int(search_batch_size),
         "capacity": int(args.capacity),
         "proposal_mode": str(args.proposal_mode),
         "select_every_wave": bool(args.select_every_wave),
@@ -119,7 +121,39 @@ def main() -> None:
             t_sim_total = 0.0
             t_update_total = 0.0
             t_select_total = 0.0
-            for _ in range(int(args.waves)):
+            if str(args.proposal_mode) == "cached_cursor_bulk":
+                sync(device)
+                t0 = time.perf_counter()
+                actions, scores = tree.propose_cached_cursor(int(args.top_k) * int(args.waves))
+                sync(device)
+                t_prop_total += (time.perf_counter() - t0) * 1000.0
+
+                t1 = time.perf_counter()
+                if actions.size:
+                    sim = search.simulate(actions)
+                else:
+                    from batched_branch_sim import BranchStepResult
+
+                    sim = BranchStepResult(
+                        rewards=np.empty((0,), dtype=np.float32),
+                        dt_ms=np.empty((0,), dtype=np.float32),
+                        executed=np.empty((0,), dtype=np.int32),
+                        terminals=np.empty((0,), dtype=np.uint8),
+                        observations=[],
+                    )
+                t_sim_total += (time.perf_counter() - t1) * 1000.0
+
+                t2 = time.perf_counter()
+                update = tree.append_new_from_wave(RootSearchWave(actions=actions, scores=scores, sim=sim))
+                t_update_total += (time.perf_counter() - t2) * 1000.0
+                iter_reward += float(np.sum(update.rewards))
+
+                if bool(args.select_every_wave):
+                    t3 = time.perf_counter()
+                    _ = tree.select_action()
+                    t_select_total += (time.perf_counter() - t3) * 1000.0
+
+            for _ in range(0 if str(args.proposal_mode) == "cached_cursor_bulk" else int(args.waves)):
                 if str(args.proposal_mode) == "cached_cursor":
                     sync(device)
                     t0 = time.perf_counter()
