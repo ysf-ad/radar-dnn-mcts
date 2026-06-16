@@ -1891,6 +1891,31 @@ Current opportunity order:
 4. Replace Python physical action-table construction with a preallocated or C
    backed path.
 
+An experimental selected-index C batch step was added behind
+`--batch-env-step`. It creates a non-owning vector view over the existing
+one-env handles and calls `vec_step_selected_validated_into(...)` once per
+decision depth instead of calling `vec_step(...)` once per env. The important
+correctness result is clean:
+
+```text
+16 envs x 5 windows: reward delta graph minus serial = 0.0
+64 envs x 20 windows: reward delta graph minus serial = 0.0
+```
+
+The synchronized stage profile shows the env-step bucket can drop from roughly
+`1.10 ms` to `0.39 ms` at 64 envs, but the no-profile headline throughput was
+not a consistent win on this machine:
+
+```text
+no batch env step:  ~829.6 env-windows/s
+batch env step:     ~810.5 env-windows/s
+```
+
+So this remains an opt-in experiment. It proves the selected-step API is
+semantically usable, but the current online path is still dominated by graph
+score replay and Python/tensor staging enough that the OpenMP selected-step
+call does not obviously improve end-to-end throughput.
+
 `perf_lab_attention_backend_variants.py` tests PyTorch SDPA backend toggles for
 the current cached score shape. On this stack (`torch 2.7.1+cu118`, 64 envs,
 101 target rows), all tested backends were bit-exact versus default. The longer

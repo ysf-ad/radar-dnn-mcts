@@ -695,6 +695,160 @@ static PyObject* radarxs_vec_restore_step_validated_into(PyObject* self, PyObjec
     return PyLong_FromLong(count);
 }
 
+static PyObject* radarxs_vec_step_selected_validated_into(PyObject* self, PyObject* args) {
+    if (PyTuple_Size(args) != 6) {
+        PyErr_SetString(PyExc_TypeError, "vec_step_selected_validated_into requires vec handle, indices array, actions array, dt array, executed array, and count");
+        return NULL;
+    }
+    PyObject* handle_obj = PyTuple_GetItem(args, 0);
+    if (!PyObject_TypeCheck(handle_obj, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "vec env handle must be an integer");
+        return NULL;
+    }
+    RadarxsVecEnv* vec = (RadarxsVecEnv*)PyLong_AsVoidPtr(handle_obj);
+    if (!vec || vec->num_envs <= 0 || !vec->envs) {
+        PyErr_SetString(PyExc_ValueError, "invalid vec env handle");
+        return NULL;
+    }
+    PyObject* indices_obj = PyTuple_GetItem(args, 1);
+    PyObject* actions_obj = PyTuple_GetItem(args, 2);
+    PyObject* dt_obj = PyTuple_GetItem(args, 3);
+    PyObject* executed_obj = PyTuple_GetItem(args, 4);
+    if (!PyObject_TypeCheck(indices_obj, &PyArray_Type) ||
+        !PyObject_TypeCheck(actions_obj, &PyArray_Type) ||
+        !PyObject_TypeCheck(dt_obj, &PyArray_Type) ||
+        !PyObject_TypeCheck(executed_obj, &PyArray_Type)) {
+        PyErr_SetString(PyExc_TypeError, "indices, actions, dt, and executed must be NumPy arrays");
+        return NULL;
+    }
+    PyArrayObject* indices_arr = (PyArrayObject*)indices_obj;
+    PyArrayObject* actions_arr = (PyArrayObject*)actions_obj;
+    PyArrayObject* dt_arr = (PyArrayObject*)dt_obj;
+    PyArrayObject* executed_arr = (PyArrayObject*)executed_obj;
+    if (!PyArray_ISCONTIGUOUS(indices_arr) ||
+        !PyArray_ISCONTIGUOUS(actions_arr) ||
+        !PyArray_ISCONTIGUOUS(dt_arr) ||
+        !PyArray_ISCONTIGUOUS(executed_arr)) {
+        PyErr_SetString(PyExc_ValueError, "indices, actions, dt, and executed arrays must be contiguous");
+        return NULL;
+    }
+    if (PyArray_TYPE(indices_arr) != NPY_INT32 ||
+        PyArray_TYPE(actions_arr) != NPY_INT32 ||
+        PyArray_TYPE(dt_arr) != NPY_FLOAT32 ||
+        PyArray_TYPE(executed_arr) != NPY_INT32) {
+        PyErr_SetString(PyExc_ValueError, "indices/actions/executed must be int32 and dt must be float32");
+        return NULL;
+    }
+    int count = (int)PyLong_AsLong(PyTuple_GetItem(args, 5));
+    if (count < 0 ||
+        PyArray_SIZE(indices_arr) < count ||
+        PyArray_SIZE(actions_arr) < count ||
+        PyArray_SIZE(dt_arr) < count ||
+        PyArray_SIZE(executed_arr) < count) {
+        PyErr_SetString(PyExc_ValueError, "selected step count out of range");
+        return NULL;
+    }
+    int* indices_in = (int*)PyArray_DATA(indices_arr);
+    int* actions_in = (int*)PyArray_DATA(actions_arr);
+    float* dt_out = (float*)PyArray_DATA(dt_arr);
+    int* executed_out = (int*)PyArray_DATA(executed_arr);
+    for (int i = 0; i < count; i++) {
+        int env_idx = indices_in[i];
+        if (env_idx < 0 || env_idx >= vec->num_envs || !vec->envs[env_idx]) {
+            PyErr_SetString(PyExc_ValueError, "selected env index out of range");
+            return NULL;
+        }
+    }
+    int i;
+    Py_BEGIN_ALLOW_THREADS
+    #ifdef _OPENMP
+    #pragma omp parallel for if(count >= 32) schedule(static)
+    #endif
+    for (i = 0; i < count; i++) {
+        Radarxs* env = vec->envs[indices_in[i]];
+        int raw_action = actions_in[i];
+        env->actions[0] = raw_action;
+        int logical_action;
+        int requested_sensor;
+        int before_tick = env->tick;
+        radarxs_decode_physical_action(env, raw_action, &logical_action, &requested_sensor);
+        int valid = radarxs_action_valid_for_wrapper(env, raw_action);
+        if (valid) {
+            c_step(env);
+            float dt = (float)(env->tick - before_tick);
+            if (logical_action == SEARCH && dt <= 0.0f) {
+                dt = (float)SEARCH_DWELL_TIME;
+            }
+            executed_out[i] = raw_action;
+            dt_out[i] = dt;
+        } else {
+            env->rewards[0] = 0.0f;
+            executed_out[i] = -1;
+            dt_out[i] = 0.0f;
+        }
+    }
+    Py_END_ALLOW_THREADS
+    return PyLong_FromLong(count);
+}
+
+static PyObject* radarxs_vec_release(PyObject* self, PyObject* args) {
+    if (PyTuple_Size(args) != 1) {
+        PyErr_SetString(PyExc_TypeError, "vec_release requires 1 argument");
+        return NULL;
+    }
+    PyObject* handle_obj = PyTuple_GetItem(args, 0);
+    if (!PyObject_TypeCheck(handle_obj, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "vec env handle must be an integer");
+        return NULL;
+    }
+    RadarxsVecEnv* vec = (RadarxsVecEnv*)PyLong_AsVoidPtr(handle_obj);
+    if (!vec) {
+        PyErr_SetString(PyExc_ValueError, "invalid vec env handle");
+        return NULL;
+    }
+    free(vec->envs);
+    free(vec);
+    Py_RETURN_NONE;
+}
+
+static PyObject* radarxs_vec_view_firsts(PyObject* self, PyObject* args) {
+    int count = (int)PyTuple_Size(args);
+    if (count <= 0) {
+        PyErr_SetString(PyExc_TypeError, "vec_view_firsts requires at least one one-env vector handle");
+        return NULL;
+    }
+    RadarxsVecEnv* out = (RadarxsVecEnv*)calloc(1, sizeof(RadarxsVecEnv));
+    if (!out) {
+        PyErr_SetString(PyExc_MemoryError, "failed to allocate vector view");
+        return NULL;
+    }
+    out->envs = (Radarxs**)calloc(count, sizeof(Radarxs*));
+    if (!out->envs) {
+        free(out);
+        PyErr_SetString(PyExc_MemoryError, "failed to allocate vector view env array");
+        return NULL;
+    }
+    out->num_envs = count;
+    for (int i = 0; i < count; i++) {
+        PyObject* handle_obj = PyTuple_GetItem(args, i);
+        if (!PyObject_TypeCheck(handle_obj, &PyLong_Type)) {
+            free(out->envs);
+            free(out);
+            PyErr_SetString(PyExc_TypeError, "all handles must be integers");
+            return NULL;
+        }
+        RadarxsVecEnv* one = (RadarxsVecEnv*)PyLong_AsVoidPtr(handle_obj);
+        if (!one || one->num_envs <= 0 || !one->envs || !one->envs[0]) {
+            free(out->envs);
+            free(out);
+            PyErr_SetString(PyExc_ValueError, "invalid one-env vector handle");
+            return NULL;
+        }
+        out->envs[i] = one->envs[0];
+    }
+    return PyLong_FromVoidPtr(out);
+}
+
 #define MY_METHODS \
     {"vec_snapshot", radarxs_vec_snapshot, METH_VARARGS, "Snapshot first radar env in a vector"}, \
     {"vec_restore", radarxs_vec_restore, METH_VARARGS, "Restore first radar env in a vector"}, \
@@ -705,7 +859,10 @@ static PyObject* radarxs_vec_restore_step_validated_into(PyObject* self, PyObjec
     {"vec_aux_all", radarxs_vec_aux_all, METH_VARARGS, "Return sensor busy timers and target ranges for every radar env"}, \
     {"vec_step_validated", radarxs_vec_step_validated, METH_VARARGS, "Step every env with Python-wrapper-compatible action validity"}, \
     {"vec_step_validated_into", radarxs_vec_step_validated_into, METH_VARARGS, "Step first N envs and write dt/executed into NumPy arrays"}, \
-    {"vec_restore_step_validated_into", radarxs_vec_restore_step_validated_into, METH_VARARGS, "Restore first N envs, assign actions, step, and write dt/executed"}
+    {"vec_restore_step_validated_into", radarxs_vec_restore_step_validated_into, METH_VARARGS, "Restore first N envs, assign actions, step, and write dt/executed"}, \
+    {"vec_step_selected_validated_into", radarxs_vec_step_selected_validated_into, METH_VARARGS, "Step selected env indices with selected actions and write dt/executed"}, \
+    {"vec_release", radarxs_vec_release, METH_VARARGS, "Release a vector wrapper without closing underlying envs"}, \
+    {"vec_view_firsts", radarxs_vec_view_firsts, METH_VARARGS, "Create a non-owning vector view from the first env of each one-env vector handle"}
 
 #include "../env_binding.h"
 

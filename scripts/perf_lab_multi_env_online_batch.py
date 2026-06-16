@@ -1118,6 +1118,7 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     from exact_env_mutual import attach_env_obs, xs_decode_action
     from final_radar_campaign import get_obs
     from mutual_features import TOKEN_DIM
+    from pufferlib.ocean.radarxs import binding as radar_binding
     from realistic_reward_retrain import adapter
     from repaired_campaign_tools import decode_sensor_action, execute_first_valid_action
     from two_sensor_physical_head_eval import MAXT
@@ -1139,6 +1140,16 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
     root_raw_encodes = 0
     graph_replay_rounds = 0
     raw_rounds = 0
+    batch_env_step_available = bool(getattr(args, "batch_env_step", False)) and bool(getattr(args, "fast_env_step", False)) and hasattr(
+        radar_binding, "vec_step_selected_validated_into"
+    )
+    env_vec = radar_binding.vec_view_firsts(*[eng.env for eng in envs]) if batch_env_step_available and envs else None
+    env_index_buf = np.empty((len(envs),), dtype=np.int32)
+    env_action_buf = np.empty((len(envs),), dtype=np.int32)
+    env_dt_buf = np.empty((len(envs),), dtype=np.float32)
+    env_executed_buf = np.empty((len(envs),), dtype=np.int32)
+    batch_env_step_calls = 0
+    scalar_env_step_calls = 0
     if envs and hasattr(planner, "warmup"):
         planner.warmup(get_obs(envs[0], 0.0), budget_ms=int(args.window_ms))
     sync(device)
@@ -1300,7 +1311,24 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
             batch_sizes.append(len(live_pos))
             next_live: list[int] = []
             def step_envs():
+                nonlocal batch_env_step_calls, scalar_env_step_calls
                 next_ids: list[int] = []
+                if env_vec is not None and len(live_pos) > 0:
+                    count = int(len(live_pos))
+                    for local_idx, pos in enumerate(live_pos):
+                        env_index_buf[local_idx] = int(root_env_ids[pos])
+                        env_action_buf[local_idx] = int(actions[local_idx])
+                    radar_binding.vec_step_selected_validated_into(
+                        env_vec,
+                        env_index_buf,
+                        env_action_buf,
+                        env_dt_buf,
+                        env_executed_buf,
+                        count,
+                    )
+                    batch_env_step_calls += 1
+                else:
+                    scalar_env_step_calls += int(len(live_pos))
                 for local_idx, pos in enumerate(live_pos):
                     env_idx = root_env_ids[pos]
                     eng = envs[env_idx]
@@ -1309,7 +1337,14 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
                     remaining = max(0.0, float(args.window_ms) - float(elapsed[pos]))
                     action = int(actions[local_idx])
                     base, _ = xs_decode_action(action, MAXT)
-                    if bool(getattr(args, "fast_env_step", False)):
+                    if env_vec is not None:
+                        executed_action = int(env_executed_buf[local_idx])
+                        if executed_action < 0:
+                            continue
+                        dwell = float(packed.dwell[pos, int(base) - 1]) if int(base) > 0 else 0.0
+                        dt = float(10.0 if int(base) == 0 else dwell)
+                        reward = float(eng.rew_buf[0])
+                    elif bool(getattr(args, "fast_env_step", False)):
                         dwell = float(packed.dwell[pos, int(base) - 1]) if int(base) > 0 else 0.0
                         reward, dt, executed_action = execute_known_valid_action_fast(eng, action, int(base), dwell, remaining)
                     else:
@@ -1343,6 +1378,9 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         windows_done += 1
     sync(device)
     wall_ms = (time.perf_counter() - wall0) * 1000.0
+    if env_vec is not None and hasattr(radar_binding, "vec_release"):
+        radar_binding.vec_release(env_vec)
+        env_vec = None
     total_env_windows = int(windows_done * len(envs))
     return {
         "wall_ms": float(wall_ms),
@@ -1358,6 +1396,8 @@ def run_batched_cached_graph(planner, envs, args, device: torch.device) -> dict:
         "root_raw_encodes": int(root_raw_encodes),
         "graph_replay_rounds": int(graph_replay_rounds),
         "raw_rounds": int(raw_rounds),
+        "batch_env_step_calls": int(batch_env_step_calls),
+        "scalar_env_step_calls": int(scalar_env_step_calls),
         "mean_batch_size": float(np.mean(batch_sizes)) if batch_sizes else 0.0,
         "mean_depth": float(np.mean(depth_counts)) if depth_counts else 0.0,
         "planning_round_stats": stats(plan_round_times),
@@ -1396,6 +1436,7 @@ def main() -> None:
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--profile-cpu-top", type=int, default=0, help="Record top cumulative cProfile functions for each benchmark path.")
     parser.add_argument("--fast-env-step", action="store_true", help="Skip redundant per-action observation validation in cached-root env stepping.")
+    parser.add_argument("--batch-env-step", action="store_true", help="Use the selected-index C batch step in the cached-root graph path.")
     parser.add_argument("--direct-root-pack", action="store_true", help="Pack cached-root observations directly from C engine buffers.")
     parser.add_argument("--out", type=Path, default=Path("results/perf_lab_multi_env_online_batch.json"))
     args = parser.parse_args()
