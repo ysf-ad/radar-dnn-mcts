@@ -575,6 +575,18 @@ class FastActionAttentionPlanner:
         slot[3] = 1.0 if int(last_action) == 0 else 0.0
         return slot
 
+    def warmup(self, obs, budget_ms=200):
+        """Populate CUDA kernels/graph cache before timed online planning."""
+        profiling = bool(self.profile_enabled)
+        self.profile_enabled = False
+        try:
+            plan = self.plan(obs, budget_ms=budget_ms)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            return plan
+        finally:
+            self.profile_enabled = profiling
+
     def plan(self, obs, budget_ms=200):
         t_plan = self._profile_start()
         t0 = self._profile_start()

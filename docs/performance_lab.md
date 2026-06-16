@@ -1192,6 +1192,13 @@ lookup table and the dwell array once per plan call. This removes repeated
 inside the decision loop. It is a small cleanup, but the profiled bookkeeping
 stage dropped from roughly `0.022 ms/decision` to `0.021 ms/decision`.
 
+`FastActionAttentionPlanner.warmup(obs, budget_ms)` now runs one untimed plan
+with internal profiling disabled. For CUDA Graph mode, this pays kernel startup
+and graph capture before the online control loop. In `profile_online_pipeline`,
+the warmup call cost about `209 ms` once, while measured-window
+`cuda_graph_prepare` dropped to about `0.086 ms/window` and root encoding stayed
+near `1.5 ms/window`.
+
 The fast planner also now builds a per-window slot-feature template. The
 observation-dependent slot terms are constant throughout a planning call, so the
 loop only updates:
