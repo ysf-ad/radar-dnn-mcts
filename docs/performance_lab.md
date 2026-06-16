@@ -10,6 +10,7 @@ python scripts\perf_lab_action_attention.py --device cuda --forward-batches 1,8,
 python scripts\profile_action_attention_steps.py --device cuda
 python scripts\perf_lab_batched_roots.py --device cuda --batch-sizes 1,8,32,128
 python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
+python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast
 ```
 
 ## First Findings
@@ -122,6 +123,38 @@ branches=58: ~1.46x
 ```
 
 The executed actions, elapsed times, and rewards matched the scalar path in the benchmark. The speedup is real but modest because the C binding still loops internally over vector envs. The larger win should come from combining this with batched neural scoring and dense tree tensors so MCTS expansion/evaluation happens in grouped batches instead of Python node-by-node control flow.
+
+## End-to-End Online Profile
+
+`profile_online_pipeline.py` times the full online evaluation loop:
+
+```text
+observation read -> planner.plan -> execute scheduled plan -> sample metrics
+```
+
+It also records the top `cProfile` cumulative functions for each planner. On a 20-window CPU profile with 40 initial targets and rate 3:
+
+```text
+EDF planner.plan:                ~1.5 ms/window
+original action-attention plan: ~162.4 ms/window
+cached fast action-attention:   ~103.8 ms/window
+simulator execution:              ~4.4-4.6 ms/window for learned planners
+```
+
+The cached planner is about 1.56x faster than the original online action-attention planner on this run, while producing the same actions for the random-weight latency comparison. The remaining learned-planner cost is dominated by repeated action-attention/head scoring inside each scheduling window:
+
+```text
+original forward_scores:      ~2.62 s cumulative over 400 decisions
+fast _scores_from_encoded:    ~1.76 s cumulative over 400 decisions
+transformer/action couplers:  dominant torch kernels in both paths
+```
+
+This confirms the main performance direction:
+
+- cache root target/context encoding, which is already implemented;
+- batch independent windows/root states/rollout branches before model scoring;
+- move MCTS/search from Python node loops into dense batched tree tensors;
+- consider lower-level kernels only after the dense batched formulation is in place.
 
 ## MCTX Takeaway
 
