@@ -81,6 +81,14 @@ class BatchedWindowExpansionScorer:
         self._root_selected_cpu = self.root_selected.squeeze(0).detach().cpu().numpy().astype(bool, copy=True)
         self._root_actions, self._root_bases, self._root_sensors = physical_action_arrays(self.obs, selected=set(), max_trackers=MAXT)
         self._root_width = max(1, int(self._root_actions.size))
+        self._root_flat_indices = (self._root_bases.astype(np.int64, copy=False) * 2 + self._root_sensors.astype(np.int64, copy=False)).astype(
+            np.int64,
+            copy=False,
+        )
+        self._root_actions_dev = torch.as_tensor(self._root_actions, device=self.planner.device, dtype=torch.long)
+        self._root_bases_dev = torch.as_tensor(self._root_bases, device=self.planner.device, dtype=torch.long)
+        self._root_sensors_dev = torch.as_tensor(self._root_sensors, device=self.planner.device, dtype=torch.long)
+        self._root_flat_indices_dev = torch.as_tensor(self._root_flat_indices, device=self.planner.device, dtype=torch.long)
         self._slot_template = slot_features(self.obs, 0.0, 0, 0, -1, self.budget_ms).astype(np.float32, copy=True)
 
     def _selected_masks(self, prefixes: list[BranchPrefix]) -> torch.Tensor:
@@ -158,15 +166,12 @@ class BatchedWindowExpansionScorer:
             score_tables=np.asarray(score_tables, dtype=np.float32),
         )
 
-    def _physical_tables_for_prefixes(self, prefixes: list[BranchPrefix]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _valid_table_for_prefixes(self, prefixes: list[BranchPrefix]) -> np.ndarray:
         n = len(prefixes)
         width = int(self._root_width)
-        actions_t = np.broadcast_to(self._root_actions[None, :], (n, width)).astype(np.int64, copy=True)
-        bases_t = np.broadcast_to(self._root_bases[None, :], (n, width)).astype(np.int64, copy=True)
-        sensors_t = np.broadcast_to(self._root_sensors[None, :], (n, width)).astype(np.int64, copy=True)
         valid_t = np.ones((n, width), dtype=bool)
         if width <= 0:
-            return actions_t, bases_t, sensors_t, np.zeros((n, width), dtype=bool)
+            return np.zeros((n, width), dtype=bool)
 
         selected_mask = np.zeros((n, int(MAXT) + 1), dtype=bool)
         for row, prefix in enumerate(prefixes):
@@ -177,6 +182,15 @@ class BatchedWindowExpansionScorer:
         track_cols = self._root_bases > 0
         if np.any(track_cols):
             valid_t[:, track_cols] &= ~selected_mask[:, self._root_bases[track_cols]]
+        return valid_t
+
+    def _physical_tables_for_prefixes(self, prefixes: list[BranchPrefix]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        n = len(prefixes)
+        width = int(self._root_width)
+        actions_t = np.broadcast_to(self._root_actions[None, :], (n, width)).astype(np.int64, copy=True)
+        bases_t = np.broadcast_to(self._root_bases[None, :], (n, width)).astype(np.int64, copy=True)
+        sensors_t = np.broadcast_to(self._root_sensors[None, :], (n, width)).astype(np.int64, copy=True)
+        valid_t = self._valid_table_for_prefixes(prefixes)
         return actions_t, bases_t, sensors_t, valid_t
 
     def score_prefixes_gpu_select(self, prefixes: Iterable[BranchPrefix]) -> BranchExpansionResult:
@@ -197,7 +211,7 @@ class BatchedWindowExpansionScorer:
                 valid=np.zeros((0,), dtype=bool),
                 score_tables=np.empty((0, 0, 0), dtype=np.float32),
             )
-        actions_np, bases_np, sensors_np, valid_np = self._physical_tables_for_prefixes(prefix_list)
+        valid_np = self._valid_table_for_prefixes(prefix_list)
         with torch.inference_mode():
             selected_t = self._selected_masks(prefix_list)
             slot_t = self._slots(prefix_list)
@@ -211,11 +225,10 @@ class BatchedWindowExpansionScorer:
                 ).float()
             score_t[:, 0, :] += self.planner.search_score_bias
             flat_scores = score_t.reshape(len(prefix_list), -1)
-            flat_idx_np = bases_np * 2 + sensors_np
-            actions_dev = torch.as_tensor(actions_np, device=self.planner.device, dtype=torch.long)
-            bases_dev = torch.as_tensor(bases_np, device=self.planner.device, dtype=torch.long)
-            sensors_dev = torch.as_tensor(sensors_np, device=self.planner.device, dtype=torch.long)
-            flat_idx = torch.as_tensor(flat_idx_np, device=self.planner.device, dtype=torch.long)
+            actions_dev = self._root_actions_dev.expand(len(prefix_list), -1)
+            bases_dev = self._root_bases_dev.expand(len(prefix_list), -1)
+            sensors_dev = self._root_sensors_dev.expand(len(prefix_list), -1)
+            flat_idx = self._root_flat_indices_dev.expand(len(prefix_list), -1)
             valid_dev = torch.as_tensor(valid_np, device=self.planner.device, dtype=torch.bool)
             candidate_scores = torch.gather(flat_scores, 1, flat_idx)
             candidate_scores = candidate_scores.masked_fill(~(valid_dev & torch.isfinite(candidate_scores)), -torch.inf)
@@ -256,14 +269,14 @@ class BatchedWindowExpansionScorer:
                 valid=empty_bool,
                 count=0,
             )
-        actions_np, bases_np, sensors_np, valid_np = self._physical_tables_for_prefixes(prefix_list)
+        valid_np = self._valid_table_for_prefixes(prefix_list)
         return DevicePreparedPrefixBatch(
             selected=self._selected_masks(prefix_list),
             slots=self._slots(prefix_list),
-            actions=torch.as_tensor(actions_np, device=self.planner.device, dtype=torch.long),
-            flat_indices=torch.as_tensor(bases_np * 2 + sensors_np, device=self.planner.device, dtype=torch.long),
-            bases=torch.as_tensor(bases_np, device=self.planner.device, dtype=torch.long),
-            sensors=torch.as_tensor(sensors_np, device=self.planner.device, dtype=torch.long),
+            actions=self._root_actions_dev.expand(n, -1),
+            flat_indices=self._root_flat_indices_dev.expand(n, -1),
+            bases=self._root_bases_dev.expand(n, -1),
+            sensors=self._root_sensors_dev.expand(n, -1),
             valid=torch.as_tensor(valid_np, device=self.planner.device, dtype=torch.bool),
             count=int(n),
         )

@@ -1314,6 +1314,18 @@ beam width 8, full-table top-1:       ~63.28 ms/window
 plans match fast planner:             true
 ```
 
+The prefix scorer also caches root action/base/sensor/flat-index tensors on the
+GPU. This removes repeated device construction for the experimental device
+top-1 path and slightly tightens the default live beam timing:
+
+```text
+beam width 1, full-table top-1:       ~54.37 ms/window
+beam width 1, device top-1:           ~65.18 ms/window
+beam width 8, full-table top-1:       ~53.70 ms/window
+beam width 8, device top-1:           ~63.59 ms/window
+plans match fast planner:             true
+```
+
 Live beam-planner A/B confirms that distinction. With a dynamic frontier, each
 depth creates a new prefix batch, so graph capture cannot be reused and the
 device-selection setup cost is paid every depth:
