@@ -2753,6 +2753,20 @@ So the next meaningful wins need to come from reducing model replay work,
 batching/fusing selection, or moving more simulator stepping out of the Python
 boundary; root/template setup is now secondary for large batches.
 
+`--padded-live-graph` was rechecked against raw partial-batch scoring using the
+graph-only 64-env/20-window profile. It should stay enabled for this workload:
+
+```text
+mode                    env-windows/s   ms/env-action   reward
+padded partial replay   727.70          0.03865         -6951.252
+raw partial scoring     424.44          0.08885         -6951.252
+```
+
+When padded replay is disabled, the 221 partial-live rounds fall back to raw
+dynamic scoring at about `7.18 ms/call`; padded full-batch graph replay handles
+those same rounds at about `1.68 ms/call`, even though it computes some inactive
+rows. The graph replay efficiency dominates the wasted-row cost here.
+
 Lower-precision model conversion was checked as a way to reduce autocast copies.
 The fast planner now uses a dtype-safe invalid-action sentinel, preserving
 `-1e9` for the current float32/AMP path while using the finite FP16 minimum only
