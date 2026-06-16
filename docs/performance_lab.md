@@ -1254,6 +1254,22 @@ most prefix counts because it still paid Python/Numpy preparation and tensor
 construction costs. The prepared device graph path is the useful one for dense
 MCTS/frontier batches that can be prepared once and replayed many times.
 
+The physical action table for prefix batches is now vectorized: the scorer
+caches one root action table and applies a per-prefix selected-target validity
+mask instead of rebuilding `physical_action_arrays(...)` for every prefix. This
+keeps top-1 action selection equivalent while reducing CPU preparation for large
+prefix batches:
+
+```text
+prefixes  full-table path   GPU top-1 with vectorized table
+32        ~8.26 ms          ~7.38 ms
+64        ~18.59 ms         ~14.98 ms
+128       ~35.29 ms         ~25.72 ms
+
+selected actions match: true
+max score difference:   < 2e-7
+```
+
 Live beam-planner A/B confirms that distinction. With a dynamic frontier, each
 depth creates a new prefix batch, so graph capture cannot be reused and the
 device-selection setup cost is paid every depth:
@@ -1270,6 +1286,17 @@ beam width 8, full-table top-1:       ~61.50 ms/window
 beam width 8, device top-1:           ~72.36 ms/window
 
 plans match fast planner: true
+```
+
+After vectorizing prefix action tables, the isolated large-prefix GPU-selection
+path improves, but the dynamic beam result is still not better:
+
+```text
+beam width 1, full-table top-1:       ~74.44 ms/window
+beam width 1, device top-1:           ~79.27 ms/window
+beam width 8, full-table top-1:       ~64.97 ms/window
+beam width 8, device top-1:           ~80.21 ms/window
+plans match fast planner:             true
 ```
 
 So the online beam planner should keep using the full-table path unless the

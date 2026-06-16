@@ -78,6 +78,8 @@ class BatchedWindowExpansionScorer:
             root_x = torch.from_numpy(root_tok).to(planner.device, dtype=torch.float32).unsqueeze(0)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=planner.use_amp):
                 self.cls_out, self.tok_out, self.root_selected, self.token_active = planner.model.backbone.encode_tokens(root_x)
+        self._root_actions, self._root_bases, self._root_sensors = physical_action_arrays(self.obs, selected=set(), max_trackers=MAXT)
+        self._root_width = max(1, int(self._root_actions.size))
 
     def _selected_masks(self, prefixes: list[BranchPrefix]) -> torch.Tensor:
         rows = int(self.root_selected.shape[1])
@@ -160,21 +162,24 @@ class BatchedWindowExpansionScorer:
         )
 
     def _physical_tables_for_prefixes(self, prefixes: list[BranchPrefix]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        width = 2 + 2 * int(MAXT)
         n = len(prefixes)
-        actions_t = np.full((n, width), -1, dtype=np.int64)
-        bases_t = np.zeros((n, width), dtype=np.int64)
-        sensors_t = np.zeros((n, width), dtype=np.int64)
-        valid_t = np.zeros((n, width), dtype=bool)
+        width = int(self._root_width)
+        actions_t = np.broadcast_to(self._root_actions[None, :], (n, width)).astype(np.int64, copy=True)
+        bases_t = np.broadcast_to(self._root_bases[None, :], (n, width)).astype(np.int64, copy=True)
+        sensors_t = np.broadcast_to(self._root_sensors[None, :], (n, width)).astype(np.int64, copy=True)
+        valid_t = np.ones((n, width), dtype=bool)
+        if width <= 0:
+            return actions_t, bases_t, sensors_t, np.zeros((n, width), dtype=bool)
+
+        selected_mask = np.zeros((n, int(MAXT) + 1), dtype=bool)
         for row, prefix in enumerate(prefixes):
-            actions, bases, sensors = physical_action_arrays(self.obs, selected=prefix.selected, max_trackers=MAXT)
-            take = min(int(actions.size), width)
-            if take <= 0:
-                continue
-            actions_t[row, :take] = actions[:take]
-            bases_t[row, :take] = bases[:take]
-            sensors_t[row, :take] = sensors[:take]
-            valid_t[row, :take] = True
+            for base in prefix.selected:
+                base_i = int(base)
+                if 1 <= base_i <= int(MAXT):
+                    selected_mask[row, base_i] = True
+        track_cols = self._root_bases > 0
+        if np.any(track_cols):
+            valid_t[:, track_cols] &= ~selected_mask[:, self._root_bases[track_cols]]
         return actions_t, bases_t, sensors_t, valid_t
 
     def score_prefixes_gpu_select(self, prefixes: Iterable[BranchPrefix]) -> BranchExpansionResult:
