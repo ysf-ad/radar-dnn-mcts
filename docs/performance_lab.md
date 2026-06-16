@@ -11,6 +11,7 @@ python scripts\profile_action_attention_steps.py --device cuda
 python scripts\perf_lab_batched_roots.py --device cuda --batch-sizes 1,8,32,128
 python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
 python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast
+python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
 ```
 
 ## First Findings
@@ -155,6 +156,53 @@ This confirms the main performance direction:
 - batch independent windows/root states/rollout branches before model scoring;
 - move MCTS/search from Python node loops into dense batched tree tensors;
 - consider lower-level kernels only after the dense batched formulation is in place.
+
+## Batched Slot Scoring
+
+After the root target/context transformer is cached, the remaining learned-planner loop repeatedly changes only:
+
+```text
+slot/context vector
+selected-target mask
+```
+
+`score_slots_from_encoded` scores many such contexts against the same cached root encoding:
+
+```text
+cached root encoding + [slot_1, ..., slot_B] + [mask_1, ..., mask_B]
+    -> one batched action-attention/head pass
+    -> scores [B, rows, sensors]
+```
+
+This is directly relevant to batched rollout branches and dense MCTS expansion, where many candidate states share a root or near-root target encoding.
+
+Measured equivalence:
+
+```text
+max absolute score difference vs sequential loop: <= 5e-7
+```
+
+Measured CPU speedups:
+
+```text
+B=4:  ~1.57x
+B=8:  ~1.75x
+B=16: ~1.84x
+B=32: ~1.76x
+B=64: ~1.72x
+```
+
+Measured CUDA speedups:
+
+```text
+B=4:  ~3.9x
+B=8:  ~7.7x
+B=16: ~14.8x
+B=32: ~23.0x
+B=64: ~16.5x
+```
+
+This is the strongest evidence so far that the GPU path needs larger search batches, not tiny one-decision calls. The best next implementation step is to make MCTS/root expansion produce batches of slot/mask contexts and call this batched scorer once per expansion wave.
 
 ## MCTX Takeaway
 

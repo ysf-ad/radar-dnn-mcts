@@ -200,6 +200,31 @@ class FastActionAttentionPlanner:
         q = (base_q + q_residual).masked_fill(~valid, 0.0)
         return self.policy_weight * scores + self.q_weight * q
 
+    def score_slots_from_encoded(self, cls_out, tok_out, selected_t, token_active, slot_t):
+        """Score many slot/selected contexts against one cached target encoding.
+
+        ``encode_tokens`` is root-state specific, while the scheduling loop
+        changes the slot/context vector and selected-target mask at each
+        decision. This helper batches those per-decision contexts so the action
+        attention/Q-policy heads can be evaluated with a larger batch dimension.
+        """
+        if slot_t.ndim == 1:
+            slot_t = slot_t.unsqueeze(0)
+        batch = int(slot_t.shape[0])
+        if selected_t.ndim == 1:
+            selected_t = selected_t.unsqueeze(0)
+        if selected_t.shape[0] == 1 and batch > 1:
+            selected_t = selected_t.expand(batch, -1)
+        if token_active.ndim == 1:
+            token_active = token_active.unsqueeze(0)
+        if token_active.shape[0] == 1 and batch > 1:
+            token_active = token_active.expand(batch, -1)
+        if cls_out.shape[0] == 1 and batch > 1:
+            cls_out = cls_out.expand(batch, -1)
+        if tok_out.shape[0] == 1 and batch > 1:
+            tok_out = tok_out.expand(batch, -1, -1)
+        return self._scores_from_encoded(cls_out, tok_out, selected_t, token_active, slot_t)
+
     def plan(self, obs, budget_ms=200):
         obs = attach_env_obs(obs, self.env_cfg, True, True)
         root_tok = tokenize(self.adapt, obs, selected=set(), search_count=0).astype(np.float32)
