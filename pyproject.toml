@@ -1,10 +1,36 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "radar-dnn-mcts"
-version = "0.1.0"
-description = "Radar scheduling research code with transformer policy/Q models and MCTS-style planning."
-requires-python = ">=3.10"
+version = "0.2.0"
+description = "Transformer policy/Q radar schedulers with PUCT, recurrent, autoregressive, and batched deployment modes."
 readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "torch>=2.2",
+  "matplotlib>=3.8",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[tool.setuptools.packages.find]
+include = ["radar_dnn_mcts*", "pufferlib*"]
+
+[tool.setuptools.package-data]
+"pufferlib.ocean" = ["*.h"]
+"pufferlib.ocean.radarxs" = ["*.c", "*.h"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = [".", "radar_dnn_mcts"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+exclude = ["pufferlib"]

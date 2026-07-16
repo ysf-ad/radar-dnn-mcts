@@ -1,4 +1,4 @@
-﻿#define _GNU_SOURCE
+#define _GNU_SOURCE
 #define _USE_MATH_DEFINES
 #include <stdint.h>
 #include <stdbool.h>
@@ -139,11 +139,11 @@ typedef struct {
     float episode_return; // Recommended metric: sum of agent rewards over episode
     float episode_length; // Recommended metric: number of steps of agent episode
     // Any extra fields you add here may be exported to Python in binding.c
-    float n; // Required as the last field 
+    float n; // Required as the last field
 } Log;
 
 
-// Required struct named same as env 
+// Required struct named same as env
 typedef struct {
     Log log; // Required field. Env binding code uses this to aggregate logs
     float* observations; // Required. You can use any obs type, but make sure it matches in Python!
@@ -321,7 +321,7 @@ void initialize_target(Radarxs *env, int target_index) {
     env->targets[target_index].z = radarxs_uniform01(env) * MAX_TARGET_Z_RANGE;
   }
 
-  
+
   env->targets[target_index].x_velocity =
       radarxs_uniform01(env) * MAX_TARGET_XY_VELOCITY;
   env->targets[target_index].y_velocity =
@@ -1154,18 +1154,30 @@ move_simulation_forward:
         float age = ZERO_COST_SEARCH_TIME - env->observations[i];
         float overdue = age - env->search_frame_desired_ms;
         if (overdue > 0.0f) {
-          float norm = overdue / env->search_frame_desired_ms;
-          frame_cost += norm * norm;
+          if (env->search_task_cost_mode == 1) {
+            float denom = fmaxf(1e-3f, env->search_frame_deadline_ms - env->search_frame_desired_ms);
+            float norm = overdue / denom;
+            if (norm > 1.0f) norm = 1.0f;
+            frame_cost += norm;
+          } else {
+            float norm = overdue / env->search_frame_desired_ms;
+            frame_cost += norm * norm;
+          }
         }
-        if (env->search_frame_drop_penalty > 0.0f &&
+        if (env->search_task_cost_mode != 1 &&
+            env->search_frame_drop_penalty > 0.0f &&
             env->search_frame_deadline_ms > 0.0f &&
             age > env->search_frame_deadline_ms) {
           frame_cost += env->search_frame_drop_penalty;
         }
       }
+      // Interpret frame staleness as a cost rate. Scaling by elapsed time
+      // makes the reward invariant to whether a 200 ms schedule is split
+      // into many short searches or fewer long tracks.
       env->rewards[0] -= env->search_frame_overdue_weight *
                          frame_cost /
-                         (float)(MAX_AZ_SLICES * MAX_EL_SLICES);
+                         (float)(MAX_AZ_SLICES * MAX_EL_SLICES) *
+                         (delta_t / 200.0f);
     }
     for (int i = 0; i < env->max_trackers; i++) {
       if (env->targets[i].is_tracked) {
@@ -1176,11 +1188,28 @@ move_simulation_forward:
         if (env->enable_global_delay) {
           float t_des_after =
               env->observations[MAX_AZ_SLICES * MAX_EL_SLICES + i * FEATURES_PER_TRACKER];
-          float overdue_before = (t_des_before < 0.0f) ? -t_des_before : 0.0f;
-          float overdue_after = (t_des_after < 0.0f) ? -t_des_after : 0.0f;
-          float overdue_inc = overdue_after - overdue_before;
-          if (overdue_inc > 0.0f) {
-              global_overdue_increment += overdue_inc * (1.0f + 2.0f * env->targets[i].priority);
+          if (env->search_task_cost_mode == 1) {
+            float t_dead_before =
+                env->observations[MAX_AZ_SLICES * MAX_EL_SLICES + i * FEATURES_PER_TRACKER + 1] + delta_t;
+            float t_dead_after =
+                env->observations[MAX_AZ_SLICES * MAX_EL_SLICES + i * FEATURES_PER_TRACKER + 1];
+            float denom_before = fmaxf(1e-3f, t_dead_before - t_des_before);
+            float denom_after = fmaxf(1e-3f, t_dead_after - t_des_after);
+            float norm_before = (t_des_before < 0.0f) ? (-t_des_before / denom_before) : 0.0f;
+            float norm_after = (t_des_after < 0.0f) ? (-t_des_after / denom_after) : 0.0f;
+            if (norm_before > 1.0f) norm_before = 1.0f;
+            if (norm_after > 1.0f) norm_after = 1.0f;
+            float overdue_inc = norm_after - norm_before;
+            if (overdue_inc > 0.0f) {
+              global_overdue_increment += overdue_inc;
+            }
+          } else {
+            float overdue_before = (t_des_before < 0.0f) ? -t_des_before : 0.0f;
+            float overdue_after = (t_des_after < 0.0f) ? -t_des_after : 0.0f;
+            float overdue_inc = overdue_after - overdue_before;
+            if (overdue_inc > 0.0f) {
+                global_overdue_increment += overdue_inc * (1.0f + 2.0f * env->targets[i].priority);
+            }
           }
         }
         // if the tracker has expired, lose the track and apply the penalty
@@ -1232,12 +1261,28 @@ move_simulation_forward:
         env->targets[i].latent_t_desired -= delta_t;
         env->targets[i].latent_t_deadline -= delta_t;
         if (env->penalize_hidden_targets && env->enable_global_delay) {
-          float overdue_before = (t_des_before < 0.0f) ? -t_des_before : 0.0f;
-          float overdue_after =
-              (env->targets[i].latent_t_desired < 0.0f) ? -env->targets[i].latent_t_desired : 0.0f;
-          float overdue_inc = overdue_after - overdue_before;
-          if (overdue_inc > 0.0f) {
-            global_overdue_increment += overdue_inc * (1.0f + 2.0f * env->targets[i].priority);
+          if (env->search_task_cost_mode == 1) {
+            float t_des_after = env->targets[i].latent_t_desired;
+            float t_dead_before = env->targets[i].latent_t_deadline + delta_t;
+            float t_dead_after = env->targets[i].latent_t_deadline;
+            float denom_before = fmaxf(1e-3f, t_dead_before - t_des_before);
+            float denom_after = fmaxf(1e-3f, t_dead_after - t_des_after);
+            float norm_before = (t_des_before < 0.0f) ? (-t_des_before / denom_before) : 0.0f;
+            float norm_after = (t_des_after < 0.0f) ? (-t_des_after / denom_after) : 0.0f;
+            if (norm_before > 1.0f) norm_before = 1.0f;
+            if (norm_after > 1.0f) norm_after = 1.0f;
+            float overdue_inc = norm_after - norm_before;
+            if (overdue_inc > 0.0f) {
+              global_overdue_increment += overdue_inc;
+            }
+          } else {
+            float overdue_before = (t_des_before < 0.0f) ? -t_des_before : 0.0f;
+            float overdue_after =
+                (env->targets[i].latent_t_desired < 0.0f) ? -env->targets[i].latent_t_desired : 0.0f;
+            float overdue_inc = overdue_after - overdue_before;
+            if (overdue_inc > 0.0f) {
+              global_overdue_increment += overdue_inc * (1.0f + 2.0f * env->targets[i].priority);
+            }
           }
         }
         if (env->penalize_hidden_targets && env->targets[i].latent_t_deadline < 0.0f) {
@@ -1257,7 +1302,11 @@ move_simulation_forward:
     // This redistributes the same local-delay mass over time
     // (service-time spike -> dense per-step bleed) without changing units.
     if (env->enable_global_delay) {
-      env->rewards[0] -= global_overdue_increment * GLOBAL_DELAY_PENALTY;
+      if (env->search_task_cost_mode == 1) {
+        env->rewards[0] -= global_overdue_increment;
+      } else {
+        env->rewards[0] -= global_overdue_increment * GLOBAL_DELAY_PENALTY;
+      }
     }
     if (env->target_service_weight > 0.0f) {
       env->rewards[0] += target_service_before - target_service_cost(env);
@@ -1426,7 +1475,7 @@ void c_render(Radarxs* env) {
     // }
   }
 
-  
+
 
   DrawText(TextFormat("TIME: %d ms", env->tick), 130 * scale, 15 * scale,
            10 * scale, WHITE);
@@ -1438,7 +1487,7 @@ void c_render(Radarxs* env) {
            10 * scale, WHITE);
   DrawText(TextFormat("REWARD/SECOND: %.4f", env->log.episode_return / env->tick * 1000), 280 * scale,
            130 * scale, 10 * scale, WHITE);
-  
+
   // The time remaining for each sensor
   DrawText(TextFormat("S-BAND BUSY: %d ms", env->s_band_t_until_free), 280 * scale, 140 * scale,
            10 * scale, WHITE);
@@ -1494,4 +1543,3 @@ void c_close(Radarxs* env) {
     }
 #endif
 }
-

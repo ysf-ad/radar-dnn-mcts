@@ -2,7 +2,7 @@
  * bash scripts/build_ocean.sh radarxs local (debug)
  * bash scripts/build_ocean.sh radarxs fast
  * We suggest building and debugging your env in pure C first. You
- * get faster builds and better error messages. 
+ * get faster builds and better error messages.
  * Run it on mac with:
  * puffer train puffer_radarxs --train.device mps
  */
@@ -31,4 +31,3 @@ int main() {
     free(env.targets);
     c_close(&env);
 }
-

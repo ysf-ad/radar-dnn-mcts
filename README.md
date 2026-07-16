@@ -1,36 +1,16 @@
 # radar-dnn-mcts
 
-Research code for radar scheduling with transformer policy/Q models and MCTS-style planning.
-
-This repository contains the core simulator, model, planner, training, and evaluation code used for the radar DNN/MCTS experiments.
+Research code for learned radar scheduling with transformer policy/Q models and PUCT-style planning.
 
 ## Main Components
 
-- `pufferlib/ocean/radarxs/`
-  - Radar C simulator.
-  - Python binding source.
-  - Environment wrapper.
-  - EDF, EST, and MCTS planner implementations.
-
-- `radar_dnn_mcts/`
-  - Transformer model code.
-  - Flat policy head experiments.
-  - Factorized type/target policy head experiments.
-  - Action-attention factorized policy/Q model.
-  - Dual-sensor sequential and joint-action planning utilities.
-  - Training and evaluation scripts used for the main ablations.
-
-- `scripts/`
-  - Binding build script.
-  - Import smoke test.
-  - Baseline cross-test helper.
-  - Small training/evaluation entry points.
-
-- `configs/`
-  - Small reproducibility configs for smoke and 9-cell evaluation runs.
-
-- `tests/`
-  - Lightweight import/smoke tests.
+- `pufferlib/ocean/radarxs/`: radar C simulator, Python binding, and EDF/EST baselines.
+- `radar_dnn_mcts/env/`: reward, action, feature, and shadow-transition contracts.
+- `radar_dnn_mcts/models/`: shared state encoder, action attention, policy/Q heads, latent dynamics, autoregressive decoder, batch decoder, and boundary predictor.
+- `radar_dnn_mcts/schedulers/`: full re-encode, MuZero latent, autoregressive, batched, and asynchronous deployment paths.
+- `radar_dnn_mcts/search/`: PUCT implementation.
+- `radar_dnn_mcts/training/`: replay records and policy/Q training losses.
+- `radar_dnn_mcts/evaluation/`: common benchmark, service metrics, latency reporting, and plot generation.
 
 ## Install
 
@@ -38,91 +18,68 @@ This repository contains the core simulator, model, planner, training, and evalu
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -e ".[dev]"
 python scripts\build_binding.py
 ```
 
-On Linux/macOS:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python scripts/build_binding.py
-```
-
-## Smoke Test
+## Test
 
 ```powershell
+python -m pytest
 python scripts\smoke_import.py
 ```
 
-Expected output:
+## Evaluate
 
-```text
-smoke_import ok
-model=ActionAttentionFactorizedNet
-```
-
-## Baseline Cross-Test
-
-The baseline cross-test compares EDF/EST behavior between this repo and another source tree.
+Run the nine-cell, 100-window benchmark:
 
 ```powershell
-python scripts\cross_test_baselines.py `
-  --code-root "C:\path\to\other\model_code" `
-  --out baseline_check.csv `
-  --windows 100 `
-  --seed 916
+python scripts\evaluate.py --config configs\paper_9cell.yaml --checkpoint path\to\model.pt
 ```
 
-## Common Entry Points
-
-Build the C binding:
+Run a short baseline smoke test:
 
 ```powershell
-python scripts\build_binding.py
+python scripts\evaluate.py --config configs\smoke.yaml --methods edf,est
 ```
 
-Run import smoke test:
+The evaluator writes per-window traces, per-cell summaries, an aggregate summary, and a six-panel plot suite under the requested output directory.
+
+## Training
+
+Collect PUCT targets and train the shared policy/Q model:
 
 ```powershell
-python scripts\smoke_import.py
+python scripts\collect_puct_targets.py --out data\puct_targets.npz
+python scripts\train.py --data path\to\puct_targets.npz --out checkpoints\model.pt
 ```
 
-Run a small action-attention PQ smoke experiment:
+The target dataset contains state tokens, window context, planner-improved policy targets, and action-Q targets and masks.
+PUCT uses the predicted policy and action-Q by default. Set
+`--learned-q-weight 0` when collecting a policy-only ablation.
+
+The sequence and latent-dynamics stages use explicit trajectory datasets:
 
 ```powershell
-python scripts\train_action_attention_pq_smoke.py
+python scripts\train_sequence.py --data data\windows.npz --checkpoint checkpoints\model.pt --out checkpoints\model_sequence.pt
+python scripts\train_dynamics.py --data data\transitions.npz --checkpoint checkpoints\model_sequence.pt --out checkpoints\model_full.pt
+python scripts\train_boundary.py --data data\boundaries.npz --checkpoint checkpoints\model_full.pt --out checkpoints\model_async.pt
 ```
 
-Run the 9-cell evaluation entry point:
+## Reproducibility Checks
+
+Compare simulator state trajectories with a reference experiment checkout:
 
 ```powershell
-python scripts\eval_9cell.py --checkpoint path\to\model.pt
+python scripts\cross_test_environment.py --other-root path\to\experiment\model_code
 ```
 
-Run the action-attention performance lab:
+Validate an archived result table from its per-window trace:
 
 ```powershell
-python scripts\perf_lab_action_attention.py --device cuda --forward-batches 1,8,32,128
-python scripts\profile_action_attention_steps.py --device cuda
-python scripts\perf_lab_batched_roots.py --device cuda --batch-sizes 1,8,32,128
-python scripts\perf_lab_batched_root_tables.py --device cuda --batch-sizes 1,8,32,128
-python scripts\profile_root_table_steps.py --device cuda --batch-size 32
-python scripts\perf_lab_batched_branch_sim.py --branch-sizes 1,8,32,128
-python scripts\perf_lab_multi_root_branch_sim.py --root-counts 1,4,8,16,32 --branches-per-root 8
-python scripts\profile_online_pipeline.py --device cpu --windows 20 --planners edf,physical,fast
-python scripts\perf_lab_batched_slots.py --device cuda --slot-batches 1,4,8,16,32,64
-python scripts\perf_lab_batched_window_expansion.py --device cuda --prefix-batches 1,4,8,16,32,64
-python scripts\profile_cached_action_attention_internals.py --device cuda --prefix-batches 1,4,8,16,32,64
-python scripts\perf_lab_batched_beam_planner.py --device cuda --beam-widths 1,4,8,16 --max-depth 24
-python scripts\perf_lab_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
-python scripts\perf_lab_persistent_neural_exact_wave.py --device cuda --wave-sizes 1,4,8,16,32
-python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32
-python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached
-python scripts\perf_lab_persistent_dense_root_tree.py --device cuda --waves 8 --top-k 32 --proposal-mode cached_cursor
-python scripts\perf_lab_coupler_variants.py --device cuda --amp --prefixes 64
-python scripts\perf_lab_multi_env_online_batch.py --device cuda --envs 64 --windows 20 --initial-targets 60 --rate 4 --amp --fast-env-step --direct-root-pack --cached-action-table --gpu-action-template --gpu-valid-mask --batch-env-step --padded-live-graph
+python scripts\validate_reference.py --windows path\to\canonical_windows.csv --expected path\to\canonical_summary.csv
 ```
+
+See `docs/ENVIRONMENT.md` for the simulator and reward contract, and
+`docs/VALIDATION.md` for the distinction between fresh benchmarks and archived
+result validation.

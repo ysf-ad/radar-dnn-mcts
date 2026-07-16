@@ -134,15 +134,15 @@ static PyObject* env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         return NULL;
     }
     // env->truncations = PyArray_DATA(truncations);
-    
-    
+
+
     PyObject* seed_arg = PyTuple_GetItem(args, 5);
     if (!PyObject_TypeCheck(seed_arg, &PyLong_Type)) {
         PyErr_SetString(PyExc_TypeError, "seed must be an integer");
         return NULL;
     }
     int seed = PyLong_AsLong(seed_arg);
- 
+
     // Assumes each process has the same number of environments
     srand(seed);
 
@@ -410,10 +410,10 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
             return NULL;
         }
         vec->envs[i] = env;
-        
+
         // // Make sure the log is initialized to 0
         memset(&env->log, 0, sizeof(Log));
-        
+
         env->observations = (void*)((char*)PyArray_DATA(observations) + i*PyArray_STRIDE(observations, 0));
         env->actions = (void*)((char*)PyArray_DATA(actions) + i*PyArray_STRIDE(actions, 0));
         env->rewards = (void*)((char*)PyArray_DATA(rewards) + i*PyArray_STRIDE(rewards, 0));
@@ -423,7 +423,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         // Assumes each process has the same number of environments
         int env_seed = i + seed*vec->num_envs;
         srand(env_seed);
- 
+
         // Add the seed to kwargs for this environment
         PyObject* py_seed = PyLong_FromLong(env_seed);
         if (PyDict_SetItemString(kwargs, "seed", py_seed) < 0) {
@@ -496,7 +496,7 @@ static PyObject* vec_reset(PyObject* self, PyObject* args) {
         return NULL;
     }
     int seed = PyLong_AsLong(seed_arg);
- 
+
     for (int i = 0; i < vec->num_envs; i++) {
         // Assumes each process has the same number of environments
         srand(i + seed*vec->num_envs);
@@ -542,7 +542,7 @@ static PyObject* vec_render(PyObject* self, PyObject* args) {
         return NULL;
     }
     int env_id = PyLong_AsLong(env_id_arg);
- 
+
     c_render(vec->envs[env_id]);
     Py_RETURN_NONE;
 }

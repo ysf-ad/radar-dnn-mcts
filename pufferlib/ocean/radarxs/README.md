@@ -14,11 +14,10 @@ The X-Band radar has a narrower field of view and shorter range, but higher prob
 
 Targets resemble aircraft following singer trajectories.
 
-The action space is discrete and contains one action for each tracker, plus an additional 'search' action. 
+The action space is discrete and contains one action for each tracker, plus an additional 'search' action.
 
 Searching is done by broadcasting a beam in the least recently observed direction.
 Tracking is done by broadcasting a beam in the direction of the target.
 
 Penalties are incurred for delaying a searcher or tracker.
 Sufficiently delayed trackers are lost, and incur an additional penalty.
-

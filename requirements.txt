@@ -1,8 +1,1 @@
-numpy
-pandas
-torch
-matplotlib
-joblib
-scikit-learn
-gymnasium
-pytest
+-e .

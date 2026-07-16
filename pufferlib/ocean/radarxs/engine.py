@@ -20,17 +20,17 @@ GRID_SIZE = 300  # 30 az * 10 el slices (MAX_AZ_SLICES * MAX_EL_SLICES)
 MAX_TRACKERS = 500
 FEATURES_PER_TRACKER = 6  # t_desired, t_deadline, t_dwell, priority, az_bin, el_bin
 NO_TARGET = -1
- 
+
 
 def get_obs_from_buf(obs_buf, max_trackers=MAX_TRACKERS):
     """
     Convert flat observation buffer to planner-compatible format.
-    
+
     Args:
         obs_buf: Flat observation buffer from binding, shape (1, obs_size).
                  Layout: [Grid(300)] + [Tracker0(4), Tracker1(4), ...] + [sensor_id]
         max_trackers: Maximum number of trackers.
-    
+
     Returns:
         dict: Observation with keys:
             - 'grid': (300,) array of sector freshness values
@@ -45,10 +45,10 @@ def get_obs_from_buf(obs_buf, max_trackers=MAX_TRACKERS):
         obs_flat = obs_buf[0]
     else:
         obs_flat = obs_buf
-    
+
     # Extract grid (sector freshness)
     grid = obs_flat[:GRID_SIZE]
-    
+
     # Infer per-tracker feature count from buffer shape to tolerate stale bindings.
     # Expected: 6, legacy fallback: 4.
     inferred = int((len(obs_flat) - GRID_SIZE - 1) / max_trackers)
@@ -58,7 +58,7 @@ def get_obs_from_buf(obs_buf, max_trackers=MAX_TRACKERS):
     base_idx = GRID_SIZE
     end_idx = base_idx + max_trackers * features_per_tracker
     flat_trackers = obs_flat[base_idx:end_idx].reshape(max_trackers, features_per_tracker)
-    
+
     t_desired = flat_trackers[:, 0]
     t_deadline = flat_trackers[:, 1]
     t_dwell = flat_trackers[:, 2]
@@ -78,17 +78,17 @@ def get_obs_from_buf(obs_buf, max_trackers=MAX_TRACKERS):
     el_bin = np.where(np.isfinite(el_bin), el_bin, 0.0)
     az_bin = np.clip(az_bin, 0.0, 1.0)
     el_bin = np.clip(el_bin, 0.0, 1.0)
-    
+
     # Active mask: target is active if t_desired != NO_TARGET (-1)
     active_mask = np.isfinite(t_desired) & (t_desired != NO_TARGET)
-    
+
     # Sensor ID (last element) - handle NaN gracefully
     sensor_id = 0
     if end_idx < len(obs_flat):
         val = obs_flat[end_idx]
         if not np.isnan(val) and np.isfinite(val):
             sensor_id = int(val)
-    
+
     return {
         'grid': grid,
         't_desired': t_desired,
@@ -105,11 +105,11 @@ def get_obs_from_buf(obs_buf, max_trackers=MAX_TRACKERS):
 class RadarEngine:
     """
     Variable-length Window Execution Engine for Radar Task Scheduling.
-    
+
     Connects any planner (EST, MCTS, Transformer) to the C environment binding.
     Each call to step_window() generates an action plan (length determined by planner) and executes it.
     """
-    
+
     def __init__(
         self,
         planner,
@@ -122,7 +122,7 @@ class RadarEngine:
         enable_x_band=False,
         enable_search_refresh_tracked=True,
         search_refresh_gain=1.0,
-        enable_priority=True,
+        enable_priority=False,
         enable_poisson_arrivals=False,
         activate_all_targets_without_poisson=True,
         poisson_rate_per_second=5.0,
@@ -162,7 +162,7 @@ class RadarEngine:
         self.initial_targets = initial_targets
         self.max_trackers = max_trackers
         self.seed = seed
-        
+
         # Environment buffers
         obs_size = GRID_SIZE + max_trackers * FEATURES_PER_TRACKER + 1
         self.num_envs = 1
@@ -171,10 +171,10 @@ class RadarEngine:
         self.rew_buf = np.zeros((self.num_envs,), dtype=np.float32)
         self.term_buf = np.zeros((self.num_envs,), dtype=np.uint8)
         self.trunc_buf = np.zeros((self.num_envs,), dtype=np.uint8)
-        
+
         # Initialize environment
         self.env = binding.vec_init(
-            self.obs_buf, self.act_buf, self.rew_buf, 
+            self.obs_buf, self.act_buf, self.rew_buf,
             self.term_buf, self.trunc_buf, self.num_envs, seed,
             initial_targets=initial_targets,
             max_trackers=max_trackers,
@@ -210,7 +210,7 @@ class RadarEngine:
             search_debt_tau_ms=float(search_debt_tau_ms),
             search_delay_penalty_cap=float(search_delay_penalty_cap),
         )
-        
+
         # Statistics
         self.total_reward = 0.0
         self.total_steps = 0
@@ -219,7 +219,7 @@ class RadarEngine:
 
         # Ensure the observation buffer is populated before first use.
         self.reset(seed)
-    
+
     def reset(self, seed=None):
         """Reset the environment."""
         if seed is None:
@@ -240,29 +240,29 @@ class RadarEngine:
                     RuntimeWarning,
                 )
             self._warned_obs_layout = True
-    
+
     def step_window(self):
         """
         Execute a single planning window.
-        
+
         1. Convert observation to MCTS format.
         2. Call planner.plan() to get action sequence.
         3. Execute each action via binding.vec_step().
-        
+
         Returns:
             float: Total reward accumulated in this window.
         """
         # Get observation in planner-compatible format
         planner_obs = get_obs_from_buf(self.obs_buf, self.max_trackers)
-        
+
         # Generate plan (passing window budget to hint candidate count)
         plan = self.planner.plan(planner_obs, budget_ms=self.window_ms)
-        
+
         # Execute plan
         window_reward = 0.0
         cumulative_time = 0.0
         t_dwell = planner_obs['t_dwell']
-        
+
         for action in plan:
             # Estimate Dwell Time (for budget)
             if action == 0: # SEARCH
@@ -275,40 +275,40 @@ class RadarEngine:
             binding.vec_step(self.env)
             window_reward += self.rew_buf[0]
             self.total_steps += 1
-            
+
             cumulative_time += est_dt
-            
+
             # Check for episode termination
             if self.term_buf[0]:
                 break
-            
+
             # Check for Window Time Budget
             if cumulative_time >= self.window_ms:
                 break
-        
+
         self.total_reward += window_reward
         self.windows_completed += 1
-        
+
         return window_reward
-    
+
     def run_episode(self, num_windows=50):
         """
         Run a full episode of specified windows.
-        
+
         Args:
             num_windows: Number of planning windows to execute.
-        
+
         Returns:
             dict: Episode statistics.
         """
         self.reset()
-        
+
         for w in range(num_windows):
             window_reward = self.step_window()
-            
+
             if self.term_buf[0]:
                 break
-        
+
         return {
             "total_reward": self.total_reward,
             "total_steps": self.total_steps,
@@ -316,7 +316,7 @@ class RadarEngine:
             "avg_reward_per_window": self.total_reward / max(1, self.windows_completed),
             "avg_reward_per_step": self.total_reward / max(1, self.total_steps),
         }
-    
+
     def get_active_count(self):
         """Get the number of currently active (tracked) targets."""
         end_idx = GRID_SIZE + self.max_trackers * FEATURES_PER_TRACKER
@@ -324,7 +324,7 @@ class RadarEngine:
         # FEATURES_PER_TRACKER=3 => [t_desired, t_deadline, t_dwell].
         # Slot is active if t_desired is not NO_TARGET.
         return int(np.sum(flat_trackers[:, 0] != NO_TARGET))
-    
+
     def close(self):
         """Close the environment."""
         if not getattr(self, '_closed', False):
@@ -335,24 +335,24 @@ class RadarEngine:
 def benchmark_planner(planner, target_counts=[50, 100, 200, 500], num_windows=50, seed=1):
     """
     Benchmark a planner across different target loads. Testing utility
-    
+
     Args:
         planner: Planner instance with a plan() method.
         target_counts: List of target counts to test.
         num_windows: Windows per test.
         seed: Random seed.
-    
+
     Returns:
         dict: Results mapping target_count -> avg_reward.
     """
     results = {}
-    
+
     for n_targets in target_counts:
         engine = RadarEngine(planner, initial_targets=n_targets, seed=seed)
         stats = engine.run_episode(num_windows)
         results[n_targets] = stats["avg_reward_per_step"]
         engine.close()
-        
+
         print(f"  {n_targets} targets: {stats['avg_reward_per_step']:.4f} reward/step")
-    
+
     return results
