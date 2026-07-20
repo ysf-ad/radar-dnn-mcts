@@ -53,6 +53,7 @@ class RadarSchedulerModel(nn.Module):
         context_state = self.context_projection(context)
         valid = state.valid_rows.clone()
         if selected_rows is not None:
+            # Targets are selected at most once per window; search stays legal.
             valid = valid & ~selected_rows.bool()
             valid[:, 0] = True
         if self.action_mixer is not None:
@@ -61,6 +62,7 @@ class RadarSchedulerModel(nn.Module):
             global_rows = (state.global_state + context_state)[:, None, :].expand_as(state.target_states)
             actions = self.direct_action(torch.cat([state.target_states, global_rows], dim=-1))
 
+        # Type selection sees global radar state plus the current window prefix.
         global_context = torch.cat([state.global_state, context_state], dim=-1)
         type_logits = self.type_head(global_context)
         target_logits = self.target_head(actions).squeeze(-1)

@@ -30,6 +30,7 @@ class AutoregressiveDecoder(nn.Module):
 
     def initial(self, tokens: torch.Tensor, context: torch.Tensor) -> tuple[EncodedState, torch.Tensor]:
         state = self.backbone.encode(tokens, context)
+        # Seed the recurrent schedule memory from the encoded global state.
         return state, state.global_state
 
     def step(

@@ -42,8 +42,10 @@ class StateEncoder(nn.Module):
         if tokens.ndim != 3 or context.ndim != 2:
             raise ValueError("tokens must be [batch, rows, features] and context [batch, features]")
         valid = tokens[:, :, 4] > 0.5
+        # Row zero represents search and remains available independently of targets.
         valid[:, 0] = True
         token_state = self.token_projection(tokens)
+        # The learned CLS token carries window-level context through attention.
         cls = self.cls[None, None, :].expand(tokens.shape[0], 1, -1) + self.context_projection(context)[:, None, :]
         sequence = torch.cat([cls, token_state], dim=1)
         sequence_valid = torch.cat(
