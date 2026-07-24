@@ -113,37 +113,6 @@ class PUCT:
         )
         return float(reward) / max(self.config.reward_scale, 1e-6), discount, terminal
 
-    def _complete_trajectory(
-        self,
-        state: SearchState,
-        node: Node,
-        path: list[Node],
-        terminal: bool,
-    ) -> float:
-        """Complete a newly expanded prefix to the window boundary by policy."""
-        while not terminal:
-            legal = state.legal_actions()
-            if not legal:
-                break
-            if not node.children:
-                self._expand(node, state)
-            actions = list(node.children)
-            probabilities = np.asarray(
-                [node.children[action].prior for action in actions],
-                dtype=np.float64,
-            )
-            probabilities /= max(probabilities.sum(), 1e-12)
-            index = int(np.argmax(probabilities))
-            child = node.children[int(actions[index])]
-            reward, discount, terminal = self._step(state, int(actions[index]))
-            child.reward = reward
-            child.discount = discount
-            node = child
-            path.append(node)
-
-        _, value = self.evaluator(state, [])
-        return float(value)
-
     def _distribution(self, node: Node) -> tuple[list[int], np.ndarray]:
         actions = list(node.children)
         visits = np.asarray([node.children[action].visits for action in actions], dtype=np.float64)
@@ -202,16 +171,20 @@ class PUCT:
             path = [root]
             node = root
             terminal = False
-            while node.children and not terminal:
+            value = 0.0
+            while not terminal:
+                if not node.children:
+                    value = self._expand(node, state)
+                    if not node.children:
+                        break
                 action, child = self._select(node)
                 reward, discount, terminal = self._step(state, action)
                 child.reward = reward
                 child.discount = discount
                 node = child
                 path.append(node)
-                if node.visits == 0:
-                    break
-            value = self._complete_trajectory(state, node, path, terminal)
+            if terminal:
+                _, value = self.evaluator(state, [])
             # Back up edge rewards followed by the boundary value at the leaf.
             for current in reversed(path):
                 current.visits += 1

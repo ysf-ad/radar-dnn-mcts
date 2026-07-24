@@ -23,7 +23,7 @@ def policy_q_loss(
     q_target: torch.Tensor,
     weights: LossWeights = LossWeights(),
 ) -> dict[str, torch.Tensor]:
-    """Train policy from soft visits and state value from return-to-go."""
+    """Train policy by cross-entropy and state value by mean-squared return error."""
     target = policy_target / policy_target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     if output.type_logits is None or output.target_logits is None:
         policy_loss = -(target * F.log_softmax(output.policy_logits, dim=-1)).sum(dim=-1).mean()
@@ -53,7 +53,7 @@ def policy_q_loss(
         value_prediction = output.q_values[:, 0]
     else:
         value_prediction = output.q_values
-    q_error = F.smooth_l1_loss(value_prediction, q_target, reduction="none")
+    q_error = F.mse_loss(value_prediction, q_target, reduction="none")
     q_loss = q_error.mean()
     total = weights.policy * policy_loss + weights.q * q_loss
     return {
@@ -86,6 +86,6 @@ def batch_sequence_loss(
     q = torch.zeros((), device=logits.device)
     if q_target is not None:
         selected_q = output.q_values.gather(-1, action_rows.unsqueeze(-1)).squeeze(-1)
-        q_error = F.smooth_l1_loss(selected_q, q_target, reduction="none")
+        q_error = F.mse_loss(selected_q, q_target, reduction="none")
         q = (q_error * action_mask.float()).sum() / action_mask.float().sum().clamp_min(1.0)
     return {"loss": weights.policy * policy + weights.q * q, "policy": policy, "q": q}
