@@ -42,9 +42,15 @@ class MuZeroScheduler:
             if elapsed >= budget_ms:
                 break
             context = tensor(self.features.context(obs, elapsed, searches, tracks, last), device)
-            chosen = selected_mask(root_tokens.shape[1], selected, device)
+            chosen = selected_mask(root_tokens.shape[1], selected, device, obs, elapsed)
             output = self.model.predict(state, context, chosen)
-            row = choose_row(output.policy_logits, output.q_values, output.valid_rows, self.policy_weight, self.q_weight)
+            row = choose_row(
+                output.policy_logits,
+                output.q_values,
+                output.valid_rows,
+                self.policy_weight,
+                self.q_weight,
+            )
             plan.append(row)
             state, _reward = self.dynamics(state, torch.tensor([row], device=device))
             elapsed, searches, tracks = update_prefix(row, obs, elapsed, searches, tracks, selected)

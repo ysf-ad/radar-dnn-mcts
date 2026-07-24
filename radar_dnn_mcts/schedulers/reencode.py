@@ -39,9 +39,15 @@ class FullReencodeScheduler:
         for _ in range(self.max_steps):
             tokens = tensor(self.features.tokens(shadow, selected, searches), device)
             context = tensor(self.features.context(shadow, elapsed, searches, tracks, last), device)
-            chosen = selected_mask(tokens.shape[1], selected, device)
+            chosen = selected_mask(tokens.shape[1], selected, device, shadow, 0.0)
             output = self.model(tokens, context, chosen)
-            row = choose_row(output.policy_logits, output.q_values, output.valid_rows, self.policy_weight, self.q_weight)
+            row = choose_row(
+                output.policy_logits,
+                output.q_values,
+                output.valid_rows,
+                self.policy_weight,
+                self.q_weight,
+            )
             if elapsed >= budget_ms:
                 break
             plan.append(row)

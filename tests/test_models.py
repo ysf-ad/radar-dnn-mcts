@@ -32,9 +32,9 @@ def test_recurrent_ar_batch_and_boundary_contracts(radar_obs):
 
     ar = AutoregressiveDecoder(core, max_rows=6).eval()
     ar_state, prefix = ar.initial(tokens, context)
-    output, prefix = ar.step(ar_state, prefix, context, torch.tensor([0]), torch.zeros(1, 6, dtype=torch.bool))
+    output = ar.step(ar_state, prefix, context, torch.zeros(1, 6, dtype=torch.bool))
     assert output.policy_logits.shape == (1, 6)
-    assert prefix.shape == (1, 32)
+    assert prefix.shape == (1, 0)
 
     batch = BatchDecoder(max_steps=4, d_model=32, nhead=4, encoder_layers=1, decoder_layers=1).eval()
     sequence = batch(tokens, context)

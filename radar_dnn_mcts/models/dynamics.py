@@ -22,7 +22,10 @@ class LatentDynamics(nn.Module):
         self.reward = nn.Sequential(nn.LayerNorm(2 * d_model), nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1))
 
     def forward(self, state: EncodedState, action_rows: torch.Tensor) -> tuple[EncodedState, torch.Tensor]:
-        action = self.action_embedding(action_rows.long())
+        rows = action_rows.long()
+        gather = rows[:, None, None].expand(-1, 1, state.target_states.shape[-1])
+        selected_action = state.target_states.gather(1, gather).squeeze(1)
+        action = self.action_embedding((rows > 0).long()) + selected_action
         new_global = self.global_update(action, state.global_state)
         action_rows_expanded = action[:, None, :].expand_as(state.target_states)
         global_rows = new_global[:, None, :].expand_as(state.target_states)

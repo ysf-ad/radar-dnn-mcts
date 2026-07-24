@@ -6,7 +6,7 @@ Research code for learned radar scheduling with transformer policy/Q models and 
 
 - `pufferlib/ocean/radarxs/`: radar C simulator, Python binding, and EDF/EST baselines.
 - `radar_dnn_mcts/env/`: reward, action, feature, and shadow-transition contracts.
-- `radar_dnn_mcts/models/`: shared state encoder, action attention, policy/Q heads, latent dynamics, autoregressive decoder, batch decoder, and boundary predictor.
+- `radar_dnn_mcts/models/`: shared state encoder, action attention, policy/value heads, latent dynamics, autoregressive decoder, batch decoder, and boundary predictor.
 - `radar_dnn_mcts/schedulers/`: full re-encode, MuZero latent, autoregressive, batched, and asynchronous deployment paths.
 - `radar_dnn_mcts/search/`: PUCT implementation.
 - `radar_dnn_mcts/training/`: replay records and policy/Q training losses.
@@ -37,6 +37,13 @@ Run the nine-cell, 100-window benchmark:
 python scripts\evaluate.py --config configs\paper_9cell.yaml --checkpoint path\to\model.pt
 ```
 
+Run the reproducible nine-cell comparison:
+
+```powershell
+python -m scripts.build_binding
+python -m scripts.evaluate --config configs\repro_9cell.yaml --checkpoint path\to\model.pt --methods reencode,muzero,ar,batch,edf,est --device cuda
+```
+
 Run a short baseline smoke test:
 
 ```powershell
@@ -50,19 +57,35 @@ The evaluator writes per-window traces, per-cell summaries, an aggregate summary
 Collect PUCT targets and train the shared policy/Q model:
 
 ```powershell
-python scripts\collect_puct_targets.py --out data\puct_targets.npz
-python scripts\train.py --data path\to\puct_targets.npz --out checkpoints\model.pt
+python -m scripts.collect_puct_targets --teacher edf --out data\edf.npz
+python -m scripts.train --data data\edf.npz --out checkpoints\edf.pt
+
+python -m scripts.collect_puct_targets --checkpoint checkpoints\edf.pt --out data\puct.npz
+python -m scripts.train --checkpoint checkpoints\edf.pt --data data\puct.npz --out checkpoints\puct.pt
 ```
 
-The target dataset contains state tokens, window context, planner-improved policy targets, and action-Q targets and masks.
-PUCT uses the predicted policy and action-Q by default. Set
-`--learned-q-weight 0` when collecting a policy-only ablation.
-
-The sequence and latent-dynamics stages use explicit trajectory datasets:
+The collector stores grouped 200 ms trajectories with PUCT visit targets,
+executed rewards, and episode returns. Train a sequence decoder from the same data:
 
 ```powershell
-python scripts\train_sequence.py --data data\windows.npz --checkpoint checkpoints\model.pt --out checkpoints\model_sequence.pt
-python scripts\train_dynamics.py --data data\transitions.npz --checkpoint checkpoints\model_sequence.pt --out checkpoints\model_full.pt
+python -m scripts.train_sequence --data data\puct.npz --checkpoint checkpoints\puct.pt --out checkpoints\model_sequence.pt
+```
+
+Automate repeated collection and training:
+
+```powershell
+python scripts\self_play.py --checkpoint checkpoints\model_sequence.pt --out-dir runs\ar --search-model ar --learner ar
+python scripts\self_play.py --checkpoint checkpoints\model_sequence.pt --out-dir runs\muzero --search-model core --learner muzero
+```
+
+`--learner` accepts `core`, `ar`, `muzero`, or `batch`. Recurrent MuZero training
+follows the MuZero paper and the MIT-licensed
+[MuZero General](https://github.com/werner-duvaud/muzero-general) trainer;
+radar-specific state and action modules retain the local interfaces.
+
+The asynchronous boundary stage retains its dedicated transition dataset:
+
+```powershell
 python scripts\train_boundary.py --data data\boundaries.npz --checkpoint checkpoints\model_full.pt --out checkpoints\model_async.pt
 ```
 

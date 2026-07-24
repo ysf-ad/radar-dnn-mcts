@@ -1,3 +1,9 @@
-from radar_dnn_mcts.search.puct import PUCT, PUCTConfig, SearchResult, SearchState
+from radar_dnn_mcts.search.puct import (
+    PUCT,
+    PUCTConfig,
+    SearchDecision,
+    SearchResult,
+    SearchState,
+)
 
-__all__ = ["PUCT", "PUCTConfig", "SearchResult", "SearchState"]
+__all__ = ["PUCT", "PUCTConfig", "SearchDecision", "SearchResult", "SearchState"]

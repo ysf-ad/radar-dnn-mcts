@@ -34,18 +34,28 @@ class AutoregressiveScheduler:
         selected: set[int] = set()
         elapsed = 0.0
         searches = tracks = 0
-        previous = torch.zeros(1, dtype=torch.long, device=device)
         last = -1
         for _ in range(self.max_steps):
             if elapsed >= budget_ms:
                 break
             context = tensor(self.features.context(obs, elapsed, searches, tracks, last), device)
-            output, prefix = self.decoder.step(
-                state, prefix, context, previous, selected_mask(tokens.shape[1], selected, device)
+            output = self.decoder.step(
+                state,
+                prefix,
+                context,
+                selected_mask(tokens.shape[1], selected, device, obs, elapsed),
             )
-            row = choose_row(output.policy_logits, output.q_values, output.valid_rows, self.policy_weight, self.q_weight)
+            row = choose_row(
+                output.policy_logits,
+                output.q_values,
+                output.valid_rows,
+                self.policy_weight,
+                self.q_weight,
+            )
             plan.append(row)
             elapsed, searches, tracks = update_prefix(row, obs, elapsed, searches, tracks, selected)
-            previous.fill_(row)
+            prefix = torch.cat(
+                [prefix, torch.tensor([[row]], dtype=torch.long, device=device)], dim=1
+            )
             last = row
         return plan

@@ -32,8 +32,12 @@ class ActionTokenMixer(nn.Module):
 
     def forward(self, state: EncodedState, context_state: torch.Tensor, valid_rows: torch.Tensor) -> torch.Tensor:
         rows = state.target_states.shape[1]
-        action_type = self.track_embedding[None, None, :].expand(state.target_states.shape[0], rows, -1).clone()
-        action_type[:, 0] = self.search_embedding
+        row_ids = torch.arange(rows, device=state.target_states.device)[None, :, None]
+        action_type = torch.where(
+            row_ids == 0,
+            self.search_embedding[None, None, :],
+            self.track_embedding[None, None, :],
+        ).expand(state.target_states.shape[0], -1, -1)
         global_rows = (state.global_state + context_state)[:, None, :].expand(-1, rows, -1)
         candidates = self.builder(torch.cat([state.target_states, global_rows, action_type], dim=-1))
         return self.mixer(candidates, src_key_padding_mask=~valid_rows)

@@ -17,7 +17,13 @@ from radar_dnn_mcts.models.checkpoint import load_checkpoint
 from radar_dnn_mcts.models.decoders import AutoregressiveDecoder, BatchDecoder
 from radar_dnn_mcts.models.dynamics import LatentDynamics
 from radar_dnn_mcts.models.scheduler import RadarSchedulerModel
-from radar_dnn_mcts.schedulers import AutoregressiveScheduler, BatchScheduler, FullReencodeScheduler, MuZeroScheduler
+from radar_dnn_mcts.schedulers import (
+    AutoregressiveScheduler,
+    BatchScheduler,
+    FullReencodeScheduler,
+    FullWindowPUCTScheduler,
+    MuZeroScheduler,
+)
 
 
 def load_config(path: Path) -> BenchmarkConfig:
@@ -55,6 +61,7 @@ def main() -> None:
         "edf": EDFPlanner(config.max_targets),
         "est": ESTPlanner(config.max_targets),
         "reencode": FullReencodeScheduler(core),
+        "puct": FullWindowPUCTScheduler(core),
         "muzero": MuZeroScheduler(core, dynamics),
         "ar": AutoregressiveScheduler(ar),
         "batch": BatchScheduler(batch),

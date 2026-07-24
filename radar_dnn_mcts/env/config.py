@@ -8,10 +8,10 @@ class RewardConfig:
     """Versioned environment objective shared by training and evaluation."""
 
     env_mode: str = "pufferlib_service"
-    search_action_reward: float = 0.0
-    track_action_reward: float = 0.0
+    search_action_reward: float = 0.1
+    track_action_reward: float = 0.3
     drop_penalty: float = 8.0
-    search_frame_overdue_weight: float = 0.5
+    search_frame_overdue_weight: float = 0.2
     search_frame_desired_ms: float = 3000.0
     search_frame_deadline_ms: float = 4500.0
     search_frame_drop_penalty: float = 8.0

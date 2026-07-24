@@ -81,6 +81,7 @@ def get_obs_from_buf(obs_buf, max_trackers=MAX_TRACKERS):
 
     # Active mask: target is active if t_desired != NO_TARGET (-1)
     active_mask = np.isfinite(t_desired) & (t_desired != NO_TARGET)
+    tracked_mask = active_mask & (t_deadline >= 0.0)
 
     # Sensor ID (last element) - handle NaN gracefully
     sensor_id = 0
@@ -98,6 +99,7 @@ def get_obs_from_buf(obs_buf, max_trackers=MAX_TRACKERS):
         'az_bin': az_bin,
         'el_bin': el_bin,
         'active_mask': active_mask,
+        'tracked_mask': tracked_mask,
         'sensor_id': sensor_id,
     }
 
@@ -215,6 +217,7 @@ class RadarEngine:
         self.total_reward = 0.0
         self.total_steps = 0
         self.windows_completed = 0
+        self.last_executed_plan = []
         self._warned_obs_layout = False
 
         # Ensure the observation buffer is populated before first use.
@@ -228,6 +231,7 @@ class RadarEngine:
         self.total_reward = 0.0
         self.total_steps = 0
         self.windows_completed = 0
+        self.last_executed_plan = []
 
         # One-time sanity warning for common binding/layout mismatch issues.
         if not self._warned_obs_layout:
@@ -261,22 +265,34 @@ class RadarEngine:
         # Execute plan
         window_reward = 0.0
         cumulative_time = 0.0
-        t_dwell = planner_obs['t_dwell']
+        self.last_executed_plan = []
 
         for action in plan:
-            # Estimate Dwell Time (for budget)
-            if action == 0: # SEARCH
-                est_dt = 10.0
-            else: # TRACK
-                est_dt = t_dwell[action-1]
+            action = int(action)
+            before = get_obs_from_buf(self.obs_buf, self.max_trackers)
+            if action < 0 or action > self.max_trackers:
+                continue
+            if action > 0 and (
+                not before['active_mask'][action - 1]
+                or before['t_deadline'][action - 1] < 0.0
+            ):
+                continue
+            est_dt = 10.0 if action == 0 else float(before['t_dwell'][action - 1])
 
             # Execute action
-            self.act_buf[0] = int(action)
+            self.act_buf[0] = action
             binding.vec_step(self.env)
-            window_reward += self.rew_buf[0]
+            reward = float(self.rew_buf[0])
+            window_reward += reward
             self.total_steps += 1
-
             cumulative_time += est_dt
+            self.last_executed_plan.append(action)
+
+            if hasattr(self.planner, 'observe_transition'):
+                after = get_obs_from_buf(self.obs_buf, self.max_trackers)
+                self.planner.observe_transition(
+                    action, reward, before, after, est_dt
+                )
 
             # Check for episode termination
             if self.term_buf[0]:
@@ -286,6 +302,8 @@ class RadarEngine:
             if cumulative_time >= self.window_ms:
                 break
 
+        if hasattr(self.planner, 'finish_window'):
+            self.planner.finish_window()
         self.total_reward += window_reward
         self.windows_completed += 1
 
@@ -303,8 +321,8 @@ class RadarEngine:
         """
         self.reset()
 
-        for w in range(num_windows):
-            window_reward = self.step_window()
+        for _ in range(num_windows):
+            self.step_window()
 
             if self.term_buf[0]:
                 break

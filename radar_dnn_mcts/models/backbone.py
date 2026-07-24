@@ -43,7 +43,7 @@ class StateEncoder(nn.Module):
             raise ValueError("tokens must be [batch, rows, features] and context [batch, features]")
         valid = tokens[:, :, 4] > 0.5
         # Row zero represents search and remains available independently of targets.
-        valid[:, 0] = True
+        valid = torch.cat([torch.ones_like(valid[:, :1]), valid[:, 1:]], dim=1)
         token_state = self.token_projection(tokens)
         # The learned CLS token carries window-level context through attention.
         cls = self.cls[None, None, :].expand(tokens.shape[0], 1, -1) + self.context_projection(context)[:, None, :]

@@ -11,7 +11,7 @@ RADARXS = ROOT / "pufferlib" / "ocean" / "radarxs"
 
 def main() -> None:
     subprocess.check_call(
-        [sys.executable, "setup_binding.py", "build_ext", "--inplace"],
+        [sys.executable, "setup_binding.py", "build_ext", "--inplace", "--force"],
         cwd=str(RADARXS),
     )
 

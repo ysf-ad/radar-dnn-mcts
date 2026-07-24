@@ -7,39 +7,74 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from radar_dnn_mcts.models.backbone import EncodedState
 from radar_dnn_mcts.models.checkpoint import load_checkpoint, save_checkpoint
 from radar_dnn_mcts.models.decoders import AutoregressiveDecoder, BatchDecoder
 from radar_dnn_mcts.models.dynamics import LatentDynamics
-from radar_dnn_mcts.models.scheduler import RadarSchedulerModel
-from radar_dnn_mcts.training.losses import batch_sequence_loss
+from radar_dnn_mcts.models.scheduler import PolicyQOutput, RadarSchedulerModel
+from radar_dnn_mcts.training.losses import (
+    LossWeights,
+    batch_sequence_loss,
+    policy_q_loss,
+)
 
 
-def ar_loss(model, tokens, context, actions, action_mask):
-    state, prefix = model.initial(tokens, context)
-    selected = torch.zeros(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
-    previous = torch.zeros(tokens.shape[0], dtype=torch.long, device=tokens.device)
-    losses = []
-    for step in range(actions.shape[1]):
-        output, prefix = model.step(state, prefix, context, previous, selected)
-        ce = F.cross_entropy(output.policy_logits, actions[:, step], reduction="none")
-        losses.append(ce * action_mask[:, step].float())
-        row = actions[:, step]
-        selected.scatter_(1, row[:, None], row[:, None] > 0)
-        previous = row
-    stacked = torch.stack(losses, dim=1)
-    return stacked.sum() / action_mask.float().sum().clamp_min(1.0)
+def ar_predictions(
+    model: AutoregressiveDecoder,
+    tokens: torch.Tensor,
+    root_context: torch.Tensor,
+    step_context: torch.Tensor,
+    actions: torch.Tensor,
+    action_mask: torch.Tensor,
+    policies: torch.Tensor,
+    returns: torch.Tensor,
+) -> tuple[PolicyQOutput, torch.Tensor, torch.Tensor]:
+    state, _ = model.initial(tokens, root_context)
+    prefix_deltas = model.decode_prefix_deltas(state, actions[:, :-1])
+    rows = policies.shape[-1]
+    selected_actions = F.one_hot(actions, num_classes=rows).bool()
+    selected_actions[:, :, 0] = False
+    selected_before = selected_actions.long().cumsum(dim=1) - selected_actions.long()
+
+    batch_index, step_index = torch.nonzero(action_mask, as_tuple=True)
+    delta = prefix_deltas[batch_index, step_index]
+    context_delta = model.context_delta(delta)
+    context_delta = torch.where(
+        (step_index > 0)[:, None], context_delta, torch.zeros_like(context_delta)
+    )
+    conditioned = EncodedState(
+        state.global_state[batch_index] + delta,
+        state.target_states[batch_index],
+        state.valid_rows[batch_index],
+    )
+    unavailable = selected_before[batch_index, step_index].bool()
+    output = model.backbone.predict(
+        conditioned,
+        step_context[batch_index, step_index] + context_delta,
+        unavailable,
+    )
+    return (
+        output,
+        policies[batch_index, step_index],
+        returns[batch_index, step_index],
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=Path, required=True, help="NPZ with tokens, context, actions, action_mask")
+    parser = argparse.ArgumentParser(
+        description="Train AR and batch decoders directly from grouped PUCT windows."
+    )
+    parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--decoder", choices=["ar", "batch", "both"], default="both")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--value-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -47,10 +82,26 @@ def main() -> None:
     dynamics = LatentDynamics().to(device)
     ar = AutoregressiveDecoder(core).to(device)
     batch = BatchDecoder().to(device)
-    metadata = load_checkpoint(args.checkpoint, {"core": core, "dynamics": dynamics, "ar": ar, "batch": batch}, device)
+    metadata = load_checkpoint(
+        args.checkpoint,
+        {"core": core, "dynamics": dynamics, "ar": ar, "batch": batch},
+        device,
+    )
     arrays = np.load(args.data)
-    data = {name: torch.as_tensor(arrays[name], device=device) for name in ("tokens", "context", "actions", "action_mask")}
-    parameters = []
+    names = (
+        "tokens",
+        "context",
+        "actions",
+        "policy",
+        "returns",
+        "action_mask",
+    )
+    missing = set(names) - set(arrays.files)
+    if missing:
+        raise KeyError(f"dataset is missing arrays: {sorted(missing)}")
+    data = {name: torch.as_tensor(arrays[name], device=device) for name in names}
+
+    parameters: list[torch.nn.Parameter] = []
     if args.decoder in ("ar", "both"):
         parameters.extend(ar.parameters())
     if args.decoder in ("batch", "both"):
@@ -61,28 +112,71 @@ def main() -> None:
         order = torch.randperm(count, device=device)
         values = []
         for start in range(0, count, args.batch_size):
-            idx = order[start : start + args.batch_size]
-            tokens = data["tokens"][idx].float()
-            context = data["context"][idx].float()
-            actions = data["actions"][idx].long()
-            mask = data["action_mask"][idx].bool()
+            index = order[start : start + args.batch_size]
+            step_context = data["context"][index].float()
+            actions = data["actions"][index].long()
+            mask = data["action_mask"][index].bool()
+            policies = data["policy"][index].float()
+            returns = data["returns"][index].float()
+            active_steps = int(mask.sum(dim=1).max().item())
+            tokens = data["tokens"][index, 0].float()
+            root_context = step_context[:, 0]
+            step_context = step_context[:, :active_steps]
+            actions = actions[:, :active_steps]
+            mask = mask[:, :active_steps]
+            policies = policies[:, :active_steps]
+            returns = returns[:, :active_steps]
+
             loss = torch.zeros((), device=device)
             if args.decoder in ("ar", "both"):
-                loss = loss + ar_loss(ar, tokens, context, actions, mask)
+                output, policy_target, value_target = ar_predictions(
+                    ar,
+                    tokens,
+                    root_context,
+                    step_context,
+                    actions,
+                    mask,
+                    policies,
+                    returns,
+                )
+                loss = loss + policy_q_loss(
+                    output,
+                    policy_target,
+                    value_target,
+                    weights=LossWeights(q=args.value_loss_weight),
+                )["loss"]
             if args.decoder in ("batch", "both"):
-                batch_output = batch(tokens, context)
-                batch_output.policy_logits = batch_output.policy_logits[:, : actions.shape[1]]
-                batch_output.q_values = batch_output.q_values[:, : actions.shape[1]]
-                batch_output.valid_rows = batch_output.valid_rows[:, : actions.shape[1]]
-                loss = loss + batch_sequence_loss(batch_output, actions, mask)["loss"]
+                output = batch(tokens, root_context)
+                output.policy_logits = output.policy_logits[:, :active_steps]
+                output.q_values = output.q_values[:, :active_steps]
+                output.valid_rows = output.valid_rows[:, :active_steps]
+                loss = loss + batch_sequence_loss(
+                    output,
+                    actions,
+                    mask,
+                    q_target=returns,
+                    weights=LossWeights(q=args.value_loss_weight),
+                )["loss"]
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(parameters, 1.0)
             optimizer.step()
             values.append(float(loss.detach()))
         print(f"epoch={epoch + 1} loss={np.mean(values):.6f}")
-    metadata.update({"sequence_data": str(args.data), "sequence_epochs": args.epochs})
-    save_checkpoint(args.out, {"core": core, "dynamics": dynamics, "ar": ar, "batch": batch}, metadata)
+
+    metadata.update(
+        {
+            "sequence_data": str(args.data),
+            "sequence_epochs": args.epochs,
+            "ar_policy_target": "soft_puct_visits",
+            "batch_policy_target": "selected_window_trajectory",
+        }
+    )
+    save_checkpoint(
+        args.out,
+        {"core": core, "dynamics": dynamics, "ar": ar, "batch": batch},
+        metadata,
+    )
 
 
 if __name__ == "__main__":

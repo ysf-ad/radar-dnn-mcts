@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from radar_dnn_mcts.models.checkpoint import save_checkpoint
+from radar_dnn_mcts.models.checkpoint import load_checkpoint, save_checkpoint
 from radar_dnn_mcts.models.decoders import AutoregressiveDecoder, BatchDecoder
 from radar_dnn_mcts.models.dynamics import LatentDynamics
 from radar_dnn_mcts.models.scheduler import RadarSchedulerModel
@@ -15,8 +15,9 @@ from radar_dnn_mcts.training.losses import policy_q_loss
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the common policy/Q model from PUCT-generated targets.")
-    parser.add_argument("--data", type=Path, required=True, help="NPZ with tokens, context, policy, q, and q_mask")
+    parser.add_argument("--data", type=Path, required=True, help="Grouped trajectory NPZ from collect_puct_targets.py")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -26,13 +27,28 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     arrays = np.load(args.data)
-    required = {"tokens", "context", "policy", "q", "q_mask"}
+    required = {"tokens", "context", "policy", "returns", "action_mask"}
     missing = required - set(arrays.files)
     if missing:
         raise KeyError(f"dataset is missing arrays: {sorted(missing)}")
     device = torch.device(args.device)
-    data = {name: torch.as_tensor(arrays[name], device=device) for name in required}
+    mask = torch.as_tensor(arrays["action_mask"], device=device).bool()
+    data = {
+        "tokens": torch.as_tensor(arrays["tokens"], device=device)[mask],
+        "context": torch.as_tensor(arrays["context"], device=device)[mask],
+        "policy": torch.as_tensor(arrays["policy"], device=device)[mask],
+        "returns": torch.as_tensor(arrays["returns"], device=device)[mask],
+    }
     core = RadarSchedulerModel().to(device)
+    dynamics = LatentDynamics().to(device)
+    ar = AutoregressiveDecoder(core).to(device)
+    batch = BatchDecoder().to(device)
+    if args.checkpoint:
+        load_checkpoint(
+            args.checkpoint,
+            {"core": core, "dynamics": dynamics, "ar": ar, "batch": batch},
+            device,
+        )
     optimizer = torch.optim.AdamW(core.parameters(), lr=args.lr, weight_decay=1e-4)
     count = data["tokens"].shape[0]
     for epoch in range(args.epochs):
@@ -45,8 +61,7 @@ def main() -> None:
             losses = policy_q_loss(
                 output,
                 data["policy"][idx].float(),
-                data["q"][idx].float(),
-                data["q_mask"][idx].bool(),
+                data["returns"][idx].float(),
             )
             optimizer.zero_grad(set_to_none=True)
             losses["loss"].backward()
@@ -55,13 +70,15 @@ def main() -> None:
             totals.append(float(losses["loss"].detach()))
         print(f"epoch={epoch + 1} loss={np.mean(totals):.6f}")
 
-    dynamics = LatentDynamics().to(device)
-    ar = AutoregressiveDecoder(core).to(device)
-    batch = BatchDecoder().to(device)
     save_checkpoint(
         args.out,
         {"core": core, "dynamics": dynamics, "ar": ar, "batch": batch},
-        {"seed": args.seed, "epochs": args.epochs, "source": str(args.data)},
+        {
+            "seed": args.seed,
+            "epochs": args.epochs,
+            "source": str(args.data),
+            "initialized_from": str(args.checkpoint) if args.checkpoint else None,
+        },
     )
 
 

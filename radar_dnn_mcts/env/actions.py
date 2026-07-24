@@ -41,7 +41,7 @@ def action_duration_ms(obs: dict, row: int, search_dwell_ms: float = 10.0) -> fl
     if int(row) == 0:
         return float(search_dwell_ms)
     dwell = np.asarray(obs["t_dwell"], dtype=np.float32)
-    return float(dwell[int(row) - 1])
+    return float(int(dwell[int(row) - 1]))
 
 
 def fill_budget(rows: list[int], obs: dict, budget_ms: float = 200.0, search_dwell_ms: float = 10.0) -> list[int]:

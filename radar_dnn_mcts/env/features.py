@@ -32,9 +32,13 @@ class FeatureBuilder:
 
         tracked_active = active & tracked
         tracked_delay = local_delay[tracked_active]
+        macro_urgencies = np.empty(0, dtype=np.float32)
+        if grid.size == 300:
+            patches = grid.reshape(10, 30)
+            macro_urgencies = patches.reshape(5, 2, 15, 2).min(axis=(1, 3)).reshape(-1)
         x[0, :8] = [
             float(tracked_active.mean()) if tracked_active.size else 0.0,
-            float(grid.min()) if grid.size else 0.0,
+            float(np.clip(grid.min() / 3000.0, -2.0, 2.0)) if grid.size else 0.0,
             float(np.clip(tracked_delay.sum() / 20000.0, 0.0, 10.0)),
             float(np.clip(tracked_delay.mean() / 2000.0, 0.0, 10.0)) if tracked_delay.size else 0.0,
             float((desired[tracked_active] < 0).mean()) if tracked_active.any() else 0.0,
@@ -52,6 +56,12 @@ class FeatureBuilder:
         x[1 : n + 1, 6] = np.clip(0.001 * local_delay * (1.0 + 2.0 * priority), 0.0, 10.0)
         x[1 : n + 1, 7] = x[0, 7]
         x[0, 8] = float(search_count) / 20.0
+        if macro_urgencies.size:
+            x[0, 9:12] = np.clip(
+                np.quantile(macro_urgencies, [0.0, 0.25, 0.5]) / 3000.0,
+                -2.0,
+                2.0,
+            )
         for row in selected:
             if 1 <= row <= self.max_targets:
                 x[row, 8] = 1.0

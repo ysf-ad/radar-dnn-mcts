@@ -21,24 +21,38 @@ def policy_q_loss(
     output: PolicyQOutput,
     policy_target: torch.Tensor,
     q_target: torch.Tensor,
-    q_mask: torch.Tensor,
     weights: LossWeights = LossWeights(),
 ) -> dict[str, torch.Tensor]:
     target = policy_target / policy_target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-    search_mass = target[:, 0]
-    track_mass = target[:, 1:].sum(dim=-1)
-    type_target = torch.stack([search_mass, track_mass], dim=-1)
-    type_log_prob = F.log_softmax(output.type_logits, dim=-1)
-    type_loss = -(type_target * type_log_prob).sum(dim=-1).mean()
+    if output.type_logits is None or output.target_logits is None:
+        policy_loss = -(target * F.log_softmax(output.policy_logits, dim=-1)).sum(dim=-1).mean()
+        type_loss = torch.zeros((), device=policy_loss.device)
+        target_loss = policy_loss
+    else:
+        search_mass = target[:, 0]
+        track_mass = target[:, 1:].sum(dim=-1)
+        type_target = torch.stack([search_mass, track_mass], dim=-1)
+        type_log_prob = F.log_softmax(output.type_logits, dim=-1)
+        type_loss = -(type_target * type_log_prob).sum(dim=-1).mean()
 
-    conditional = target[:, 1:] / track_mass[:, None].clamp_min(1e-8)
-    target_log_prob = F.log_softmax(output.target_logits[:, 1:].masked_fill(~output.valid_rows[:, 1:], -1e9), dim=-1)
-    target_ce = -(conditional * target_log_prob).sum(dim=-1)
-    target_loss = (target_ce * (track_mass > 0).float()).sum() / (track_mass > 0).float().sum().clamp_min(1.0)
-    policy_loss = type_loss + target_loss
+        conditional = target[:, 1:] / track_mass[:, None].clamp_min(1e-8)
+        target_log_prob = F.log_softmax(
+            output.target_logits[:, 1:].masked_fill(
+                ~output.valid_rows[:, 1:], -1e9
+            ),
+            dim=-1,
+        )
+        target_ce = -(conditional * target_log_prob).sum(dim=-1)
+        track_count = (track_mass > 0).float()
+        target_loss = (target_ce * track_count).sum() / track_count.sum().clamp_min(1.0)
+        policy_loss = type_loss + target_loss
 
-    q_error = (output.q_values - q_target).square() * q_mask.float()
-    q_loss = q_error.sum() / q_mask.float().sum().clamp_min(1.0)
+    if q_target.ndim == 1:
+        value_prediction = output.q_values[:, 0]
+    else:
+        value_prediction = output.q_values
+    q_error = F.smooth_l1_loss(value_prediction, q_target, reduction="none")
+    q_loss = q_error.mean()
     total = weights.policy * policy_loss + weights.q * q_loss
     return {
         "loss": total,
@@ -54,15 +68,21 @@ def batch_sequence_loss(
     action_rows: torch.Tensor,
     action_mask: torch.Tensor,
     q_target: torch.Tensor | None = None,
+    policy_target: torch.Tensor | None = None,
     weights: LossWeights = LossWeights(),
 ) -> dict[str, torch.Tensor]:
     logits = output.policy_logits.flatten(0, 1)
-    targets = action_rows.flatten()
     mask = action_mask.flatten().float()
-    ce = F.cross_entropy(logits, targets, reduction="none")
+    if policy_target is None:
+        ce = F.cross_entropy(logits, action_rows.flatten(), reduction="none")
+    else:
+        target = policy_target.flatten(0, 1)
+        target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        ce = -(target * F.log_softmax(logits, dim=-1)).sum(dim=-1)
     policy = (ce * mask).sum() / mask.sum().clamp_min(1.0)
     q = torch.zeros((), device=logits.device)
     if q_target is not None:
         selected_q = output.q_values.gather(-1, action_rows.unsqueeze(-1)).squeeze(-1)
-        q = ((selected_q - q_target).square() * action_mask.float()).sum() / action_mask.float().sum().clamp_min(1.0)
+        q_error = F.smooth_l1_loss(selected_q, q_target, reduction="none")
+        q = (q_error * action_mask.float()).sum() / action_mask.float().sum().clamp_min(1.0)
     return {"loss": weights.policy * policy + weights.q * q, "policy": policy, "q": q}

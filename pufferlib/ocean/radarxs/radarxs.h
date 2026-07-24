@@ -1175,9 +1175,7 @@ move_simulation_forward:
       // makes the reward invariant to whether a 200 ms schedule is split
       // into many short searches or fewer long tracks.
       env->rewards[0] -= env->search_frame_overdue_weight *
-                         frame_cost /
-                         (float)(MAX_AZ_SLICES * MAX_EL_SLICES) *
-                         (delta_t / 200.0f);
+                         frame_cost * (delta_t / 200.0f);
     }
     for (int i = 0; i < env->max_trackers; i++) {
       if (env->targets[i].is_tracked) {
