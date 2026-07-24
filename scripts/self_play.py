@@ -44,6 +44,7 @@ def run(command: list[str], root: Path) -> None:
 
 
 def merge_trajectories(paths: list[Path], output: Path) -> None:
+    """Merge cell datasets while padding only the schedule-step axis."""
     sources = [np.load(path) for path in paths]
     for path, source in zip(paths, sources):
         missing = set(GROUPED_KEYS) - set(source.files)
@@ -76,6 +77,7 @@ def merge_trajectories(paths: list[Path], output: Path) -> None:
 
 
 def main() -> None:
+    """Alternate PUCT collection and a selected learner."""
     parser = argparse.ArgumentParser(
         description="Alternate full-window PUCT collection and policy/value training."
     )

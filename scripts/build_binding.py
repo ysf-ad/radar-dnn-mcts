@@ -1,3 +1,5 @@
+"""Force a local rebuild of the radar simulator extension."""
+
 from __future__ import annotations
 
 import subprocess
@@ -10,6 +12,7 @@ RADARXS = ROOT / "pufferlib" / "ocean" / "radarxs"
 
 
 def main() -> None:
+    """Compile in place from the current C and header sources."""
     subprocess.check_call(
         [sys.executable, "setup_binding.py", "build_ext", "--inplace", "--force"],
         cwd=str(RADARXS),

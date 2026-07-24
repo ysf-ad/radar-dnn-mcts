@@ -4,6 +4,7 @@ from scripts.self_play import GROUPED_KEYS, merge_trajectories
 
 
 def grouped_arrays(windows: int, steps: int) -> dict[str, np.ndarray]:
+    """Create a minimal grouped trajectory fixture."""
     return {
         "tokens": np.zeros((windows, steps, 3, 2), dtype=np.float32),
         "context": np.zeros((windows, steps, 2), dtype=np.float32),
@@ -18,6 +19,7 @@ def grouped_arrays(windows: int, steps: int) -> dict[str, np.ndarray]:
 
 
 def test_merge_trajectories_pads_steps_and_preserves_masks(tmp_path):
+    """Merging pads short windows without marking padding valid."""
     first = tmp_path / "first.npz"
     second = tmp_path / "second.npz"
     output = tmp_path / "merged.npz"

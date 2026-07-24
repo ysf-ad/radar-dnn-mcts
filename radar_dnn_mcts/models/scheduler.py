@@ -13,6 +13,8 @@ from radar_dnn_mcts.models.backbone import EncodedState, StateEncoder
 
 @dataclass
 class PolicyQOutput:
+    """Complete-action policy logits plus a broadcast scalar state value."""
+
     policy_logits: torch.Tensor
     q_values: torch.Tensor
     valid_rows: torch.Tensor
@@ -59,6 +61,7 @@ class RadarSchedulerModel(nn.Module):
         )
 
     def encode(self, tokens: torch.Tensor, context: torch.Tensor) -> EncodedState:
+        """Encode the visible candidate set and global radar context."""
         return self.encoder(tokens, context)
 
     def predict(
@@ -67,6 +70,7 @@ class RadarSchedulerModel(nn.Module):
         context: torch.Tensor,
         selected_rows: torch.Tensor | None = None,
     ) -> PolicyQOutput:
+        """Score valid complete actions from an existing state encoding."""
         context_state = self.context_projection(context)
         valid = state.valid_rows.clone()
         if selected_rows is not None:
@@ -85,6 +89,7 @@ class RadarSchedulerModel(nn.Module):
             type_logits = None
             target_logits = None
         else:
+            # Chain rule: P(track target i) = P(track) P(i | track).
             track_valid = torch.cat([torch.zeros_like(valid[:, :1]), valid[:, 1:]], dim=1)
             track_scores = self.type_pool(actions).squeeze(-1).masked_fill(~track_valid, -1e9)
             track_weights = torch.softmax(track_scores, dim=-1)
@@ -101,6 +106,7 @@ class RadarSchedulerModel(nn.Module):
             policy = torch.cat([type_log_prob[:, :1], track_policy[:, 1:]], dim=1)
             policy = policy.masked_fill(~valid, -1e9)
         value = self.q_head(global_context).squeeze(-1)
+        # The historical q_values API is retained although this is V(s).
         q = value[:, None].expand_as(policy).masked_fill(~valid, 0.0)
         return PolicyQOutput(policy, q, valid, type_logits, target_logits)
 

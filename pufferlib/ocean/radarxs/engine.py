@@ -288,6 +288,7 @@ class RadarEngine:
             cumulative_time += est_dt
             self.last_executed_plan.append(action)
 
+            # Collectors use this hook to pair planned actions with live rewards.
             if hasattr(self.planner, 'observe_transition'):
                 after = get_obs_from_buf(self.obs_buf, self.max_trackers)
                 self.planner.observe_transition(
@@ -302,6 +303,7 @@ class RadarEngine:
             if cumulative_time >= self.window_ms:
                 break
 
+        # Preserve window boundaries in grouped training trajectories.
         if hasattr(self.planner, 'finish_window'):
             self.planner.finish_window()
         self.total_reward += window_reward

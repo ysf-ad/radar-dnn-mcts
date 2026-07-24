@@ -14,6 +14,8 @@ from radar_dnn_mcts.evaluation.metrics import observation_metrics, summarize_win
 
 
 class TimedPlanner:
+    """Measure planner latency without including environment execution."""
+
     def __init__(self, planner):
         self.planner = planner
         self.last_plan: list[int] = []
@@ -27,6 +29,8 @@ class TimedPlanner:
 
 
 class BenchmarkRunner:
+    """Evaluate each planner on the same configured load cells."""
+
     def __init__(self, config: BenchmarkConfig):
         self.config = config
 
@@ -43,6 +47,7 @@ class BenchmarkRunner:
         )
 
     def run(self, planners: dict[str, object], warmup_windows: int = 10) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Return per-window traces and aggregate method summaries."""
         rows: list[dict] = []
         latency_warmup = min(int(warmup_windows), max(0, self.config.windows // 4))
         for initial, rate, seed in self.config.cells():

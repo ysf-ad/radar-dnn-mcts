@@ -29,6 +29,7 @@ def ar_predictions(
     policies: torch.Tensor,
     returns: torch.Tensor,
 ) -> tuple[PolicyQOutput, torch.Tensor, torch.Tensor]:
+    """Align prefix-conditioned predictions with active PUCT targets."""
     state, _ = model.initial(tokens, root_context)
     prefix_deltas = model.decode_prefix_deltas(state, actions[:, :-1])
     rows = policies.shape[-1]

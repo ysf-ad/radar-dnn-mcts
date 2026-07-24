@@ -31,6 +31,7 @@ class ActionTokenMixer(nn.Module):
         self.mixer = nn.TransformerEncoder(layer, num_layers=layers, enable_nested_tensor=False)
 
     def forward(self, state: EncodedState, context_state: torch.Tensor, valid_rows: torch.Tensor) -> torch.Tensor:
+        """Construct candidates, then let actions condition one another."""
         rows = state.target_states.shape[1]
         row_ids = torch.arange(rows, device=state.target_states.device)[None, :, None]
         action_type = torch.where(

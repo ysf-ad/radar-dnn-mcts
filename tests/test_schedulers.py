@@ -13,6 +13,7 @@ from radar_dnn_mcts.search import PUCTConfig
 
 
 def test_all_scheduler_modes_return_legal_nonempty_plans(radar_obs):
+    """Every deployment mode returns a legal, nonempty schedule."""
     torch.manual_seed(916)
     features = FeatureBuilder(max_targets=5)
     core = RadarSchedulerModel(d_model=32, nhead=4, encoder_layers=1, action_layers=1).eval()

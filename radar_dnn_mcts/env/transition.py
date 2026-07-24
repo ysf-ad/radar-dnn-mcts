@@ -16,6 +16,7 @@ class RadarObservationTransition:
         return dict(obs)
 
     def step(self, obs: dict, row: int) -> tuple[dict, float]:
+        """Apply one search/track action without advancing the live C engine."""
         nxt = self.clone(obs)
         duration = action_duration_ms(nxt, row)
         active = np.asarray(nxt["active_mask"], dtype=bool)
@@ -25,6 +26,7 @@ class RadarObservationTransition:
         grid = np.asarray(nxt.get("grid", np.zeros(300)), dtype=np.float32).copy()
         refreshed: tuple[int, ...] = ()
         if row == 0:
+            # Search refreshes the stalest 2x2 sector represented by the grid.
             if grid.size == self.grid_width * self.grid_height:
                 cells = grid.reshape(self.grid_height, self.grid_width)
                 candidates = [

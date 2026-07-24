@@ -1,3 +1,5 @@
+"""Public full-window PUCT search contracts."""
+
 from radar_dnn_mcts.search.puct import (
     PUCT,
     PUCTConfig,

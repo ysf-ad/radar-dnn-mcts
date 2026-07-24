@@ -32,6 +32,7 @@ def evaluator(state, legal):
 
 
 def test_puct_prefers_higher_return_action():
+    """Backed-up return should dominate equal priors."""
     result = PUCT(evaluator, PUCTConfig(rollouts=64, c_puct=1.0)).run(ToyState())
     assert result.trajectory[0].action == 1
     assert abs(sum(result.trajectory[0].policy.values()) - 1.0) < 1e-6
@@ -47,6 +48,7 @@ def zero_evaluator(state, legal):
 
 
 def test_root_q_includes_immediate_edge_reward():
+    """Immediate reward must enter the root edge value."""
     result = PUCT(
         zero_evaluator,
         PUCTConfig(rollouts=16, c_puct=0.5, reward_scale=1.0),
@@ -67,6 +69,7 @@ def boundary_value_evaluator(state, legal):
 
 
 def test_puct_uses_boundary_state_value():
+    """Leaf value should guide otherwise equal terminal rewards."""
     result = PUCT(
         boundary_value_evaluator,
         PUCTConfig(rollouts=16, c_puct=1.0),
@@ -75,5 +78,6 @@ def test_puct_uses_boundary_state_value():
 
 
 def test_puct_returns_complete_trajectory():
+    """Search returns an executable full-window path."""
     result = PUCT(evaluator, PUCTConfig(rollouts=16)).run(ToyState())
     assert len(result.trajectory) == 3

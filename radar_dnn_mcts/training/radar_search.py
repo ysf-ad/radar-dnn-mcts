@@ -28,6 +28,8 @@ def _selected_mask(rows: int, selected: set[int], device: torch.device) -> torch
 
 
 class RadarWindowSearchState:
+    """Cloneable shadow state for searching one scheduling window."""
+
     def __init__(
         self,
         obs: dict,
@@ -53,6 +55,7 @@ class RadarWindowSearchState:
         return deepcopy(self)
 
     def legal_actions(self) -> list[int]:
+        """Return search plus active, unexpired, unselected targets."""
         if self.elapsed >= self.budget_ms:
             return []
         active = np.asarray(self.obs["active_mask"], dtype=bool)
@@ -61,6 +64,7 @@ class RadarWindowSearchState:
         return [0, *tracks]
 
     def step(self, action: int) -> tuple[float, bool]:
+        """Advance the shadow state and return its transition reward."""
         before = self.obs
         self.obs, duration = self.transition.step(self.obs, action)
         self.elapsed += duration
@@ -74,6 +78,7 @@ class RadarWindowSearchState:
         return transition_reward(before, self.obs, action, self.reward_config), self.elapsed >= self.budget_ms
 
     def network_input(self):
+        """Build model features at the current searched action prefix."""
         return (
             self.features.tokens(self.obs, self.selected, self.searches),
             self.features.context(self.obs, self.elapsed, self.searches, self.tracks, self.last),
@@ -93,6 +98,8 @@ class RadarWindowSearchState:
 
 
 class RadarModelEvaluator:
+    """Adapt the shared policy/value model to the PUCT interface."""
+
     def __init__(self, model: RadarSchedulerModel):
         self.model = model.eval()
 
@@ -114,6 +121,8 @@ class RadarModelEvaluator:
 
 
 class RadarAREvaluator:
+    """Evaluate a PUCT prefix through the causal sequence decoder."""
+
     def __init__(self, decoder):
         self.decoder = decoder.eval()
 

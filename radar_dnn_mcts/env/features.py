@@ -11,10 +11,13 @@ CONTEXT_DIM = 11
 
 @dataclass(frozen=True)
 class FeatureBuilder:
+    """Convert a variable radar observation into fixed-size model inputs."""
+
     max_targets: int = 100
     window_ms: float = 200.0
 
     def tokens(self, obs: dict, selected: set[int] | None = None, search_count: int = 0) -> np.ndarray:
+        """Build row 0 for search/global state and rows 1..N for targets."""
         selected = selected or set()
         rows = self.max_targets + 1
         x = np.zeros((rows, TOKEN_DIM), dtype=np.float32)
@@ -73,6 +76,7 @@ class FeatureBuilder:
         return x
 
     def context(self, obs: dict, elapsed_ms: float, search_count: int, track_count: int, last_row: int) -> np.ndarray:
+        """Build window-level timing, load, and sensor-availability features."""
         active = np.asarray(obs["active_mask"], dtype=bool)[: self.max_targets]
         deadline = np.asarray(obs["t_deadline"], dtype=np.float32)[: self.max_targets]
         dwell = np.asarray(obs["t_dwell"], dtype=np.float32)[: self.max_targets]

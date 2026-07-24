@@ -13,6 +13,7 @@ def _inputs(obs):
 
 
 def test_policy_q_shapes_and_masks(radar_obs):
+    """The shared model scores every row and rejects inactive targets."""
     tokens, context = _inputs(radar_obs)
     model = RadarSchedulerModel(d_model=32, nhead=4, encoder_layers=1, action_layers=1).eval()
     output = model(tokens, context)
@@ -22,6 +23,7 @@ def test_policy_q_shapes_and_masks(radar_obs):
 
 
 def test_recurrent_ar_batch_and_boundary_contracts(radar_obs):
+    """Decoder variants preserve their public tensor contracts."""
     tokens, context = _inputs(radar_obs)
     core = RadarSchedulerModel(d_model=32, nhead=4, encoder_layers=1, action_layers=1).eval()
     state = core.encode(tokens, context)

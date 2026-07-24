@@ -14,6 +14,8 @@ from radar_dnn_mcts.models.scheduler import PolicyQOutput, RadarSchedulerModel
 
 @dataclass
 class SequenceOutput:
+    """Per-position policy/value predictions and their validity masks."""
+
     policy_logits: torch.Tensor
     q_values: torch.Tensor
     valid_rows: torch.Tensor
@@ -54,6 +56,7 @@ class AutoregressiveDecoder(nn.Module):
         self.context_delta = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, CONTEXT_DIM))
 
     def initial(self, tokens: torch.Tensor, context: torch.Tensor) -> tuple[EncodedState, torch.Tensor]:
+        """Encode the root observation once and initialize an empty prefix."""
         state = self.backbone.encode(tokens, context)
         prefix = torch.empty(tokens.shape[0], 0, dtype=torch.long, device=tokens.device)
         return state, prefix
@@ -63,6 +66,7 @@ class AutoregressiveDecoder(nn.Module):
         state: EncodedState,
         prefix_rows: torch.Tensor,
     ) -> torch.Tensor:
+        """Cross-attend the causal action prefix to the encoded radar state."""
         batch, prefix_length = prefix_rows.shape
         sequence = self.bos.expand(batch, -1, -1) + self.position.weight[0][None, None, :]
         if prefix_length:
@@ -96,6 +100,7 @@ class AutoregressiveDecoder(nn.Module):
         context: torch.Tensor,
         selected_rows: torch.Tensor,
     ) -> PolicyQOutput:
+        """Predict the next action from the root encoding and decoded prefix."""
         prefix_delta = self.decode_prefix_deltas(state, prefix_rows)[:, -1]
         if prefix_rows.shape[1]:
             context = context + self.context_delta(prefix_delta)
@@ -143,10 +148,12 @@ class BatchDecoder(nn.Module):
         )
 
     def forward(self, tokens: torch.Tensor, context: torch.Tensor) -> SequenceOutput:
+        """Predict all schedule-position/action scores in one network pass."""
         state = self.encoder(tokens, context)
         action_memory = self.action_mixer(
             state, self.context_projection(context), state.valid_rows
         )
+        # Each query represents a schedule position; only elapsed fraction varies.
         slot_context = context[:, None, :].expand(-1, self.max_steps, -1).clone()
         slot_context[:, :, 0] = (
             torch.arange(self.max_steps, device=context.device, dtype=context.dtype) / 20.0

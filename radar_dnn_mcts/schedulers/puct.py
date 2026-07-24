@@ -25,6 +25,7 @@ class FullWindowPUCTScheduler:
         self.search = PUCT(RadarModelEvaluator(model), config or PUCTConfig())
 
     def plan(self, obs: dict, budget_ms: float = 200.0) -> list[int]:
+        """Return the visit-count principal trajectory from full-window search."""
         state = RadarWindowSearchState(
             obs, self.features, self.reward, budget_ms=budget_ms
         )

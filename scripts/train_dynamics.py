@@ -15,6 +15,7 @@ from radar_dnn_mcts.training.losses import LossWeights, policy_q_loss
 
 
 def select_output(output: PolicyQOutput, indices: torch.Tensor) -> PolicyQOutput:
+    """Select active roots without changing the prediction contract."""
     return PolicyQOutput(
         output.policy_logits[indices],
         output.q_values[indices],
@@ -25,6 +26,7 @@ def select_output(output: PolicyQOutput, indices: torch.Tensor) -> PolicyQOutput
 
 
 def main() -> None:
+    """Jointly optimize MuZero representation, dynamics, and prediction."""
     parser = argparse.ArgumentParser(
         description="Jointly train MuZero h/g/f with recurrent policy, value, and reward targets."
     )
@@ -110,6 +112,7 @@ def main() -> None:
             loss = torch.zeros((), device=device)
             terms = 0
             for offset in range(max_steps):
+                # Shorter trajectory suffixes become inactive during unrolling.
                 steps = root_steps + offset
                 in_bounds = steps < sequence_steps
                 safe_steps = steps.clamp_max(sequence_steps - 1)

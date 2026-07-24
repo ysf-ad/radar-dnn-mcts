@@ -1,4 +1,5 @@
 # radar-dnn-mcts
+<!-- Minimal operator guide; architecture details live in docs/. -->
 
 Research code for learned radar scheduling with transformer policy/Q models and PUCT-style planning.
 

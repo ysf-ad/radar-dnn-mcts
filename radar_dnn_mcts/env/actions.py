@@ -38,6 +38,7 @@ def valid_action_mask(
 
 
 def action_duration_ms(obs: dict, row: int, search_dwell_ms: float = 10.0) -> float:
+    """Return fixed search dwell or the selected target's track dwell."""
     if int(row) == 0:
         return float(search_dwell_ms)
     dwell = np.asarray(obs["t_dwell"], dtype=np.float32)

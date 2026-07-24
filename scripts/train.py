@@ -1,3 +1,5 @@
+"""Train the shared policy/value model from grouped PUCT trajectories."""
+
 from __future__ import annotations
 
 import argparse
@@ -14,6 +16,7 @@ from radar_dnn_mcts.training.losses import policy_q_loss
 
 
 def main() -> None:
+    """Fine-tune core weights while preserving other checkpoint modules."""
     parser = argparse.ArgumentParser(description="Train the common policy/Q model from PUCT-generated targets.")
     parser.add_argument("--data", type=Path, required=True, help="Grouped trajectory NPZ from collect_puct_targets.py")
     parser.add_argument("--out", type=Path, required=True)

@@ -1174,6 +1174,7 @@ move_simulation_forward:
       // Interpret frame staleness as a cost rate. Scaling by elapsed time
       // makes the reward invariant to whether a 200 ms schedule is split
       // into many short searches or fewer long tracks.
+      // frame_cost is already aggregated over the active search grid.
       env->rewards[0] -= env->search_frame_overdue_weight *
                          frame_cost * (delta_t / 200.0f);
     }

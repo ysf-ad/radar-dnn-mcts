@@ -26,6 +26,7 @@ class AutoregressiveScheduler:
 
     @torch.inference_mode()
     def plan(self, obs: dict, budget_ms: float = 200.0) -> list[int]:
+        """Decode until the soft window budget or step limit is reached."""
         device = device_of(self.decoder)
         tokens = tensor(self.features.tokens(obs), device)
         root_context = tensor(self.features.context(obs, 0.0, 0, 0, -1), device)

@@ -29,6 +29,7 @@ class FullReencodeScheduler:
 
     @torch.inference_mode()
     def plan(self, obs: dict, budget_ms: float = 200.0) -> list[int]:
+        """Decode greedily while re-encoding each shadow observation."""
         device = device_of(self.model)
         shadow = self.transition.clone(obs)
         plan: list[int] = []

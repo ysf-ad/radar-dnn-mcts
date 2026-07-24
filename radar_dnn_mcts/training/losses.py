@@ -23,12 +23,14 @@ def policy_q_loss(
     q_target: torch.Tensor,
     weights: LossWeights = LossWeights(),
 ) -> dict[str, torch.Tensor]:
+    """Train policy from soft visits and state value from return-to-go."""
     target = policy_target / policy_target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     if output.type_logits is None or output.target_logits is None:
         policy_loss = -(target * F.log_softmax(output.policy_logits, dim=-1)).sum(dim=-1).mean()
         type_loss = torch.zeros((), device=policy_loss.device)
         target_loss = policy_loss
     else:
+        # Marginalize complete-action targets into type and target factors.
         search_mass = target[:, 0]
         track_mass = target[:, 1:].sum(dim=-1)
         type_target = torch.stack([search_mass, track_mass], dim=-1)
@@ -71,6 +73,7 @@ def batch_sequence_loss(
     policy_target: torch.Tensor | None = None,
     weights: LossWeights = LossWeights(),
 ) -> dict[str, torch.Tensor]:
+    """Average slot policy/value losses over executed schedule positions."""
     logits = output.policy_logits.flatten(0, 1)
     mask = action_mask.flatten().float()
     if policy_target is None:

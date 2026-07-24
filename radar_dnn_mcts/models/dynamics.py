@@ -22,6 +22,7 @@ class LatentDynamics(nn.Module):
         self.reward = nn.Sequential(nn.LayerNorm(2 * d_model), nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1))
 
     def forward(self, state: EncodedState, action_rows: torch.Tensor) -> tuple[EncodedState, torch.Tensor]:
+        """Predict the next latent candidate set and immediate reward."""
         rows = action_rows.long()
         gather = rows[:, None, None].expand(-1, 1, state.target_states.shape[-1])
         selected_action = state.target_states.gather(1, gather).squeeze(1)

@@ -26,6 +26,7 @@ class BatchScheduler:
 
     @torch.inference_mode()
     def plan(self, obs: dict, budget_ms: float = 200.0) -> list[int]:
+        """Project one-pass slot scores into a feasible ordered schedule."""
         device = device_of(self.decoder)
         tokens = tensor(self.features.tokens(obs), device)
         context = tensor(self.features.context(obs, 0.0, 0, 0, -1), device)

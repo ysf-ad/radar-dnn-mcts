@@ -1,4 +1,5 @@
 # Architecture
+<!-- Keep this document aligned with the executable scheduler classes. -->
 
 The package separates shared learned components from deployment behavior.
 

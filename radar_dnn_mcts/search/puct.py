@@ -20,6 +20,8 @@ class PolicyValueEvaluator(Protocol):
 
 @dataclass(frozen=True)
 class PUCTConfig:
+    """Search and duration-aware return settings for one scheduling window."""
+
     rollouts: int = 32
     c_puct: float = 1.5
     discount: float = 0.99
@@ -33,6 +35,8 @@ class PUCTConfig:
 
 @dataclass
 class Node:
+    """One action edge and its backed-up subtree statistics."""
+
     prior: float = 1.0
     visits: int = 0
     value_sum: float = 0.0
@@ -116,6 +120,7 @@ class PUCT:
         path: list[Node],
         terminal: bool,
     ) -> float:
+        """Complete a newly expanded prefix to the window boundary by policy."""
         while not terminal:
             legal = state.legal_actions()
             if not legal:
@@ -155,6 +160,7 @@ class PUCT:
     def _extract_trajectory(
         self, root: Node, root_state: SearchState
     ) -> tuple[SearchDecision, ...]:
+        """Follow maximum visit mass to produce one executable schedule."""
         state = root_state.clone()
         node: Node | None = root
         decisions: list[SearchDecision] = []
@@ -188,6 +194,7 @@ class PUCT:
         return tuple(decisions)
 
     def run(self, root_state: SearchState, *, training: bool = False) -> SearchResult:
+        """Run complete-window rollouts and return their principal trajectory."""
         root = Node()
         self._expand(root, root_state, root_noise=training)
         for _ in range(self.config.rollouts):
@@ -205,6 +212,7 @@ class PUCT:
                 if node.visits == 0:
                     break
             value = self._complete_trajectory(state, node, path, terminal)
+            # Back up edge rewards followed by the boundary value at the leaf.
             for current in reversed(path):
                 current.visits += 1
                 current.value_sum += value

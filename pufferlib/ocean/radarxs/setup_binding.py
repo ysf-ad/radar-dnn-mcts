@@ -1,3 +1,5 @@
+"""Build the headless radar C extension and track header dependencies."""
+
 import os
 from setuptools import setup, Extension
 import numpy as np

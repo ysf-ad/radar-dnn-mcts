@@ -29,6 +29,7 @@ class MuZeroScheduler:
 
     @torch.inference_mode()
     def plan(self, obs: dict, budget_ms: float = 200.0) -> list[int]:
+        """Decode greedily while g predicts each next latent radar state."""
         device = device_of(self.model)
         root_tokens = tensor(self.features.tokens(obs), device)
         context = tensor(self.features.context(obs, 0.0, 0, 0, -1), device)

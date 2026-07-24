@@ -1,3 +1,5 @@
+"""Evaluate learned schedulers and EDF/EST on a shared load grid."""
+
 from __future__ import annotations
 
 import argparse
@@ -27,6 +29,7 @@ from radar_dnn_mcts.schedulers import (
 
 
 def load_config(path: Path) -> BenchmarkConfig:
+    """Load reproducible benchmark dimensions from YAML."""
     data = yaml.safe_load(path.read_text())
     return BenchmarkConfig(
         initial_targets=tuple(data["initial_targets"]),
@@ -40,6 +43,7 @@ def load_config(path: Path) -> BenchmarkConfig:
 
 
 def main() -> None:
+    """Write per-window traces, aggregate summaries, and plots."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path("configs/eval_9cell.yaml"))
     parser.add_argument("--checkpoint", type=Path)

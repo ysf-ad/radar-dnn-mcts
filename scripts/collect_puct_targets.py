@@ -23,6 +23,8 @@ from radar_dnn_mcts.training.radar_search import (
 
 
 class WindowTrajectoryCollector:
+    """Collect executed full-window trajectories and episode returns."""
+
     def __init__(
         self,
         search: PUCT | None,
@@ -89,6 +91,7 @@ class WindowTrajectoryCollector:
         return records
 
     def plan(self, obs: dict, budget_ms: float) -> list[int]:
+        """Search or query a teacher, retaining records for execution."""
         self.pending = (
             self._teacher_records(obs, budget_ms)
             if self.teacher is not None
@@ -106,6 +109,7 @@ class WindowTrajectoryCollector:
         _after: dict,
         duration_ms: float,
     ) -> None:
+        """Attach live simulator reward to the matching planned decision."""
         while (
             self.cursor < len(self.pending)
             and self.pending[self.cursor]["action"] != action
@@ -127,6 +131,7 @@ class WindowTrajectoryCollector:
         self.cursor = 0
 
     def backfill_episode_returns(self, discount: float, window_ms: float, scale: float) -> None:
+        """Backfill duration-discounted returns across episode windows."""
         value = 0.0
         for window in reversed(self.windows):
             for record in reversed(window):
@@ -137,6 +142,7 @@ class WindowTrajectoryCollector:
                 record["return"] = value
 
     def arrays(self) -> dict[str, np.ndarray]:
+        """Pad variable-length windows into one grouped dataset."""
         if not self.windows:
             raise RuntimeError("collector produced no executed window trajectories")
         window_count = len(self.windows)

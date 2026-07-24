@@ -10,6 +10,8 @@ from radar_dnn_mcts.env.features import CONTEXT_DIM, TOKEN_DIM
 
 @dataclass
 class EncodedState:
+    """Global CLS representation, candidate rows, and their validity mask."""
+
     global_state: torch.Tensor
     target_states: torch.Tensor
     valid_rows: torch.Tensor
@@ -39,6 +41,7 @@ class StateEncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers=layers, enable_nested_tensor=False)
 
     def forward(self, tokens: torch.Tensor, context: torch.Tensor) -> EncodedState:
+        """Contextualize every visible candidate together with a CLS token."""
         if tokens.ndim != 3 or context.ndim != 2:
             raise ValueError("tokens must be [batch, rows, features] and context [batch, features]")
         valid = tokens[:, :, 4] > 0.5

@@ -31,6 +31,8 @@ class RewardConfig:
 
 @dataclass(frozen=True)
 class BenchmarkConfig:
+    """Cartesian load grid and episode settings used by evaluation."""
+
     initial_targets: tuple[int, ...] = (20, 40, 60)
     arrival_rates: tuple[float, ...] = (2.0, 3.0, 4.0)
     seeds: tuple[int, ...] = (916,)
@@ -41,6 +43,7 @@ class BenchmarkConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
 
     def cells(self):
+        """Yield every initial-target, arrival-rate, and seed combination."""
         for initial in self.initial_targets:
             for rate in self.arrival_rates:
                 for seed in self.seeds:
