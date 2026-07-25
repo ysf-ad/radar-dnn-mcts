@@ -7,5 +7,13 @@ from radar_dnn_mcts.search.puct import (
     SearchResult,
     SearchState,
 )
+from radar_dnn_mcts.search.puct_dynamics import DynamicsPUCT
 
-__all__ = ["PUCT", "PUCTConfig", "SearchDecision", "SearchResult", "SearchState"]
+__all__ = [
+    "PUCT",
+    "PUCTConfig",
+    "DynamicsPUCT",
+    "SearchDecision",
+    "SearchResult",
+    "SearchState",
+]

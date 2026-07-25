@@ -147,7 +147,7 @@ def main() -> None:
                     data["rewards"][windows, safe_steps].float()
                     / args.return_scale
                 )
-                reward_loss = F.smooth_l1_loss(
+                reward_loss = F.mse_loss(
                     predicted_reward[active],
                     reward_target[active],
                 )

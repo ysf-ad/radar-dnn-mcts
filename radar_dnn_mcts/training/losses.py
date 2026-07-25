@@ -26,7 +26,7 @@ def policy_q_loss(
     """Train policy by cross-entropy and state value by mean-squared return error."""
     target = policy_target / policy_target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     if output.type_logits is None or output.target_logits is None:
-        policy_loss = -(target * F.log_softmax(output.policy_logits, dim=-1)).sum(dim=-1).mean()
+        policy_loss = F.cross_entropy(output.policy_logits, target)
         type_loss = torch.zeros((), device=policy_loss.device)
         target_loss = policy_loss
     else:
@@ -34,27 +34,24 @@ def policy_q_loss(
         search_mass = target[:, 0]
         track_mass = target[:, 1:].sum(dim=-1)
         type_target = torch.stack([search_mass, track_mass], dim=-1)
-        type_log_prob = F.log_softmax(output.type_logits, dim=-1)
-        type_loss = -(type_target * type_log_prob).sum(dim=-1).mean()
+        type_loss = F.cross_entropy(output.type_logits, type_target)
 
         conditional = target[:, 1:] / track_mass[:, None].clamp_min(1e-8)
-        target_log_prob = F.log_softmax(
+        target_ce = F.cross_entropy(
             output.target_logits[:, 1:].masked_fill(
                 ~output.valid_rows[:, 1:], -1e9
             ),
-            dim=-1,
+            conditional,
+            reduction="none",
         )
-        target_ce = -(conditional * target_log_prob).sum(dim=-1)
-        track_count = (track_mass > 0).float()
-        target_loss = (target_ce * track_count).sum() / track_count.sum().clamp_min(1.0)
+        target_loss = (target_ce * track_mass).mean()
         policy_loss = type_loss + target_loss
 
     if q_target.ndim == 1:
         value_prediction = output.q_values[:, 0]
     else:
         value_prediction = output.q_values
-    q_error = F.mse_loss(value_prediction, q_target, reduction="none")
-    q_loss = q_error.mean()
+    q_loss = F.mse_loss(value_prediction, q_target)
     total = weights.policy * policy_loss + weights.q * q_loss
     return {
         "loss": total,

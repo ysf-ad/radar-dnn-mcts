@@ -3,6 +3,7 @@ from copy import copy
 import numpy as np
 
 from radar_dnn_mcts.search import PUCT, PUCTConfig
+from radar_dnn_mcts.search.puct import Node
 
 
 class ToyState:
@@ -81,3 +82,10 @@ def test_puct_returns_complete_trajectory():
     """Search returns an executable full-window path."""
     result = PUCT(evaluator, PUCTConfig(rollouts=16)).run(ToyState())
     assert len(result.trajectory) == 3
+
+
+def test_fresh_states_follow_the_policy_prior():
+    node = Node(visits=0)
+    node.children = {0: Node(prior=0.1), 1: Node(prior=0.9)}
+    action, _ = PUCT(evaluator)._select(node)
+    assert action == 1

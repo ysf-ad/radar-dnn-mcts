@@ -13,8 +13,9 @@ from radar_dnn_mcts.env.factory import create_engine
 from radar_dnn_mcts.env.features import FeatureBuilder
 from radar_dnn_mcts.models.checkpoint import load_checkpoint
 from radar_dnn_mcts.models.decoders import AutoregressiveDecoder
+from radar_dnn_mcts.models.dynamics import LatentDynamics
 from radar_dnn_mcts.models.scheduler import RadarSchedulerModel
-from radar_dnn_mcts.search import PUCT, PUCTConfig
+from radar_dnn_mcts.search import DynamicsPUCT, PUCT, PUCTConfig
 from radar_dnn_mcts.training.radar_search import (
     RadarAREvaluator,
     RadarModelEvaluator,
@@ -27,7 +28,7 @@ class WindowTrajectoryCollector:
 
     def __init__(
         self,
-        search: PUCT | None,
+        search: PUCT | DynamicsPUCT | None,
         features: FeatureBuilder,
         reward: RewardConfig,
         teacher=None,
@@ -198,7 +199,9 @@ def main() -> None:
     parser.add_argument("--dirichlet-alpha", type=float, default=0.03)
     parser.add_argument("--dirichlet-fraction", type=float, default=0.25)
     parser.add_argument("--teacher", choices=["puct", "edf", "est"], default="puct")
-    parser.add_argument("--search-model", choices=["core", "ar"], default="core")
+    parser.add_argument(
+        "--search-model", choices=["core", "ar", "muzero"], default="core"
+    )
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--initial-targets", type=int, default=40)
     parser.add_argument("--arrival-rate", type=float, default=3.0)
@@ -215,10 +218,13 @@ def main() -> None:
     reward = RewardConfig()
     core = RadarSchedulerModel().to(device)
     ar = AutoregressiveDecoder(core).to(device)
+    dynamics = LatentDynamics(max_rows=args.max_targets + 1).to(device)
     if args.checkpoint:
         modules = {"core": core}
         if args.search_model == "ar":
             modules["ar"] = ar
+        elif args.search_model == "muzero":
+            modules["dynamics"] = dynamics
         load_checkpoint(args.checkpoint, modules, device)
     elif args.teacher == "puct":
         parser.error("--teacher puct requires --checkpoint")
@@ -230,24 +236,32 @@ def main() -> None:
     elif args.teacher == "est":
         teacher = ESTPlanner(args.max_targets)
     else:
-        evaluator = (
-            RadarAREvaluator(ar)
-            if args.search_model == "ar"
-            else RadarModelEvaluator(core)
-        )
-        search = PUCT(
-            evaluator,
-            PUCTConfig(
-                rollouts=args.rollouts,
-                c_puct=args.c_puct,
-                discount=args.discount,
-                reward_scale=args.return_scale,
-                temperature=args.temperature,
-                dirichlet_alpha=args.dirichlet_alpha,
-                dirichlet_fraction=args.dirichlet_fraction,
-                random_seed=args.seed,
+        config = PUCTConfig(
+            rollouts=args.rollouts,
+            c_puct=args.c_puct,
+            discount=args.discount,
+            reward_scale=(
+                1.0 if args.search_model == "muzero" else args.return_scale
             ),
+            temperature=args.temperature,
+            dirichlet_alpha=args.dirichlet_alpha,
+            dirichlet_fraction=args.dirichlet_fraction,
+            random_seed=args.seed,
         )
+        if args.search_model == "muzero":
+            search = DynamicsPUCT(
+                core, dynamics, config, features=features
+            )
+        else:
+            evaluator = (
+                RadarAREvaluator(ar)
+                if args.search_model == "ar"
+                else RadarModelEvaluator(core)
+            )
+            search = PUCT(
+                evaluator,
+                config,
+            )
     collector = WindowTrajectoryCollector(search, features, reward, teacher)
     engine = create_engine(
         collector,

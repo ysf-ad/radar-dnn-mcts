@@ -7,6 +7,7 @@ from radar_dnn_mcts.schedulers import (
     BatchScheduler,
     FullReencodeScheduler,
     FullWindowPUCTScheduler,
+    MuZeroPUCTScheduler,
     MuZeroScheduler,
 )
 from radar_dnn_mcts.search import PUCTConfig
@@ -25,6 +26,13 @@ def test_all_scheduler_modes_return_legal_nonempty_plans(radar_obs):
             features=features,
         ),
         MuZeroScheduler(core, LatentDynamics(max_rows=6, d_model=32), features=features, max_steps=8),
+        MuZeroPUCTScheduler(
+            core,
+            LatentDynamics(max_rows=6, d_model=32),
+            features=features,
+            simulations=2,
+            max_steps=8,
+        ),
         AutoregressiveScheduler(AutoregressiveDecoder(core, max_rows=6), features=features, max_steps=8),
         BatchScheduler(BatchDecoder(max_steps=8, d_model=32, nhead=4, encoder_layers=1, decoder_layers=1), features=features),
     ]

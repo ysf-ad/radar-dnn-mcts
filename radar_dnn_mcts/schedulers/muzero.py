@@ -6,6 +6,7 @@ from radar_dnn_mcts.env.features import FeatureBuilder
 from radar_dnn_mcts.models.dynamics import LatentDynamics
 from radar_dnn_mcts.models.scheduler import RadarSchedulerModel
 from radar_dnn_mcts.schedulers.base import choose_row, device_of, selected_mask, tensor, update_prefix
+from radar_dnn_mcts.search import DynamicsPUCT, PUCTConfig
 
 
 class MuZeroScheduler:
@@ -57,3 +58,55 @@ class MuZeroScheduler:
             elapsed, searches, tracks = update_prefix(row, obs, elapsed, searches, tracks, selected)
             last = row
         return plan
+
+
+class MuZeroPUCTScheduler:
+    """Search a complete window with PUCT over learned latent transitions."""
+
+    def __init__(
+        self,
+        model: RadarSchedulerModel,
+        dynamics: LatentDynamics,
+        features: FeatureBuilder | None = None,
+        simulations: int = 8,
+        c_puct: float = 1.5,
+        discount: float = 0.99,
+        temperature: float = 0.0,
+        max_steps: int = 32,
+        random_seed: int = 0,
+    ):
+        features = features or FeatureBuilder()
+        self.search = DynamicsPUCT(
+            model,
+            dynamics,
+            PUCTConfig(
+                rollouts=simulations,
+                c_puct=c_puct,
+                discount=discount,
+                window_ms=features.window_ms,
+                # g is trained against already-scaled transition rewards.
+                reward_scale=1.0,
+                temperature=temperature,
+                dirichlet_fraction=0.0,
+                random_seed=random_seed,
+            ),
+            features,
+            max_steps,
+        )
+
+    @torch.inference_mode()
+    def plan(self, obs: dict, budget_ms: float = 200.0) -> list[int]:
+        result = self.search.run_observation(obs, budget_ms)
+        return [decision.action for decision in result.trajectory]
+
+    @property
+    def last_g_calls(self) -> int:
+        return self.search.last_g_calls
+
+    @property
+    def last_observations(self) -> int:
+        return self.search.last_observations
+
+    @property
+    def g_call_history(self) -> list[int]:
+        return self.search.g_call_history

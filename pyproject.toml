@@ -20,7 +20,7 @@ dependencies = [
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [tool.setuptools.packages.find]
-include = ["radar_dnn_mcts*", "pufferlib*"]
+include = ["radar_dnn_mcts*", "pufferlib*", "reference_implementations*"]
 
 [tool.setuptools.package-data]
 "pufferlib.ocean" = ["*.h"]

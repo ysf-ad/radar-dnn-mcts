@@ -93,7 +93,10 @@ class PUCT:
         return child.reward + child.discount * child.value
 
     def _select(self, node: Node) -> tuple[int, Node]:
-        scale = np.sqrt(node.visits + 1.0)
+        # A fresh state has no backed-up tree statistics, so start from P.
+        if node.visits == 0:
+            return max(node.children.items(), key=lambda item: item[1].prior)
+        scale = np.sqrt(node.visits)
         return max(
             node.children.items(),
             key=lambda item: (

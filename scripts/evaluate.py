@@ -24,6 +24,7 @@ from radar_dnn_mcts.schedulers import (
     BatchScheduler,
     FullReencodeScheduler,
     FullWindowPUCTScheduler,
+    MuZeroPUCTScheduler,
     MuZeroScheduler,
 )
 
@@ -66,7 +67,8 @@ def main() -> None:
         "est": ESTPlanner(config.max_targets),
         "reencode": FullReencodeScheduler(core),
         "puct": FullWindowPUCTScheduler(core),
-        "muzero": MuZeroScheduler(core, dynamics),
+        "muzero": MuZeroPUCTScheduler(core, dynamics),
+        "muzero-greedy": MuZeroScheduler(core, dynamics),
         "ar": AutoregressiveScheduler(ar),
         "batch": BatchScheduler(batch),
     }
