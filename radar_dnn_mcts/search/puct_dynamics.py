@@ -1,3 +1,5 @@
+"""PUCT state and traversal specialized for MuZero latent dynamics."""
+
 from __future__ import annotations
 
 from copy import copy
@@ -34,12 +36,14 @@ class DynamicsState:
     prefix: list[int] = field(default_factory=list)
 
     def clone(self) -> "DynamicsState":
+        """Copy branch bookkeeping while sharing immutable latent tensors."""
         state = copy(self)
         state.selected = set(self.selected)
         state.prefix = list(self.prefix)
         return state
 
     def legal_actions(self) -> list[int]:
+        """Mask expired, inactive, and already selected targets."""
         if self.elapsed >= self.budget_ms or len(self.prefix) >= self.max_steps:
             return []
         active = np.asarray(self.obs["active_mask"], dtype=bool)
@@ -59,9 +63,12 @@ class DynamicsState:
         return [0, *tracks]
 
     def step(self, action: int) -> tuple[float, bool]:
+        """Apply learned dynamics g to one action edge."""
         key = (*self.prefix, int(action))
         cached = self.cache.get(key)
         if cached is None:
+            # Cloned simulations share this prefix cache, so a previously
+            # evaluated tree edge does not call g a second time.
             device = self.latent.global_state.device
             latent, reward = self.dynamics(
                 self.latent,
@@ -108,6 +115,7 @@ class DynamicsPUCT(PUCT):
         super().__init__(self._evaluate, config)
 
     def reset_window_counters(self) -> None:
+        """Reset inference accounting before one radar observation is planned."""
         self.window_g_calls = 0
         self.window_h_calls = 0
         self.window_f_calls = 0
@@ -116,6 +124,7 @@ class DynamicsPUCT(PUCT):
     def _evaluate(
         self, state: DynamicsState, legal_actions: list[int]
     ) -> tuple[np.ndarray, float]:
+        """Apply prediction f to one latent tree node."""
         self.window_f_calls += 1
         device = state.latent.global_state.device
         context_values = (
@@ -128,6 +137,8 @@ class DynamicsPUCT(PUCT):
         context = torch.from_numpy(context_values).unsqueeze(0).to(device)
         unavailable = torch.zeros_like(state.latent.valid_rows)
         if legal_actions and state.selected:
+            # Dynamics changes the latent state; this explicit mask separately
+            # prevents a target from being scheduled twice in one window.
             rows = torch.as_tensor(sorted(state.selected), device=device)
             unavailable[0, rows] = True
         output = self.model.predict(state.latent, context, unavailable)
@@ -145,6 +156,7 @@ class DynamicsPUCT(PUCT):
         budget_ms: float = 200.0,
     ) -> DynamicsState:
         """Encode one radar observation into a reusable latent root."""
+        # Representation h is called exactly once for this window search.
         self.window_h_calls += 1
         device = next(self.model.parameters()).device
         tokens = torch.from_numpy(self.features.tokens(obs)).unsqueeze(0).to(device)
@@ -171,6 +183,8 @@ class DynamicsPUCT(PUCT):
         training: bool = False,
     ) -> SearchResult:
         """Search from an existing latent prefix without re-running h."""
+        # The shared PUCT algorithm only needs clone/legal/step; DynamicsState
+        # supplies those operations using g instead of a shadow observation.
         before = root.counter[0]
         result = super().run(root, training=training)
         self.last_g_calls = root.counter[0] - before

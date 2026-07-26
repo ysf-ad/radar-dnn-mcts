@@ -1,3 +1,5 @@
+"""Shared policy, value, and sequence loss definitions."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -26,6 +28,7 @@ def policy_q_loss(
     """Train policy by cross-entropy and state value by mean-squared return error."""
     target = policy_target / policy_target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     if output.type_logits is None or output.target_logits is None:
+        # PyTorch cross_entropy accepts a probability distribution target.
         policy_loss = F.cross_entropy(output.policy_logits, target)
         type_loss = torch.zeros((), device=policy_loss.device)
         target_loss = policy_loss

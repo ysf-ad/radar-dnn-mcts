@@ -1,3 +1,4 @@
+# Fixed held-out grid used for candidate checkpoint promotion.
 initial_targets: [20, 40, 60]
 arrival_rates: [2.0, 3.0, 4.0]
 seeds: [1101]

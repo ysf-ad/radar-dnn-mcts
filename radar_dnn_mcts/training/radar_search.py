@@ -1,3 +1,5 @@
+"""Radar shadow state and neural evaluators used by PUCT collection."""
+
 from __future__ import annotations
 
 from copy import deepcopy

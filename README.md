@@ -30,59 +30,39 @@ python -m pytest
 python scripts\smoke_import.py
 ```
 
-## Evaluate
-
-Run the nine-cell, 100-window benchmark:
-
-```powershell
-python scripts\evaluate.py --config configs\paper_9cell.yaml --checkpoint path\to\model.pt
-```
-
-Run the reproducible nine-cell comparison:
-
-```powershell
-python -m scripts.build_binding
-python -m scripts.evaluate --config configs\repro_9cell.yaml --checkpoint path\to\model.pt --methods reencode,muzero,ar,batch,edf,est --device cuda
-```
-
-Run a short baseline smoke test:
-
-```powershell
-python scripts\evaluate.py --config configs\smoke.yaml --methods edf,est
-```
-
-The evaluator writes per-window traces, per-cell summaries, an aggregate summary, and a six-panel plot suite under the requested output directory.
-
 ## Training
 
-Collect PUCT targets and train the shared policy/Q model:
+Each command runs collection, replay training, validation, and checkpoint
+promotion.
+
+**Full re-encode**
 
 ```powershell
-python -m scripts.collect_puct_targets --teacher edf --out data\edf.npz
-python -m scripts.train --data data\edf.npz --out checkpoints\edf.pt
-
-python -m scripts.collect_puct_targets --checkpoint checkpoints\edf.pt --out data\puct.npz
-python -m scripts.train --checkpoint checkpoints\edf.pt --data data\puct.npz --out checkpoints\puct.pt
+python scripts\self_play.py --checkpoint checkpoints\initial.pt --out-dir runs\reencode --train-config configs\training_9cell.yaml --validation-config configs\promotion_full_horizon.yaml --search-model core --learner core --iterations 30 --rollouts 64 --epochs 5 --batch-size 256 --return-horizon-windows 5 --device cuda
 ```
 
-The collector stores grouped 200 ms trajectories with PUCT visit targets,
-executed rewards, and episode returns. Train a sequence decoder from the same data:
+**MuZero**
 
 ```powershell
-python -m scripts.train_sequence --data data\puct.npz --checkpoint checkpoints\puct.pt --out checkpoints\model_sequence.pt
+python scripts\self_play.py --checkpoint checkpoints\initial.pt --out-dir runs\muzero --train-config configs\training_9cell.yaml --validation-config configs\promotion_full_horizon.yaml --search-model muzero --learner muzero --iterations 30 --rollouts 64 --epochs 5 --batch-size 256 --unroll-steps 10 --return-horizon-windows 5 --device cuda
 ```
 
-Automate repeated collection and training:
+**Autoregressive**
 
 ```powershell
-python scripts\self_play.py --checkpoint checkpoints\model_sequence.pt --out-dir runs\ar --search-model ar --learner ar
-python scripts\self_play.py --checkpoint checkpoints\model_sequence.pt --out-dir runs\muzero --search-model core --learner muzero
+python scripts\self_play.py --checkpoint checkpoints\initial.pt --out-dir runs\ar --train-config configs\training_9cell.yaml --validation-config configs\promotion_full_horizon.yaml --search-model ar --learner ar --iterations 30 --rollouts 64 --epochs 5 --batch-size 256 --return-horizon-windows 5 --device cuda
 ```
 
-`--learner` accepts `core`, `ar`, `muzero`, or `batch`. Recurrent MuZero training
-follows the MuZero paper and the MIT-licensed
-[MuZero General](https://github.com/werner-duvaud/muzero-general) trainer;
-radar-specific state and action modules retain the local interfaces.
+**Batch distillation**
+
+```powershell
+python scripts\self_play.py --checkpoint checkpoints\initial.pt --out-dir runs\batch --train-config configs\training_9cell.yaml --validation-config configs\promotion_full_horizon.yaml --search-model core --learner batch --iterations 30 --rollouts 64 --epochs 5 --batch-size 256 --return-horizon-windows 5 --device cuda
+```
+
+Each run keeps a bounded replay dataset, writes a training history and manifest,
+and promotes a candidate only when it improves over both the incumbent and EDF
+on the fixed validation grid. `--return-horizon-windows 0` uses the rest of the
+episode; the default uses five windows.
 
 The asynchronous boundary stage retains its dedicated transition dataset:
 
@@ -90,20 +70,48 @@ The asynchronous boundary stage retains its dedicated transition dataset:
 python scripts\train_boundary.py --data data\boundaries.npz --checkpoint checkpoints\model_full.pt --out checkpoints\model_async.pt
 ```
 
-## Reproducibility Checks
+Its latency-aware planning time is
+`window_ms - max_latency_ms - buffer_ms`, clipped to the window.
 
-Compare simulator state trajectories with a reference experiment checkout:
+## Evaluate
+
+Evaluate each trained method on the final held-out grid.
+
+**Full re-encode**
 
 ```powershell
-python scripts\cross_test_environment.py --other-root path\to\experiment\model_code
+python scripts\evaluate.py --checkpoint runs\reencode\incumbent.pt --config configs\final_presentation_9cell.yaml --methods reencode,edf,est --reencode-rollouts 1 --device cuda --out results\reencode
 ```
 
-Validate an archived result table from its per-window trace:
+**MuZero**
 
 ```powershell
-python scripts\validate_reference.py --windows path\to\canonical_windows.csv --expected path\to\canonical_summary.csv
+python scripts\evaluate.py --checkpoint runs\muzero\incumbent.pt --config configs\final_presentation_9cell.yaml --methods muzero,edf,est --muzero-rollouts 1 --device cuda --out results\muzero
 ```
 
-See `docs/ENVIRONMENT.md` for the simulator and reward contract, and
-`docs/VALIDATION.md` for the distinction between fresh benchmarks and archived
-result validation.
+**Autoregressive**
+
+```powershell
+python scripts\evaluate.py --checkpoint runs\ar\incumbent.pt --config configs\final_presentation_9cell.yaml --methods ar,edf,est --ar-rollouts 1 --device cuda --out results\ar
+```
+
+**Batch**
+
+```powershell
+python scripts\evaluate.py --checkpoint runs\batch\incumbent.pt --config configs\final_presentation_9cell.yaml --methods batch,edf,est --device cuda --out results\batch
+```
+
+For a quick end-to-end check:
+
+```powershell
+python scripts\evaluate.py --config configs\smoke.yaml --checkpoint checkpoints\initial.pt --methods reencode,muzero,ar,batch,edf,est --reencode-rollouts 1 --muzero-rollouts 1 --ar-rollouts 1 --device cpu
+```
+
+Evaluation writes window traces, cell summaries, aggregate summaries, latency,
+observation counts, and neural-call counts.
+
+## Documentation
+
+See `docs/ENVIRONMENT.md` for the simulator and reward contract,
+`docs/VALIDATION.md` for benchmark validation, and `docs/CODEPATH.md` for the
+state, search, collection, training, evaluation, and boundary-execution paths.

@@ -1,3 +1,5 @@
+"""Predict the next boundary state while the current radar window executes."""
+
 from __future__ import annotations
 
 import torch

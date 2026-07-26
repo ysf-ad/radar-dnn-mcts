@@ -1,3 +1,5 @@
+"""Generic PUCT over an action-prefix search state."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -7,6 +9,7 @@ import numpy as np
 
 
 class SearchState(Protocol):
+    """State operations required by the generic tree search."""
     elapsed: float
 
     def clone(self) -> "SearchState": ...
@@ -15,6 +18,7 @@ class SearchState(Protocol):
 
 
 class PolicyValueEvaluator(Protocol):
+    """Callable that scores legal actions and the current state."""
     def __call__(self, state: SearchState, legal_actions: list[int]) -> tuple[np.ndarray, float]: ...
 
 
@@ -54,6 +58,7 @@ class Node:
 
 @dataclass(frozen=True)
 class SearchDecision:
+    """One selected action and its search statistics."""
     action: int
     policy: dict[int, float]
     value: float
@@ -63,6 +68,7 @@ class SearchDecision:
 
 @dataclass(frozen=True)
 class SearchResult:
+    """Complete selected prefix returned by one search."""
     trajectory: tuple[SearchDecision, ...]
     root_value: float
 
@@ -76,12 +82,16 @@ class PUCT:
         self.rng = np.random.default_rng(config.random_seed)
 
     def _expand(self, node: Node, state: SearchState, root_noise: bool = False) -> float:
+        """Create one child edge per legal action and return the leaf value."""
         legal = state.legal_actions()
         priors, value = self.evaluator(state, legal)
         if not legal:
             return float(value)
+
         priors = np.maximum(np.asarray(priors, dtype=np.float64), 0.0)
         priors /= max(priors.sum(), 1e-12)
+
+        # Noise is applied only at the root during training-time collection.
         if root_noise and self.config.dirichlet_fraction > 0.0 and len(legal) > 1:
             noise = self.rng.dirichlet(
                 np.full(len(legal), max(self.config.dirichlet_alpha, 1e-6))
@@ -93,12 +103,13 @@ class PUCT:
         return float(value)
 
     def _edge_value(self, child: Node) -> float:
+        """Combine an edge's immediate reward with its mean downstream value."""
         if not child.visits:
             return 0.0
         return child.reward + child.discount * child.value
 
     def _select(self, node: Node) -> tuple[int, Node]:
-        # A fresh state has no backed-up tree statistics, so start from P.
+        """Choose one outgoing tree edge."""
         if node.visits == 0:
             if self.config.factorized_policy_first and 0 in node.children:
                 search = node.children[0]
@@ -113,6 +124,7 @@ class PUCT:
                     return max(tracks, key=lambda item: item[1].prior)
                 return 0, search
             return max(node.children.items(), key=lambda item: item[1].prior)
+
         scale = np.sqrt(node.visits)
 
         def score(child: Node) -> float:
@@ -130,14 +142,18 @@ class PUCT:
         )
 
     def _step(self, state: SearchState, action: int) -> tuple[float, float, bool]:
+        """Advance one edge and express its reward in the training scale."""
         before_elapsed = state.elapsed
         reward, terminal = state.step(action)
+        # Longer radar actions consume more of the window and therefore apply
+        # more discount before the downstream value.
         discount = self.config.discount ** (
             (state.elapsed - before_elapsed) / self.config.window_ms
         )
         return float(reward) / max(self.config.reward_scale, 1e-6), discount, terminal
 
     def _distribution(self, node: Node) -> tuple[list[int], np.ndarray]:
+        """Convert child visits into the policy target at one prefix."""
         actions = list(node.children)
         visits = np.asarray([node.children[action].visits for action in actions], dtype=np.float64)
         if visits.sum() <= 0.0:
@@ -225,6 +241,8 @@ class PUCT:
         root = Node()
         self._expand(root, root_state, root_noise=training)
         for _ in range(self.config.rollouts):
+            # Every simulation owns a branch-local state but shares tree
+            # statistics with the other simulations.
             state = root_state.clone()
             path = [root]
             node = root
@@ -232,6 +250,8 @@ class PUCT:
             value = 0.0
             while not terminal:
                 if not node.children:
+                    # Window search continues after expansion instead of
+                    # stopping at the first newly expanded leaf.
                     value = self._expand(node, state)
                     if not node.children:
                         break
@@ -242,8 +262,11 @@ class PUCT:
                 node = child
                 path.append(node)
             if terminal:
+                # Evaluate the predicted boundary state after the simulated
+                # action prefix reaches the end of the scheduling window.
                 _, value = self.evaluator(state, [])
-            # Back up edge rewards followed by the boundary value at the leaf.
+            # Back up from the boundary: each node stores the mean downstream
+            # value, while its incoming reward is added for its parent.
             for current in reversed(path):
                 current.visits += 1
                 current.value_sum += value

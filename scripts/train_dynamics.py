@@ -1,3 +1,5 @@
+"""Train MuZero h, g, and f on executed radar trajectory suffixes."""
+
 from __future__ import annotations
 
 import argparse
@@ -65,6 +67,9 @@ def main() -> None:
         name: torch.as_tensor(arrays[name], device=device)
         for name in required
     }
+
+    # The checkpoint keeps every deployment module together. This trainer
+    # updates only the shared core (h and f) and latent dynamics g.
     core = RadarSchedulerModel().to(device)
     dynamics = LatentDynamics().to(device)
     ar = AutoregressiveDecoder(core).to(device)
@@ -82,6 +87,9 @@ def main() -> None:
         weight_decay=1e-4,
     )
     parameters = list(core.parameters()) + list(dynamics.parameters())
+
+    # Every non-padding decision can serve as the root of a recurrent suffix.
+    # A window with J actions therefore contributes J possible training roots.
     positions = torch.nonzero(data["action_mask"].bool())
     count = positions.shape[0]
     sequence_steps = data["actions"].shape[1]
@@ -89,6 +97,7 @@ def main() -> None:
     rows = data["policy"].shape[-1]
     selected_actions = F.one_hot(data["actions"].long(), num_classes=rows).bool()
     selected_actions[:, :, 0] = False
+    # At step k, mask targets chosen before k but not the current target.
     selected_before = (
         selected_actions.long().cumsum(dim=1) - selected_actions.long()
     ).bool()
@@ -100,6 +109,7 @@ def main() -> None:
         core.train()
         dynamics.train()
         for start in range(0, count, args.batch_size):
+            # Sample suffix roots, then call representation h once per root.
             roots = positions[order[start : start + args.batch_size]]
             windows = roots[:, 0]
             root_steps = roots[:, 1]
@@ -112,7 +122,8 @@ def main() -> None:
             loss = torch.zeros((), device=device)
             terms = 0
             for offset in range(max_steps):
-                # Shorter trajectory suffixes become inactive during unrolling.
+                # Suffixes have different remaining lengths. `active` removes
+                # padding while keeping the batch tensors rectangular.
                 steps = root_steps + offset
                 in_bounds = steps < sequence_steps
                 safe_steps = steps.clamp_max(sequence_steps - 1)
@@ -128,6 +139,9 @@ def main() -> None:
                     windows, safe_steps
                 ].float()
                 recurrent_context[:, :4] = step_context[:, :4]
+
+                # Prediction f supplies policy and value before the recorded
+                # action is applied. Targets are PUCT visits and return G.
                 output = core.predict(state, recurrent_context, selected)
                 prediction_loss = policy_q_loss(
                     select_output(output, active),
@@ -142,6 +156,9 @@ def main() -> None:
 
                 chosen = data["actions"][windows, safe_steps].long()
                 chosen = torch.where(in_bounds, chosen, torch.zeros_like(chosen))
+
+                # Dynamics g advances the latent state and predicts the actual
+                # simulator reward observed for this executed transition.
                 next_state, predicted_reward = dynamics(state, chosen)
                 reward_target = (
                     data["rewards"][windows, safe_steps].float()
@@ -162,6 +179,8 @@ def main() -> None:
                 next_state.target_states.register_hook(lambda grad: grad * 0.5)
                 state = next_state
 
+            # Average over recurrent positions so suffix length does not change
+            # the effective learning rate of a minibatch.
             loss = loss / max(terms, 1)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -186,6 +205,8 @@ def main() -> None:
             "muzero_finetuned_core": True,
         }
     )
+    # AR and batch weights are preserved so the output remains one complete,
+    # interchangeable project checkpoint.
     save_checkpoint(
         args.out,
         {"core": core, "dynamics": dynamics, "ar": ar, "batch": batch},

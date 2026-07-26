@@ -1,3 +1,5 @@
+"""Run schedulers against the radar simulator with shared timing and metrics."""
+
 from __future__ import annotations
 
 from dataclasses import asdict

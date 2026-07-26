@@ -1,3 +1,5 @@
+"""Reward terms shared by the live simulator and shadow search state."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -6,6 +8,7 @@ from radar_dnn_mcts.env.config import RewardConfig
 
 
 def normalized_tardiness(obs: dict) -> float:
+    """Sum normalized delay beyond each active track's desired time."""
     active = np.asarray(obs["active_mask"], dtype=bool)
     desired = np.asarray(obs["t_desired"], dtype=np.float32)
     deadline = np.asarray(obs["t_deadline"], dtype=np.float32)
@@ -15,6 +18,7 @@ def normalized_tardiness(obs: dict) -> float:
 
 
 def service_pressure(obs: dict) -> float:
+    """Return total normalized urgency for active tracking tasks."""
     active = np.asarray(obs["active_mask"], dtype=bool)
     desired = np.asarray(obs["t_desired"], dtype=np.float32)
     deadline = np.asarray(obs["t_deadline"], dtype=np.float32)
@@ -28,6 +32,7 @@ def service_pressure(obs: dict) -> float:
 
 
 def search_frame_pressure(obs: dict, config: RewardConfig) -> float:
+    """Measure accumulated staleness across search sectors."""
     grid = np.asarray(obs.get("grid", []), dtype=np.float32)
     if not grid.size:
         return 0.0
@@ -44,6 +49,7 @@ def search_frame_pressure(obs: dict, config: RewardConfig) -> float:
 
 
 def dropped_count(obs: dict) -> int:
+    """Count targets that have been dropped by the scheduler."""
     active = np.asarray(obs["active_mask"], dtype=bool)
     deadline = np.asarray(obs["t_deadline"], dtype=np.float32)
     return int((active & (deadline < 0.0)).sum())
@@ -59,6 +65,7 @@ def _target_pressure(desired: float, deadline: float) -> float:
 def serviced_pressure_improvement(
     before: dict, after: dict, row: int, duration_ms: float
 ) -> float:
+    """Return the pressure removed by servicing one target."""
     if int(row) <= 0:
         return 0.0
     idx = int(row) - 1

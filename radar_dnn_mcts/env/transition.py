@@ -1,3 +1,5 @@
+"""Deterministic observation updates used during within-window search."""
+
 from __future__ import annotations
 
 import numpy as np

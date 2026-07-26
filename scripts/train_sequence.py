@@ -1,3 +1,5 @@
+"""Train AR and batch decoders from grouped PUCT window trajectories."""
+
 from __future__ import annotations
 
 import argparse
@@ -29,8 +31,10 @@ def ar_predictions(
     policies: torch.Tensor,
     returns: torch.Tensor,
 ) -> tuple[PolicyQOutput, torch.Tensor, torch.Tensor]:
-    """Align prefix-conditioned predictions with active PUCT targets."""
+    """Replay an MCTS trajectory and align each prefix with its PUCT targets."""
     state, _ = model.initial(tokens, root_context)
+    # Replaying MCTS-selected earlier actions reconstructs the self-play prefix;
+    # the current policy target remains the soft PUCT visit distribution.
     prefix_deltas = model.decode_prefix_deltas(state, actions[:, :-1])
     rows = policies.shape[-1]
     selected_actions = F.one_hot(actions, num_classes=rows).bool()
@@ -38,6 +42,8 @@ def ar_predictions(
     selected_before = selected_actions.long().cumsum(dim=1) - selected_actions.long()
 
     batch_index, step_index = torch.nonzero(action_mask, as_tuple=True)
+    # Flatten real positions so padding contributes neither policy nor value
+    # loss, then recover each position's prefix-conditioned representation.
     delta = prefix_deltas[batch_index, step_index]
     context_delta = model.context_delta(delta)
     context_delta = torch.where(
@@ -120,6 +126,7 @@ def main() -> None:
             policies = data["policy"][index].float()
             returns = data["returns"][index].float()
             active_steps = int(mask.sum(dim=1).max().item())
+            # Trim unused tail padding before running either decoder.
             tokens = data["tokens"][index, 0].float()
             root_context = step_context[:, 0]
             step_context = step_context[:, :active_steps]
@@ -130,6 +137,8 @@ def main() -> None:
 
             loss = torch.zeros((), device=device)
             if args.decoder in ("ar", "both"):
+                # AR predicts each position conditioned on recorded earlier
+                # actions and learns from its PUCT policy/value targets.
                 output, policy_target, value_target = ar_predictions(
                     ar,
                     tokens,
@@ -147,6 +156,8 @@ def main() -> None:
                     weights=LossWeights(q=args.value_loss_weight),
                 )["loss"]
             if args.decoder in ("batch", "both"):
+                # Batch predicts all positions in parallel and is supervised
+                # against the same grouped trajectory.
                 output = batch(tokens, root_context)
                 output.policy_logits = output.policy_logits[:, :active_steps]
                 output.q_values = output.q_values[:, :active_steps]

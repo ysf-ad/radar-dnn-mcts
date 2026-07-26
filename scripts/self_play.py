@@ -1,3 +1,5 @@
+"""Alternate simulator collection, replay training, and held-out promotion."""
+
 from __future__ import annotations
 
 import argparse
@@ -40,10 +42,12 @@ SCALAR_METADATA_KEYS = (
 
 
 def csv_values(value: str, cast):
+    """Parse a comma-separated command-line value."""
     return tuple(cast(item.strip()) for item in value.split(",") if item.strip())
 
 
 def run(command: list[str], root: Path) -> None:
+    """Run one repository command with the local package importable."""
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(root)
     subprocess.run(command, cwd=root, env=environment, check=True)
@@ -112,6 +116,7 @@ def evaluate_checkpoint(
     root: Path,
     device: str,
 ) -> tuple[float, float]:
+    """Return learned-method and EDF rewards on one fixed validation grid."""
     run(
         [
             sys.executable,
@@ -137,6 +142,7 @@ def evaluate_checkpoint(
 
 
 def checkpoint_hash(path: Path) -> str:
+    """Compute the checkpoint identity recorded in the run manifest."""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -192,6 +198,8 @@ def main() -> None:
 
     root = Path(__file__).resolve().parents[1]
     checkpoint = args.checkpoint.resolve()
+    # A YAML grid replaces only workload axes; CLI flags still control the
+    # optimization and search budgets.
     if args.train_config:
         train_config = yaml.safe_load(args.train_config.read_text())
         initial_targets = tuple(int(x) for x in train_config["initial_targets"])
@@ -217,6 +225,7 @@ def main() -> None:
     incumbent_reward = None
     edf_reward = None
     if args.validation_config:
+        # Establish the acceptance thresholds before the first update.
         incumbent_reward, edf_reward = evaluate_checkpoint(
             incumbent,
             args.validation_config.resolve(),
@@ -236,6 +245,7 @@ def main() -> None:
         )
 
     for iteration in range(1, args.iterations + 1):
+        # Collect fresh on-policy windows for every configured load cell.
         iteration_dir = output / f"iteration_{iteration:03d}"
         trajectory_paths = []
         for initial, arrival, seed in product(
@@ -284,6 +294,9 @@ def main() -> None:
 
         current = iteration_dir / "trajectories.npz"
         merge_trajectories(trajectory_paths, current)
+
+        # Append fresh windows, retain the newest capacity, and atomically
+        # replace the replay file used by the selected trainer.
         replay = output / "replay_buffer.npz"
         replay_sources = [current]
         if replay.exists():
@@ -293,6 +306,9 @@ def main() -> None:
         trim_replay(temporary_replay, args.replay_capacity_windows)
         temporary_replay.replace(replay)
         next_checkpoint = iteration_dir / "candidate.pt"
+
+        # All learners consume the same replay contract; only their model
+        # unrolling and loss implementation differ.
         if learner in ("ar", "batch"):
             trainer = root / "scripts" / "train_sequence.py"
             command = [
@@ -340,6 +356,8 @@ def main() -> None:
         accepted = True
         candidate_reward = None
         if args.validation_config:
+            # Validation is held fixed across iterations. A candidate must
+            # improve both the current model and the EDF reference.
             candidate_reward, candidate_edf = evaluate_checkpoint(
                 next_checkpoint,
                 args.validation_config.resolve(),
@@ -373,6 +391,8 @@ def main() -> None:
             f"{'accepted' if accepted else 'rejected'}"
         )
 
+    # Record the exact accepted checkpoint and essential run settings without
+    # copying generated datasets into version control.
     manifest = {
         "checkpoint": str(incumbent),
         "sha256": checkpoint_hash(incumbent),

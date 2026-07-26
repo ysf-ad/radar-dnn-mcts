@@ -10,10 +10,6 @@ The package separates shared learned components from deployment behavior.
 - `RadarSchedulerModel` returns a factorized complete-action policy and a state value.
 - `LatentDynamics` predicts the next latent state and immediate reward after a selected action.
 
-PUCT uses the complete-action policy as its prior and the state value at newly
-expanded leaves. Search/track and conditional target probabilities are combined
-before PUCT; the tree itself selects complete actions.
-
 ## Deployment Modes
 
 - **Full re-encode** updates a shadow observation and runs the state encoder after every action.

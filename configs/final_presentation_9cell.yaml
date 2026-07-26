@@ -1,3 +1,4 @@
+# Three-seed held-out grid used for final method comparisons.
 initial_targets: [20, 40, 60]
 arrival_rates: [2.0, 3.0, 4.0]
 seeds: [5101, 5102, 5103]

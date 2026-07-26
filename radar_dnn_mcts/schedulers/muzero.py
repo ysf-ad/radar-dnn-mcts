@@ -1,3 +1,5 @@
+"""Greedy and PUCT schedulers backed by learned latent dynamics."""
+
 from __future__ import annotations
 
 import torch

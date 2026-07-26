@@ -23,10 +23,7 @@ The default contract:
 - treats sector staleness as a time-scaled cost rate;
 - applies an explicit drop penalty and dense pressure-improvement shaping.
 
-These reward changes do not alter target arrivals or state transitions. The
-environment cross-test therefore checks state trajectories by default. Use
-`--compare-reward` only when comparing checkouts configured with the same reward
-contract.
+These reward changes do not alter target arrivals or state transitions.
 
 ## Binding Surface
 

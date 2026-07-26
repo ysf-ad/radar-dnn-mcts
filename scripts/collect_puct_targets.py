@@ -1,3 +1,5 @@
+"""Collect window trajectories and PUCT policy/return targets."""
+
 from __future__ import annotations
 
 import argparse
@@ -67,6 +69,7 @@ class WindowTrajectoryCollector:
 
     @staticmethod
     def _records(state, actions, *, skip_invalid: bool = False) -> list[dict]:
+        """Snapshot model inputs and targets immediately before each action."""
         records = []
         for action, probabilities in actions:
             action = int(action)
@@ -125,6 +128,7 @@ class WindowTrajectoryCollector:
         self.cursor += 1
 
     def finish_window(self) -> None:
+        """Commit only decisions that the live simulator actually executed."""
         if self.executed:
             self.windows.append(self.executed)
         self.pending = []
@@ -140,12 +144,16 @@ class WindowTrajectoryCollector:
     ) -> None:
         """Assign discounted returns through a fixed or complete window horizon."""
         for window_index, window in enumerate(self.windows):
+            # Horizon is measured in radar windows. Zero keeps accumulating to
+            # the end of the collected episode.
             end = (
                 len(self.windows)
                 if horizon_windows <= 0
                 else min(len(self.windows), window_index + horizon_windows)
             )
             for step, record in enumerate(window):
+                # A target begins at this action, includes the rest of its
+                # window, and then starts at action zero of later windows.
                 value = 0.0
                 weight = 1.0
                 for future_window in range(window_index, end):
@@ -187,6 +195,8 @@ class WindowTrajectoryCollector:
             for key, shape in shapes.items()
         }
         arrays["action_mask"] = np.zeros(prefix, dtype=bool)
+        # action_mask is the single source of truth for real versus padded
+        # schedule positions in every trainer.
         for window_index, window in enumerate(self.windows):
             for step, record in enumerate(window):
                 arrays["tokens"][window_index, step] = record["tokens"]
@@ -201,6 +211,7 @@ class WindowTrajectoryCollector:
 
 
 def main() -> None:
+    """Collect one configured simulator episode into a grouped NPZ dataset."""
     parser = argparse.ArgumentParser(
         description="Collect grouped full-window PUCT trajectories."
     )

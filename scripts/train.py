@@ -36,6 +36,7 @@ def main() -> None:
         raise KeyError(f"dataset is missing arrays: {sorted(missing)}")
     device = torch.device(args.device)
     mask = torch.as_tensor(arrays["action_mask"], device=device).bool()
+    # Flatten only real schedule positions; padded rows never enter the loss.
     data = {
         "tokens": torch.as_tensor(arrays["tokens"], device=device)[mask],
         "context": torch.as_tensor(arrays["context"], device=device)[mask],
@@ -47,6 +48,7 @@ def main() -> None:
     ar = AutoregressiveDecoder(core).to(device)
     batch = BatchDecoder().to(device)
     if args.checkpoint:
+        # Load the complete checkpoint, although only core is optimized here.
         load_checkpoint(
             args.checkpoint,
             {"core": core, "dynamics": dynamics, "ar": ar, "batch": batch},

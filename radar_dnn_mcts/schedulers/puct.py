@@ -1,3 +1,5 @@
+"""Full-window re-encode and autoregressive PUCT scheduler adapters."""
+
 from __future__ import annotations
 
 from radar_dnn_mcts.env.config import RewardConfig
