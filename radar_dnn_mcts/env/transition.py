@@ -51,8 +51,8 @@ class RadarObservationTransition:
                 desired[idx] = desired_period
                 deadline[idx] = desired_period * multiplier
 
-        desired -= duration
-        deadline -= duration
+        desired[active] -= duration
+        deadline[active] -= duration
         grid -= duration
         if refreshed:
             grid[np.asarray(refreshed, dtype=np.int64)] = self.fresh_sector_ms

@@ -125,14 +125,23 @@ class RadarAREvaluator:
 
     def __init__(self, decoder):
         self.decoder = decoder.eval()
+        self.encoded = None
+        self.root_tokens = None
+
+    @torch.inference_mode()
+    def prepare(self, state: RadarWindowSearchState) -> None:
+        """Encode the root observation once for one window search."""
+        device = _device_of(self.decoder)
+        tokens_np, context_np = state.root_network_input()
+        self.root_tokens = _tensor(tokens_np, device)
+        context = _tensor(context_np, device)
+        self.encoded, _ = self.decoder.initial(self.root_tokens, context)
 
     @torch.inference_mode()
     def __call__(self, state: RadarWindowSearchState, legal_actions: list[int]):
         device = _device_of(self.decoder)
-        root_tokens_np, root_context_np = state.root_network_input()
-        root_tokens = _tensor(root_tokens_np, device)
-        root_context = _tensor(root_context_np, device)
-        encoded, _ = self.decoder.initial(root_tokens, root_context)
+        if self.encoded is None or self.root_tokens is None:
+            self.prepare(state)
         prefix = torch.as_tensor(state.prefix, dtype=torch.long, device=device).unsqueeze(0)
         context_np = (
             state.network_input()[1]
@@ -141,10 +150,10 @@ class RadarAREvaluator:
         )
         context = _tensor(context_np, device)
         output = self.decoder.step(
-            encoded,
+            self.encoded,
             prefix,
             context,
-            _selected_mask(root_tokens.shape[1], state.selected, device),
+            _selected_mask(self.root_tokens.shape[1], state.selected, device),
         )
         value = float(output.q_values[0, 0].cpu())
         if not legal_actions:

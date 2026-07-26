@@ -75,6 +75,7 @@ class MuZeroPUCTScheduler:
         max_steps: int = 32,
         random_seed: int = 0,
     ):
+        self.simulations = int(simulations)
         features = features or FeatureBuilder()
         self.search = DynamicsPUCT(
             model,
@@ -89,6 +90,7 @@ class MuZeroPUCTScheduler:
                 temperature=temperature,
                 dirichlet_fraction=0.0,
                 random_seed=random_seed,
+                factorized_policy_first=True,
             ),
             features,
             max_steps,
@@ -110,3 +112,15 @@ class MuZeroPUCTScheduler:
     @property
     def g_call_history(self) -> list[int]:
         return self.search.g_call_history
+
+    @property
+    def last_h_calls(self) -> int:
+        return self.search.last_h_calls
+
+    @property
+    def last_f_calls(self) -> int:
+        return self.search.last_f_calls
+
+    @property
+    def last_simulations(self) -> int:
+        return self.simulations

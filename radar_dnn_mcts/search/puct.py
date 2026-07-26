@@ -31,6 +31,9 @@ class PUCTConfig:
     dirichlet_alpha: float = 0.03
     dirichlet_fraction: float = 0.25
     random_seed: int = 0
+    factorized_policy_first: bool = False
+    factorized_search_logit_bias: float = 0.0
+    sample_training_actions: bool = True
 
 
 @dataclass
@@ -54,6 +57,8 @@ class SearchDecision:
     action: int
     policy: dict[int, float]
     value: float
+    policy_visits: int = 0
+    policy_from_visits: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,17 +100,33 @@ class PUCT:
     def _select(self, node: Node) -> tuple[int, Node]:
         # A fresh state has no backed-up tree statistics, so start from P.
         if node.visits == 0:
+            if self.config.factorized_policy_first and 0 in node.children:
+                search = node.children[0]
+                tracks = [
+                    item for item in node.children.items() if item[0] != 0
+                ]
+                track_mass = sum(child.prior for _, child in tracks)
+                adjusted_search = search.prior * np.exp(
+                    self.config.factorized_search_logit_bias
+                )
+                if tracks and track_mass > adjusted_search:
+                    return max(tracks, key=lambda item: item[1].prior)
+                return 0, search
             return max(node.children.items(), key=lambda item: item[1].prior)
         scale = np.sqrt(node.visits)
+
+        def score(child: Node) -> float:
+            return (
+                self._edge_value(child)
+                + self.config.c_puct
+                * child.prior
+                * scale
+                / (1 + child.visits)
+            )
+
         return max(
             node.children.items(),
-            key=lambda item: (
-                self._edge_value(item[1])
-                + self.config.c_puct
-                * item[1].prior
-                * scale
-                / (1 + item[1].visits)
-            ),
+            key=lambda item: score(item[1]),
         )
 
     def _step(self, state: SearchState, action: int) -> tuple[float, float, bool]:
@@ -130,24 +151,53 @@ class PUCT:
         return actions, probabilities
 
     def _extract_trajectory(
-        self, root: Node, root_state: SearchState
+        self,
+        root: Node,
+        root_state: SearchState,
+        *,
+        sample_actions: bool = False,
     ) -> tuple[SearchDecision, ...]:
-        """Follow maximum visit mass to produce one executable schedule."""
+        """Extract one complete schedule from the searched tree."""
         state = root_state.clone()
         node: Node | None = root
         decisions: list[SearchDecision] = []
         while state.legal_actions():
             if node is not None and node.children:
+                policy_visits = sum(
+                    child.visits for child in node.children.values()
+                )
+                policy_from_visits = policy_visits > 0
                 actions, probabilities = self._distribution(node)
-                action = actions[int(np.argmax(probabilities))]
+                index = (
+                    int(self.rng.choice(len(actions), p=probabilities))
+                    if sample_actions
+                    else int(np.argmax(probabilities))
+                )
+                action = actions[index]
                 value = node.value
                 next_node = node.children[action]
             else:
+                policy_visits = 0
+                policy_from_visits = False
                 actions = state.legal_actions()
                 priors, value = self.evaluator(state, actions)
                 probabilities = np.maximum(np.asarray(priors, dtype=np.float64), 0.0)
                 probabilities /= max(probabilities.sum(), 1e-12)
-                action = actions[int(np.argmax(probabilities))]
+                if self.config.temperature <= 1e-6:
+                    tempered = np.zeros_like(probabilities)
+                    tempered[int(np.argmax(probabilities))] = 1.0
+                else:
+                    tempered = probabilities ** (
+                        1.0 / self.config.temperature
+                    )
+                    tempered /= max(tempered.sum(), 1e-12)
+                probabilities = tempered
+                index = (
+                    int(self.rng.choice(len(actions), p=probabilities))
+                    if sample_actions
+                    else int(np.argmax(probabilities))
+                )
+                action = actions[index]
                 next_node = None
             decisions.append(
                 SearchDecision(
@@ -157,6 +207,8 @@ class PUCT:
                         for candidate, probability in zip(actions, probabilities)
                     },
                     value=float(value),
+                    policy_visits=int(policy_visits),
+                    policy_from_visits=bool(policy_from_visits),
                 )
             )
             _, terminal = state.step(int(action))
@@ -167,6 +219,9 @@ class PUCT:
 
     def run(self, root_state: SearchState, *, training: bool = False) -> SearchResult:
         """Run complete-window rollouts and return their principal trajectory."""
+        prepare = getattr(self.evaluator, "prepare", None)
+        if callable(prepare):
+            prepare(root_state)
         root = Node()
         self._expand(root, root_state, root_noise=training)
         for _ in range(self.config.rollouts):
@@ -193,8 +248,13 @@ class PUCT:
                 current.visits += 1
                 current.value_sum += value
                 value = current.reward + current.discount * value
-
-        trajectory = self._extract_trajectory(root, root_state)
+        trajectory = self._extract_trajectory(
+            root,
+            root_state,
+            sample_actions=(
+                training and self.config.sample_training_actions
+            ),
+        )
         if not trajectory:
             raise RuntimeError("PUCT produced no scheduling trajectory")
         return SearchResult(

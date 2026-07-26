@@ -20,6 +20,7 @@ from radar_dnn_mcts.models.decoders import AutoregressiveDecoder, BatchDecoder
 from radar_dnn_mcts.models.dynamics import LatentDynamics
 from radar_dnn_mcts.models.scheduler import RadarSchedulerModel
 from radar_dnn_mcts.schedulers import (
+    AutoregressivePUCTScheduler,
     AutoregressiveScheduler,
     BatchScheduler,
     FullReencodeScheduler,
@@ -27,6 +28,7 @@ from radar_dnn_mcts.schedulers import (
     MuZeroPUCTScheduler,
     MuZeroScheduler,
 )
+from radar_dnn_mcts.search import PUCTConfig
 
 
 def load_config(path: Path) -> BenchmarkConfig:
@@ -50,6 +52,9 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--methods", default="edf,est,reencode,muzero,ar,batch")
+    parser.add_argument("--reencode-rollouts", type=int, default=1)
+    parser.add_argument("--ar-rollouts", type=int, default=1)
+    parser.add_argument("--muzero-rollouts", type=int, default=1)
     parser.add_argument("--out", type=Path, default=Path("results/canonical"))
     args = parser.parse_args()
 
@@ -65,11 +70,34 @@ def main() -> None:
     available = {
         "edf": EDFPlanner(config.max_targets),
         "est": ESTPlanner(config.max_targets),
-        "reencode": FullReencodeScheduler(core),
-        "puct": FullWindowPUCTScheduler(core),
-        "muzero": MuZeroPUCTScheduler(core, dynamics),
+        "reencode": FullWindowPUCTScheduler(
+            core,
+            PUCTConfig(
+                rollouts=args.reencode_rollouts,
+                window_ms=config.window_ms,
+                temperature=0.0,
+                dirichlet_fraction=0.0,
+                factorized_policy_first=True,
+            ),
+        ),
+        "reencode-greedy": FullReencodeScheduler(core),
+        "muzero": MuZeroPUCTScheduler(
+            core,
+            dynamics,
+            simulations=args.muzero_rollouts,
+        ),
         "muzero-greedy": MuZeroScheduler(core, dynamics),
-        "ar": AutoregressiveScheduler(ar),
+        "ar": AutoregressivePUCTScheduler(
+            ar,
+            PUCTConfig(
+                rollouts=args.ar_rollouts,
+                window_ms=config.window_ms,
+                temperature=0.0,
+                dirichlet_fraction=0.0,
+                factorized_policy_first=True,
+            ),
+        ),
+        "ar-greedy": AutoregressiveScheduler(ar),
         "batch": BatchScheduler(batch),
     }
     requested = [name.strip() for name in args.methods.split(",") if name.strip()]

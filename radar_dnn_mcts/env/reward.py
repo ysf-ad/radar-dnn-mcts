@@ -135,8 +135,49 @@ def shaped_transition_reward(
 
 
 def transition_reward(before: dict, after: dict, row: int, config: RewardConfig) -> float:
-    """Reward approximation for deterministic shadow transitions used by search."""
+    """Mirror the live single-sensor reward for one deterministic shadow step."""
     duration = 10.0 if int(row) == 0 else float(np.asarray(before["t_dwell"])[int(row) - 1])
     base = config.search_action_reward if int(row) == 0 else config.track_action_reward
-    base -= config.drop_penalty * max(0, dropped_count(after) - dropped_count(before))
-    return shaped_transition_reward(base, duration, before, after, row, config)
+    active = np.asarray(before["active_mask"], dtype=bool)
+    desired_before = np.asarray(before["t_desired"], dtype=np.float32)
+    deadline_before = np.asarray(before["t_deadline"], dtype=np.float32)
+    desired_after = np.asarray(after["t_desired"], dtype=np.float32)
+    deadline_after = np.asarray(after["t_deadline"], dtype=np.float32)
+    tracked_before = active & (deadline_before >= 0.0)
+
+    denominator_before = np.maximum(1e-3, deadline_before - desired_before)
+    denominator_after = np.maximum(1e-3, deadline_after - desired_after)
+    tardiness_before = np.clip(
+        np.maximum(0.0, -desired_before) / denominator_before, 0.0, 1.0
+    )
+    tardiness_after = np.clip(
+        np.maximum(0.0, -desired_after) / denominator_after, 0.0, 1.0
+    )
+    overdue_increment = np.maximum(
+        0.0,
+        tardiness_after[tracked_before] - tardiness_before[tracked_before],
+    ).sum()
+    newly_dropped = tracked_before & (deadline_after < 0.0)
+    reward = (
+        base
+        - float(overdue_increment)
+        - config.drop_penalty * int(newly_dropped.sum())
+    )
+
+    grid = np.asarray(after.get("grid", []), dtype=np.float32)
+    if (
+        grid.size
+        and config.search_frame_overdue_weight > 0.0
+        and config.search_frame_deadline_ms > config.search_frame_desired_ms
+    ):
+        age = 3000.0 - grid
+        overdue = np.maximum(0.0, age - config.search_frame_desired_ms)
+        scale = config.search_frame_deadline_ms - config.search_frame_desired_ms
+        frame_cost = np.clip(overdue / scale, 0.0, 1.0).sum()
+        reward -= (
+            config.search_frame_overdue_weight
+            * float(frame_cost)
+            * max(0.0, duration)
+            / 200.0
+        )
+    return float(reward)

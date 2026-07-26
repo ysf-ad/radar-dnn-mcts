@@ -73,6 +73,21 @@ class BenchmarkRunner:
                             "cumulative_reward": cumulative,
                             "search_fraction": searches / max(1, executed),
                             "latency_ms": np.nan if window < latency_warmup else timed.last_latency_ms,
+                            "observations": getattr(
+                                timed.planner, "last_observations", np.nan
+                            ),
+                            "h_calls": getattr(
+                                timed.planner, "last_h_calls", np.nan
+                            ),
+                            "g_calls": getattr(
+                                timed.planner, "last_g_calls", np.nan
+                            ),
+                            "f_calls": getattr(
+                                timed.planner, "last_f_calls", np.nan
+                            ),
+                            "simulations": getattr(
+                                timed.planner, "last_simulations", np.nan
+                            ),
                             **metrics,
                         }
                         rows.append(row)

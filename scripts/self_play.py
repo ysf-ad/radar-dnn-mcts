@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
+import shutil
 import subprocess
 import sys
 from itertools import product
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+import yaml
 
 
 GROUPED_KEYS = (
@@ -26,6 +31,7 @@ SCALAR_METADATA_KEYS = (
     "puct_c",
     "puct_discount",
     "return_scale",
+    "return_horizon_windows",
     "dirichlet_alpha",
     "dirichlet_fraction",
     "teacher",
@@ -76,6 +82,68 @@ def merge_trajectories(paths: list[Path], output: Path) -> None:
         source.close()
 
 
+def trim_replay(path: Path, capacity_windows: int) -> None:
+    """Keep the newest grouped windows in a bounded replay dataset."""
+    if capacity_windows <= 0:
+        return
+    source = np.load(path)
+    window_count = source["action_mask"].shape[0]
+    if window_count <= capacity_windows:
+        source.close()
+        return
+    start = window_count - capacity_windows
+    arrays = {}
+    for key in source.files:
+        value = source[key]
+        arrays[key] = (
+            value[start:]
+            if value.ndim and value.shape[0] == window_count
+            else value
+        )
+    source.close()
+    np.savez_compressed(path, **arrays)
+
+
+def evaluate_checkpoint(
+    checkpoint: Path,
+    config: Path,
+    method: str,
+    output: Path,
+    root: Path,
+    device: str,
+) -> tuple[float, float]:
+    run(
+        [
+            sys.executable,
+            str(root / "scripts" / "evaluate.py"),
+            "--checkpoint",
+            str(checkpoint),
+            "--config",
+            str(config),
+            "--methods",
+            f"{method},edf",
+            "--device",
+            device,
+            "--out",
+            str(output),
+        ],
+        root,
+    )
+    summary = pd.read_csv(output / "summary.csv").set_index("method")
+    return (
+        float(summary.loc[method, "reward_per_window"]),
+        float(summary.loc["edf", "reward_per_window"]),
+    )
+
+
+def checkpoint_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def main() -> None:
     """Alternate PUCT collection and a selected learner."""
     parser = argparse.ArgumentParser(
@@ -83,6 +151,8 @@ def main() -> None:
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--train-config", type=Path)
+    parser.add_argument("--validation-config", type=Path)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument(
         "--rollouts",
@@ -96,7 +166,7 @@ def main() -> None:
     parser.add_argument("--seeds", default="916")
     parser.add_argument(
         "--search-model",
-        choices=("core", "ar"),
+        choices=("core", "ar", "muzero"),
         default="ar",
         help="Policy/value evaluator used inside PUCT collection.",
     )
@@ -111,6 +181,9 @@ def main() -> None:
     parser.add_argument("--unroll-steps", type=int, default=10)
     parser.add_argument("--core-lr-scale", type=float, default=1.0)
     parser.add_argument("--reward-loss-weight", type=float, default=32.0)
+    parser.add_argument("--return-horizon-windows", type=int, default=5)
+    parser.add_argument("--replay-capacity-windows", type=int, default=5000)
+    parser.add_argument("--greedy-training-actions", action="store_true")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -119,13 +192,51 @@ def main() -> None:
 
     root = Path(__file__).resolve().parents[1]
     checkpoint = args.checkpoint.resolve()
-    initial_targets = csv_values(args.initial_targets, int)
-    arrival_rates = csv_values(args.arrival_rates, float)
-    seeds = csv_values(args.seeds, int)
+    if args.train_config:
+        train_config = yaml.safe_load(args.train_config.read_text())
+        initial_targets = tuple(int(x) for x in train_config["initial_targets"])
+        arrival_rates = tuple(float(x) for x in train_config["arrival_rates"])
+        seeds = tuple(int(x) for x in train_config["seeds"])
+    else:
+        initial_targets = csv_values(args.initial_targets, int)
+        arrival_rates = csv_values(args.arrival_rates, float)
+        seeds = csv_values(args.seeds, int)
     learner = args.learner or args.search_model
+    method = {
+        "core": "reencode",
+        "ar": "ar",
+        "muzero": "muzero",
+        "batch": "batch",
+    }[learner]
+    output = args.out_dir.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    incumbent = output / "incumbent.pt"
+    shutil.copy2(checkpoint, incumbent)
+    checkpoint = incumbent
+    history: list[dict] = []
+    incumbent_reward = None
+    edf_reward = None
+    if args.validation_config:
+        incumbent_reward, edf_reward = evaluate_checkpoint(
+            incumbent,
+            args.validation_config.resolve(),
+            method,
+            output / "validation_000",
+            root,
+            args.device,
+        )
+        history.append(
+            {
+                "iteration": 0,
+                "candidate_reward": incumbent_reward,
+                "incumbent_reward": incumbent_reward,
+                "edf_reward": edf_reward,
+                "accepted": True,
+            }
+        )
 
     for iteration in range(1, args.iterations + 1):
-        iteration_dir = args.out_dir.resolve() / f"iteration_{iteration:03d}"
+        iteration_dir = output / f"iteration_{iteration:03d}"
         trajectory_paths = []
         for initial, arrival, seed in product(
             initial_targets, arrival_rates, seeds
@@ -158,15 +269,30 @@ def main() -> None:
                     str(seed),
                     "--device",
                     args.device,
+                    "--return-horizon-windows",
+                    str(args.return_horizon_windows),
+                    *(
+                        ["--greedy-training-actions"]
+                        if args.greedy_training_actions
+                        else []
+                    ),
                     "--out",
                     str(trajectory),
                 ],
                 root,
             )
 
-        dataset = iteration_dir / "trajectories.npz"
-        merge_trajectories(trajectory_paths, dataset)
-        next_checkpoint = iteration_dir / "checkpoint.pt"
+        current = iteration_dir / "trajectories.npz"
+        merge_trajectories(trajectory_paths, current)
+        replay = output / "replay_buffer.npz"
+        replay_sources = [current]
+        if replay.exists():
+            replay_sources.insert(0, replay)
+        temporary_replay = output / "replay_buffer.next.npz"
+        merge_trajectories(replay_sources, temporary_replay)
+        trim_replay(temporary_replay, args.replay_capacity_windows)
+        temporary_replay.replace(replay)
+        next_checkpoint = iteration_dir / "candidate.pt"
         if learner in ("ar", "batch"):
             trainer = root / "scripts" / "train_sequence.py"
             command = [
@@ -195,7 +321,7 @@ def main() -> None:
         command.extend(
             [
                 "--data",
-                str(dataset),
+                str(replay),
                 "--checkpoint",
                 str(checkpoint),
                 "--out",
@@ -211,8 +337,57 @@ def main() -> None:
             ]
         )
         run(command, root)
-        checkpoint = next_checkpoint
-        print(f"completed iteration {iteration}: {checkpoint}")
+        accepted = True
+        candidate_reward = None
+        if args.validation_config:
+            candidate_reward, candidate_edf = evaluate_checkpoint(
+                next_checkpoint,
+                args.validation_config.resolve(),
+                method,
+                iteration_dir / "validation",
+                root,
+                args.device,
+            )
+            edf_reward = candidate_edf
+            accepted = (
+                candidate_reward > float(incumbent_reward)
+                and candidate_reward > float(edf_reward)
+            )
+        if accepted:
+            shutil.copy2(next_checkpoint, incumbent)
+            checkpoint = incumbent
+            if candidate_reward is not None:
+                incumbent_reward = candidate_reward
+        history.append(
+            {
+                "iteration": iteration,
+                "candidate_reward": candidate_reward,
+                "incumbent_reward": incumbent_reward,
+                "edf_reward": edf_reward,
+                "accepted": accepted,
+            }
+        )
+        pd.DataFrame(history).to_csv(output / "training_history.csv", index=False)
+        print(
+            f"completed iteration {iteration}: "
+            f"{'accepted' if accepted else 'rejected'}"
+        )
+
+    manifest = {
+        "checkpoint": str(incumbent),
+        "sha256": checkpoint_hash(incumbent),
+        "learner": learner,
+        "search_model": args.search_model,
+        "rollouts": args.rollouts,
+        "windows": args.windows,
+        "iterations": args.iterations,
+        "return_horizon_windows": args.return_horizon_windows,
+        "seeds": list(seeds),
+    }
+    (output / "manifest.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

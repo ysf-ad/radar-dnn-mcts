@@ -9,6 +9,18 @@ from radar_dnn_mcts.models.scheduler import RadarSchedulerModel
 from radar_dnn_mcts.schedulers.base import choose_row, device_of, selected_mask, tensor, update_prefix
 
 
+def latency_aware_start_ms(
+    window_ms: float,
+    max_latency_ms: float,
+    buffer_ms: float = 0.0,
+) -> float:
+    """Start planning at B - L_max - buffer, clipped to the window."""
+    return max(
+        0.0,
+        min(float(window_ms), float(window_ms) - float(max_latency_ms) - float(buffer_ms)),
+    )
+
+
 class AsynchronousBoundaryScheduler:
     """Prepare the next schedule while the remaining current-window actions execute."""
 
@@ -20,6 +32,7 @@ class AsynchronousBoundaryScheduler:
         policy_weight: float = 1.0,
         q_weight: float = 1.0,
         max_steps: int = 32,
+        latency_buffer_ms: float = 0.0,
     ):
         self.model = model.eval()
         self.boundary = boundary.eval()
@@ -27,6 +40,19 @@ class AsynchronousBoundaryScheduler:
         self.policy_weight = float(policy_weight)
         self.q_weight = float(q_weight)
         self.max_steps = int(max_steps)
+        self.latency_buffer_ms = float(latency_buffer_ms)
+
+    def planning_start_ms(
+        self,
+        max_latency_ms: float,
+        window_ms: float = 200.0,
+    ) -> float:
+        """Return the latency-aware boundary-planning start time."""
+        return latency_aware_start_ms(
+            window_ms,
+            max_latency_ms,
+            self.latency_buffer_ms,
+        )
 
     @torch.inference_mode()
     def plan_next(

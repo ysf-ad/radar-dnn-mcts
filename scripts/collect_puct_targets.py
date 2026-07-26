@@ -131,15 +131,35 @@ class WindowTrajectoryCollector:
         self.executed = []
         self.cursor = 0
 
-    def backfill_episode_returns(self, discount: float, window_ms: float, scale: float) -> None:
-        """Backfill duration-discounted returns across episode windows."""
-        value = 0.0
-        for window in reversed(self.windows):
-            for record in reversed(window):
-                step_discount = discount ** (
-                    float(record["duration_ms"]) / max(window_ms, 1e-6)
-                )
-                value = float(record["reward"]) / max(scale, 1e-6) + step_discount * value
+    def backfill_episode_returns(
+        self,
+        discount: float,
+        window_ms: float,
+        scale: float,
+        horizon_windows: int = 0,
+    ) -> None:
+        """Assign discounted returns through a fixed or complete window horizon."""
+        for window_index, window in enumerate(self.windows):
+            end = (
+                len(self.windows)
+                if horizon_windows <= 0
+                else min(len(self.windows), window_index + horizon_windows)
+            )
+            for step, record in enumerate(window):
+                value = 0.0
+                weight = 1.0
+                for future_window in range(window_index, end):
+                    start = step if future_window == window_index else 0
+                    for future in self.windows[future_window][start:]:
+                        value += (
+                            weight
+                            * float(future["reward"])
+                            / max(scale, 1e-6)
+                        )
+                        weight *= discount ** (
+                            float(future["duration_ms"])
+                            / max(window_ms, 1e-6)
+                        )
                 record["return"] = value
 
     def arrays(self) -> dict[str, np.ndarray]:
@@ -195,9 +215,20 @@ def main() -> None:
     parser.add_argument("--c-puct", type=float, default=1.5)
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--return-scale", type=float, default=32.0)
+    parser.add_argument(
+        "--return-horizon-windows",
+        type=int,
+        default=0,
+        help="Zero uses the full collected episode.",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--dirichlet-alpha", type=float, default=0.03)
     parser.add_argument("--dirichlet-fraction", type=float, default=0.25)
+    parser.add_argument(
+        "--greedy-training-actions",
+        action="store_true",
+        help="Store visit targets but execute their argmax during collection.",
+    )
     parser.add_argument("--teacher", choices=["puct", "edf", "est"], default="puct")
     parser.add_argument(
         "--search-model", choices=["core", "ar", "muzero"], default="core"
@@ -247,6 +278,8 @@ def main() -> None:
             dirichlet_alpha=args.dirichlet_alpha,
             dirichlet_fraction=args.dirichlet_fraction,
             random_seed=args.seed,
+            factorized_policy_first=True,
+            sample_training_actions=not args.greedy_training_actions,
         )
         if args.search_model == "muzero":
             search = DynamicsPUCT(
@@ -280,7 +313,10 @@ def main() -> None:
         engine.close()
 
     collector.backfill_episode_returns(
-        args.discount, 200.0, args.return_scale
+        args.discount,
+        200.0,
+        args.return_scale,
+        args.return_horizon_windows,
     )
     arrays = collector.arrays()
     arrays.update(
@@ -288,6 +324,7 @@ def main() -> None:
         puct_c=np.asarray(args.c_puct),
         puct_discount=np.asarray(args.discount),
         return_scale=np.asarray(args.return_scale),
+        return_horizon_windows=np.asarray(args.return_horizon_windows),
         dirichlet_alpha=np.asarray(args.dirichlet_alpha),
         dirichlet_fraction=np.asarray(args.dirichlet_fraction),
         teacher=np.asarray(args.teacher),
